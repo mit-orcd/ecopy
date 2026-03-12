@@ -14,6 +14,9 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/mman.h>
+#include <signal.h>
 #include <limits.h>
 
 /*
@@ -22,8 +25,6 @@
  *   DIRECT_COPY_SMALL_WORKERS
  *   DIRECT_COPY_LARGE_WORKERS
  *   DIRECT_COPY_CHUNK_MB
- *
- * Defaults come from config.h.
  */
 
 static pthread_t *g_small_workers = NULL;
@@ -186,6 +187,62 @@ static void finish_task(pthread_mutex_t *lock, uint64_t *active)
 
 /* -------------------- copy helpers -------------------- */
 
+static int direct_io_fallback_errno_local(int err)
+{
+    return err == EINVAL ||
+           err == EOPNOTSUPP ||
+           err == ENOTSUP ||
+           err == ENOSYS;
+}
+
+static int open_write_existing_maybe_direct(const char *path, int *used_direct)
+{
+    int fd;
+
+    if (used_direct) {
+        *used_direct = 0;
+    }
+
+    fd = open(path, O_WRONLY | O_DIRECT);
+    if (fd >= 0) {
+        if (used_direct) {
+            *used_direct = 1;
+        }
+        return fd;
+    }
+
+    if (!direct_io_fallback_errno_local(errno)) {
+        perror(path);
+        return -1;
+    }
+
+    fd = open(path, O_WRONLY);
+    if (fd < 0) {
+        perror(path);
+        return -1;
+    }
+
+    return fd;
+}
+
+static int prepare_destination_file(const char *dst, const struct stat *src_st)
+{
+    int out_direct = 0;
+    int fd = open_write_maybe_direct(dst, src_st->st_mode & 07777, &out_direct);
+    if (fd < 0) {
+        return -1;
+    }
+
+    if (ftruncate(fd, src_st->st_size) != 0) {
+        perror("ftruncate");
+        close(fd);
+        return -1;
+    }
+
+    close(fd);
+    return 0;
+}
+
 static int copy_tail_buffered(const char *src,
                               const char *dst,
                               off_t start,
@@ -292,10 +349,8 @@ static int copy_file_serial_small(const char *src, const char *dst, const struct
         return -1;
     }
 
-    if (!out_direct) {
-        if (ftruncate(fd_out, size) != 0) {
-            perror("ftruncate");
-        }
+    if (ftruncate(fd_out, size) != 0) {
+        perror("ftruncate");
     }
 
     if (posix_memalign(&buf, ALIGNMENT, (size_t)g_chunk_size) != 0) {
@@ -354,115 +409,111 @@ static int copy_file_serial_small(const char *src, const char *dst, const struct
     return finalize_copied_file(dst, src_st);
 }
 
-/* -------------------- large-file parallel copy -------------------- */
+/* -------------------- large-file forked copy -------------------- */
 
-static int ctx_has_error(parallel_ctx_t *ctx)
+static uint64_t sum_worker_bytes(chunk_worker_stat_t *workers, int count)
 {
-    int err;
-    pthread_mutex_lock(&ctx->error_lock);
-    err = ctx->error;
-    pthread_mutex_unlock(&ctx->error_lock);
-    return err;
+    uint64_t total = 0;
+    for (int i = 0; i < count; i++) {
+        total += workers[i].bytes_done;
+    }
+    return total;
 }
 
-static void ctx_set_error(parallel_ctx_t *ctx)
+static void kill_remaining_children(pid_t *pids, int count, int *done)
 {
-    pthread_mutex_lock(&ctx->error_lock);
-    ctx->error = 1;
-    pthread_mutex_unlock(&ctx->error_lock);
+    for (int i = 0; i < count; i++) {
+        if (!done[i] && pids[i] > 0) {
+            kill(pids[i], SIGTERM);
+        }
+    }
 }
 
-static void chunk_worker_set_state(parallel_ctx_t *ctx, int id, int active)
+static int child_copy_range(const char *src,
+                            const char *dst,
+                            off_t start,
+                            off_t end,
+                            chunk_worker_stat_t *ws)
 {
-    ctx->workers[id].active = active;
-}
-
-static void chunk_worker_add_done(parallel_ctx_t *ctx, int id, uint64_t bytes)
-{
-    ctx->workers[id].bytes_done += bytes;
-    ctx->workers[id].chunks_done++;
-}
-
-static void *large_chunk_worker_main(void *arg)
-{
-    chunk_worker_arg_t *wa = (chunk_worker_arg_t *)arg;
-    parallel_ctx_t *ctx = wa->ctx;
-    int id = wa->worker_id;
+    int fd_in = -1;
+    int fd_out = -1;
+    int in_direct = 0;
+    int out_direct = 0;
     void *buf = NULL;
+    int rc = 1;
+
+    fd_in = open_read_maybe_direct(src, &in_direct);
+    if (fd_in < 0) {
+        return 1;
+    }
+
+    fd_out = open_write_existing_maybe_direct(dst, &out_direct);
+    if (fd_out < 0) {
+        close(fd_in);
+        return 1;
+    }
 
     if (posix_memalign(&buf, ALIGNMENT, (size_t)g_chunk_size) != 0) {
         fprintf(stderr, "posix_memalign failed\n");
-        ctx_set_error(ctx);
-        return NULL;
+        close(fd_in);
+        close(fd_out);
+        return 1;
     }
 
-    while (!ctx_has_error(ctx)) {
-        off_t off;
-        off_t this_len_off;
-        size_t len;
+    ws->active = 1;
+    ws->bytes_done = 0;
+    ws->chunks_done = 0;
 
-        pthread_mutex_lock(&ctx->offset_lock);
-        off = ctx->next_offset;
-        if (off >= ctx->bulk_end) {
-            pthread_mutex_unlock(&ctx->offset_lock);
-            break;
-        }
+    off_t pos = start;
 
-        off_t remain = ctx->bulk_end - off;
-        this_len_off = (remain >= g_chunk_size) ? g_chunk_size : remain;
-        len = (size_t)this_len_off;
-        ctx->next_offset += this_len_off;
-        pthread_mutex_unlock(&ctx->offset_lock);
+    while (pos < end) {
+        off_t remain = end - pos;
+        off_t this_len_off = (remain >= g_chunk_size) ? g_chunk_size : remain;
+        size_t len = (size_t)this_len_off;
 
-        chunk_worker_set_state(ctx, id, 1);
-
-        ssize_t r = pread(ctx->fd_in, buf, len, off);
+        ssize_t r = pread(fd_in, buf, len, pos);
         if (r < 0) {
             perror("pread");
-            ctx_set_error(ctx);
-            chunk_worker_set_state(ctx, id, 0);
-            break;
+            goto out;
         }
         if ((size_t)r != len) {
             fprintf(stderr, "short pread at off %lld: expected %zu got %zd\n",
-                    (long long)off, len, r);
-            ctx_set_error(ctx);
-            chunk_worker_set_state(ctx, id, 0);
-            break;
+                    (long long)pos, len, r);
+            goto out;
         }
 
         size_t done = 0;
         while (done < len) {
-            ssize_t w = pwrite(ctx->fd_out,
+            ssize_t w = pwrite(fd_out,
                                (char *)buf + done,
                                len - done,
-                               off + (off_t)done);
+                               pos + (off_t)done);
             if (w < 0) {
                 perror("pwrite");
-                ctx_set_error(ctx);
-                break;
+                goto out;
             }
             if (w == 0) {
                 fprintf(stderr, "zero pwrite at off %lld\n",
-                        (long long)(off + (off_t)done));
-                ctx_set_error(ctx);
-                break;
+                        (long long)(pos + (off_t)done));
+                goto out;
             }
             done += (size_t)w;
         }
 
-        if (ctx_has_error(ctx)) {
-            chunk_worker_set_state(ctx, id, 0);
-            break;
-        }
-
-        chunk_worker_add_done(ctx, id, (uint64_t)len);
-        stats_advance_current_file((uint64_t)len);
-        chunk_worker_set_state(ctx, id, 0);
+        pos += this_len_off;
+        ws->bytes_done += (uint64_t)len;
+        ws->chunks_done++;
     }
 
+    rc = 0;
+
+out:
+    ws->active = 0;
+
     free(buf);
-    return NULL;
+    if (fd_in >= 0) close(fd_in);
+    if (fd_out >= 0) close(fd_out);
+    return rc;
 }
 
 static int copy_file_parallel_large(const char *src, const char *dst, const struct stat *src_st)
@@ -470,77 +521,145 @@ static int copy_file_parallel_large(const char *src, const char *dst, const stru
     init_runtime_config();
 
     parallel_ctx_t ctx;
-    chunk_worker_arg_t *args = NULL;
-    pthread_t *tids = NULL;
-
-    int fd_in = -1;
-    int fd_out = -1;
-    int in_direct = 0;
-    int out_direct = 0;
+    pid_t *pids = NULL;
+    int *done = NULL;
     int rc = -1;
+    uint64_t accounted = 0;
+    int failed = 0;
 
     memset(&ctx, 0, sizeof(ctx));
     ctx.file_size = src_st->st_size;
     ctx.bulk_end = (src_st->st_size / ALIGNMENT) * ALIGNMENT;
-    ctx.next_offset = 0;
     ctx.worker_count = g_large_worker_count;
-    ctx.workers = calloc((size_t)ctx.worker_count, sizeof(*ctx.workers));
-    args = calloc((size_t)ctx.worker_count, sizeof(*args));
-    tids = calloc((size_t)ctx.worker_count, sizeof(*tids));
 
-    if (!ctx.workers || !args || !tids) {
+    ctx.workers = mmap(NULL,
+                       (size_t)ctx.worker_count * sizeof(*ctx.workers),
+                       PROT_READ | PROT_WRITE,
+                       MAP_SHARED | MAP_ANONYMOUS,
+                       -1,
+                       0);
+    if (ctx.workers == MAP_FAILED) {
+        perror("mmap");
+        ctx.workers = NULL;
+        return -1;
+    }
+    memset(ctx.workers, 0, (size_t)ctx.worker_count * sizeof(*ctx.workers));
+
+    pids = calloc((size_t)ctx.worker_count, sizeof(*pids));
+    done = calloc((size_t)ctx.worker_count, sizeof(*done));
+    if (!pids || !done) {
         perror("calloc");
         goto out;
     }
 
-    pthread_mutex_init(&ctx.offset_lock, NULL);
-    pthread_mutex_init(&ctx.error_lock, NULL);
-
-    fd_in = open_read_maybe_direct(src, &in_direct);
-    if (fd_in < 0) {
+    if (prepare_destination_file(dst, src_st) != 0) {
         goto out;
     }
-
-    fd_out = open_write_maybe_direct(dst, src_st->st_mode & 07777, &out_direct);
-    if (fd_out < 0) {
-        goto out;
-    }
-
-    if (!out_direct) {
-        if (ftruncate(fd_out, src_st->st_size) != 0) {
-            perror("ftruncate");
-        }
-    }
-
-    ctx.fd_in = fd_in;
-    ctx.fd_out = fd_out;
 
     stats_begin_current_file(src, (uint64_t)src_st->st_size, 1);
     stats_set_active_parallel_ctx(&ctx);
 
+    /* Split the aligned bulk area into contiguous regions, dd-style */
+    off_t base = 0;
+    off_t per = (ctx.worker_count > 0) ? (ctx.bulk_end / ctx.worker_count) : ctx.bulk_end;
+    per = (per / ALIGNMENT) * ALIGNMENT;
+
     for (int i = 0; i < ctx.worker_count; i++) {
-        args[i].ctx = &ctx;
-        args[i].worker_id = i;
-        if (pthread_create(&tids[i], NULL, large_chunk_worker_main, &args[i]) != 0) {
-            perror("pthread_create");
-            ctx_set_error(&ctx);
-            ctx.worker_count = i;
+        off_t start = base;
+        off_t end;
+
+        if (i == ctx.worker_count - 1) {
+            end = ctx.bulk_end;
+        } else {
+            end = start + per;
+        }
+        base = end;
+
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            failed = 1;
+            kill_remaining_children(pids, i, done);
             break;
+        }
+
+        if (pid == 0) {
+            int child_rc = child_copy_range(src, dst, start, end, &ctx.workers[i]);
+            _exit(child_rc == 0 ? 0 : 1);
+        }
+
+        pids[i] = pid;
+    }
+
+    /* Parent monitors progress and child completion */
+    while (1) {
+        int completed = 0;
+
+        for (int i = 0; i < ctx.worker_count; i++) {
+            if (done[i] || pids[i] <= 0) {
+                if (done[i]) {
+                    completed++;
+                }
+                continue;
+            }
+
+            int status = 0;
+            pid_t r = waitpid(pids[i], &status, WNOHANG);
+            if (r == 0) {
+                /* still running */
+            } else if (r < 0) {
+                perror("waitpid");
+                failed = 1;
+                done[i] = 1;
+                completed++;
+            } else {
+                done[i] = 1;
+                completed++;
+                if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+                    failed = 1;
+                }
+            }
+        }
+
+        uint64_t total_done = sum_worker_bytes(ctx.workers, ctx.worker_count);
+        if (total_done > accounted) {
+            stats_advance_current_file(total_done - accounted);
+            accounted = total_done;
+        }
+
+        if (failed) {
+            kill_remaining_children(pids, ctx.worker_count, done);
+
+            /* wait for all remaining */
+            for (int i = 0; i < ctx.worker_count; i++) {
+                if (!done[i] && pids[i] > 0) {
+                    int status = 0;
+                    (void)waitpid(pids[i], &status, 0);
+                    done[i] = 1;
+                }
+            }
+            break;
+        }
+
+        if (completed == ctx.worker_count) {
+            break;
+        }
+
+        usleep(MONITOR_INTERVAL_MS * 1000);
+    }
+
+    /* Final progress sync */
+    {
+        uint64_t total_done = sum_worker_bytes(ctx.workers, ctx.worker_count);
+        if (total_done > accounted) {
+            stats_advance_current_file(total_done - accounted);
+            accounted = total_done;
         }
     }
 
-    for (int i = 0; i < ctx.worker_count; i++) {
-        pthread_join(tids[i], NULL);
-    }
-
-    if (ctx_has_error(&ctx)) {
+    if (failed) {
         goto out_with_current;
     }
-
-    close(fd_in);
-    fd_in = -1;
-    close(fd_out);
-    fd_out = -1;
 
     if (copy_tail_buffered(src, dst, ctx.bulk_end, src_st->st_size, 1) != 0) {
         goto out_with_current;
@@ -558,29 +677,11 @@ out_with_current:
     stats_end_current_file();
 
 out:
-    if (fd_in >= 0) {
-        close(fd_in);
-    }
-    if (fd_out >= 0) {
-        close(fd_out);
-    }
-
     if (ctx.workers) {
-        free(ctx.workers);
+        munmap(ctx.workers, (size_t)ctx.worker_count * sizeof(*ctx.workers));
     }
-    if (args) {
-        free(args);
-    }
-    if (tids) {
-        free(tids);
-    }
-
-    /* destroy only if initialized */
-    if (ctx.worker_count >= 0) {
-        pthread_mutex_destroy(&ctx.offset_lock);
-        pthread_mutex_destroy(&ctx.error_lock);
-    }
-
+    free(pids);
+    free(done);
     return rc;
 }
 
@@ -707,7 +808,6 @@ int workers_enqueue_small_file(const char *src, const char *dst, const struct st
 {
     init_runtime_config();
 
-    /* Safety: if traversal.c used a stale compile-time threshold, route correctly here */
     if (src_st->st_size > runtime_large_threshold()) {
         return enqueue_task(&g_large_queue_head,
                             &g_large_queue_tail,
