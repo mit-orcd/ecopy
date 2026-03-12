@@ -14,10 +14,25 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <limits.h>
+
+/*
+ * Runtime overrides:
+ *
+ *   DIRECT_COPY_SMALL_WORKERS
+ *   DIRECT_COPY_LARGE_WORKERS
+ *   DIRECT_COPY_CHUNK_MB
+ *
+ * Defaults come from config.h.
+ */
+
+static pthread_t *g_small_workers = NULL;
+static int g_small_worker_count = 0;
+static int g_large_worker_count = 0;
+static off_t g_chunk_size = 0;
 
 /* -------------------- small-file queue -------------------- */
 
-static pthread_t g_small_workers[SMALL_FILE_WORKERS];
 static pthread_mutex_t g_small_queue_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_small_queue_cond = PTHREAD_COND_INITIALIZER;
 static file_task_t    *g_small_queue_head = NULL;
@@ -36,6 +51,61 @@ static file_task_t    *g_large_queue_tail = NULL;
 static int             g_large_queue_done = 0;
 static uint64_t        g_large_queue_depth = 0;
 static uint64_t        g_large_workers_active = 0;
+
+/* -------------------- runtime config -------------------- */
+
+static int env_int_or_default(const char *name, int defval, int minval, int maxval)
+{
+    const char *s = getenv(name);
+    if (!s || !*s) {
+        return defval;
+    }
+
+    errno = 0;
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+
+    if (errno != 0 || end == s || *end != '\0') {
+        return defval;
+    }
+    if (v < minval) {
+        return minval;
+    }
+    if (v > maxval) {
+        return maxval;
+    }
+    return (int)v;
+}
+
+static void init_runtime_config(void)
+{
+    if (g_small_worker_count > 0 && g_large_worker_count > 0 && g_chunk_size > 0) {
+        return;
+    }
+
+    g_small_worker_count = env_int_or_default("DIRECT_COPY_SMALL_WORKERS",
+                                              SMALL_FILE_WORKERS,
+                                              1,
+                                              512);
+
+    g_large_worker_count = env_int_or_default("DIRECT_COPY_LARGE_WORKERS",
+                                              LARGE_FILE_WORKERS,
+                                              1,
+                                              128);
+
+    int chunk_mb = env_int_or_default("DIRECT_COPY_CHUNK_MB",
+                                      (int)(CHUNK_SIZE / (1024 * 1024)),
+                                      1,
+                                      4096);
+
+    g_chunk_size = (off_t)chunk_mb * 1024 * 1024;
+}
+
+static off_t runtime_large_threshold(void)
+{
+    init_runtime_config();
+    return g_chunk_size * 10;
+}
 
 /* -------------------- generic queue helpers -------------------- */
 
@@ -199,6 +269,8 @@ static int copy_tail_buffered(const char *src,
 
 static int copy_file_serial_small(const char *src, const char *dst, const struct stat *src_st)
 {
+    init_runtime_config();
+
     int fd_in = -1;
     int fd_out = -1;
     int in_direct = 0;
@@ -226,7 +298,7 @@ static int copy_file_serial_small(const char *src, const char *dst, const struct
         }
     }
 
-    if (posix_memalign(&buf, ALIGNMENT, (size_t)CHUNK_SIZE) != 0) {
+    if (posix_memalign(&buf, ALIGNMENT, (size_t)g_chunk_size) != 0) {
         fprintf(stderr, "posix_memalign failed\n");
         close(fd_in);
         close(fd_out);
@@ -235,7 +307,7 @@ static int copy_file_serial_small(const char *src, const char *dst, const struct
 
     while (pos < bulk_end) {
         off_t remain = bulk_end - pos;
-        off_t this_len_off = (remain >= CHUNK_SIZE) ? CHUNK_SIZE : remain;
+        off_t this_len_off = (remain >= g_chunk_size) ? g_chunk_size : remain;
         size_t len = (size_t)this_len_off;
 
         ssize_t r = read(fd_in, buf, len);
@@ -318,7 +390,7 @@ static void *large_chunk_worker_main(void *arg)
     int id = wa->worker_id;
     void *buf = NULL;
 
-    if (posix_memalign(&buf, ALIGNMENT, (size_t)CHUNK_SIZE) != 0) {
+    if (posix_memalign(&buf, ALIGNMENT, (size_t)g_chunk_size) != 0) {
         fprintf(stderr, "posix_memalign failed\n");
         ctx_set_error(ctx);
         return NULL;
@@ -337,7 +409,7 @@ static void *large_chunk_worker_main(void *arg)
         }
 
         off_t remain = ctx->bulk_end - off;
-        this_len_off = (remain >= CHUNK_SIZE) ? CHUNK_SIZE : remain;
+        this_len_off = (remain >= g_chunk_size) ? g_chunk_size : remain;
         len = (size_t)this_len_off;
         ctx->next_offset += this_len_off;
         pthread_mutex_unlock(&ctx->offset_lock);
@@ -395,9 +467,11 @@ static void *large_chunk_worker_main(void *arg)
 
 static int copy_file_parallel_large(const char *src, const char *dst, const struct stat *src_st)
 {
+    init_runtime_config();
+
     parallel_ctx_t ctx;
-    chunk_worker_arg_t args[LARGE_FILE_WORKERS];
-    pthread_t tids[LARGE_FILE_WORKERS];
+    chunk_worker_arg_t *args = NULL;
+    pthread_t *tids = NULL;
 
     int fd_in = -1;
     int fd_out = -1;
@@ -409,11 +483,14 @@ static int copy_file_parallel_large(const char *src, const char *dst, const stru
     ctx.file_size = src_st->st_size;
     ctx.bulk_end = (src_st->st_size / ALIGNMENT) * ALIGNMENT;
     ctx.next_offset = 0;
-    ctx.worker_count = LARGE_FILE_WORKERS;
-    ctx.workers = calloc((size_t)LARGE_FILE_WORKERS, sizeof(*ctx.workers));
-    if (!ctx.workers) {
+    ctx.worker_count = g_large_worker_count;
+    ctx.workers = calloc((size_t)ctx.worker_count, sizeof(*ctx.workers));
+    args = calloc((size_t)ctx.worker_count, sizeof(*args));
+    tids = calloc((size_t)ctx.worker_count, sizeof(*tids));
+
+    if (!ctx.workers || !args || !tids) {
         perror("calloc");
-        return -1;
+        goto out;
     }
 
     pthread_mutex_init(&ctx.offset_lock, NULL);
@@ -488,9 +565,22 @@ out:
         close(fd_out);
     }
 
-    pthread_mutex_destroy(&ctx.offset_lock);
-    pthread_mutex_destroy(&ctx.error_lock);
-    free(ctx.workers);
+    if (ctx.workers) {
+        free(ctx.workers);
+    }
+    if (args) {
+        free(args);
+    }
+    if (tids) {
+        free(tids);
+    }
+
+    /* destroy only if initialized */
+    if (ctx.worker_count >= 0) {
+        pthread_mutex_destroy(&ctx.offset_lock);
+        pthread_mutex_destroy(&ctx.error_lock);
+    }
+
     return rc;
 }
 
@@ -552,6 +642,8 @@ static void *large_file_dispatcher_main(void *arg)
 
 int workers_start(void)
 {
+    init_runtime_config();
+
     pthread_mutex_lock(&g_small_queue_lock);
     g_small_queue_done = 0;
     g_small_queue_head = NULL;
@@ -568,7 +660,13 @@ int workers_start(void)
     g_large_workers_active = 0;
     pthread_mutex_unlock(&g_large_queue_lock);
 
-    for (int i = 0; i < SMALL_FILE_WORKERS; i++) {
+    g_small_workers = calloc((size_t)g_small_worker_count, sizeof(*g_small_workers));
+    if (!g_small_workers) {
+        perror("calloc");
+        return -1;
+    }
+
+    for (int i = 0; i < g_small_worker_count; i++) {
         if (pthread_create(&g_small_workers[i], NULL, small_file_worker_main, NULL) != 0) {
             perror("pthread_create");
             return -1;
@@ -590,7 +688,7 @@ void workers_stop(void)
     pthread_cond_broadcast(&g_small_queue_cond);
     pthread_mutex_unlock(&g_small_queue_lock);
 
-    for (int i = 0; i < SMALL_FILE_WORKERS; i++) {
+    for (int i = 0; i < g_small_worker_count; i++) {
         pthread_join(g_small_workers[i], NULL);
     }
 
@@ -600,10 +698,27 @@ void workers_stop(void)
     pthread_mutex_unlock(&g_large_queue_lock);
 
     pthread_join(g_large_dispatcher_thread, NULL);
+
+    free(g_small_workers);
+    g_small_workers = NULL;
 }
 
 int workers_enqueue_small_file(const char *src, const char *dst, const struct stat *src_st)
 {
+    init_runtime_config();
+
+    /* Safety: if traversal.c used a stale compile-time threshold, route correctly here */
+    if (src_st->st_size > runtime_large_threshold()) {
+        return enqueue_task(&g_large_queue_head,
+                            &g_large_queue_tail,
+                            &g_large_queue_lock,
+                            &g_large_queue_cond,
+                            &g_large_queue_depth,
+                            src,
+                            dst,
+                            src_st);
+    }
+
     return enqueue_task(&g_small_queue_head,
                         &g_small_queue_tail,
                         &g_small_queue_lock,
