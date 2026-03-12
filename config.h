@@ -1,0 +1,17 @@
+#ifndef CONFIG_H
+#define CONFIG_H
+
+#include <sys/types.h>
+
+#define ALIGNMENT 4096
+#define CHUNK_SIZE ((off_t)(64ULL * 1024ULL * 1024ULL))
+#define PARALLEL_THRESHOLD ((off_t)(10 * CHUNK_SIZE))
+
+#define LARGE_FILE_WORKERS 4
+#define SMALL_FILE_WORKERS 4
+
+#define MONITOR_INTERVAL_MS 200
+#define SPEED_WINDOW_SEC 10
+#define SPEED_SLOTS (SPEED_WINDOW_SEC * 1000 / MONITOR_INTERVAL_MS)
+
+#endif
