@@ -44,15 +44,16 @@ static void trim_to_width(char *s, int width) {
 
 static void append_chunk_worker_stats(char *out, size_t out_sz, int *n_io) {
     int n = *n_io;
-    parallel_ctx_t *ctx = stats_get_active_parallel_ctx();
+    chunk_worker_stat_t workers[128];
+    int worker_count = stats_copy_active_parallel_workers(workers, (int)(sizeof(workers) / sizeof(workers[0])));
 
-    if (!ctx || !ctx->workers) {
+    if (worker_count <= 0) {
         *n_io = n;
         return;
     }
 
-    for (int i = 0; i < ctx->worker_count; i++) {
-        chunk_worker_stat_t *ws = &ctx->workers[i];
+    for (int i = 0; i < worker_count; i++) {
+        chunk_worker_stat_t *ws = &workers[i];
 
         if (n <= 0 || (size_t)n >= out_sz) {
             break;

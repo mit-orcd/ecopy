@@ -22,36 +22,39 @@
 /*
  * Runtime overrides:
  *
- *   DIRECT_COPY_SMALL_WORKERS
+ *   DIRECT_COPY_MAX_WORKERS
  *   DIRECT_COPY_LARGE_WORKERS
  *   DIRECT_COPY_CHUNK_MB
  */
 
-static pthread_t *g_small_workers = NULL;
-static int g_small_worker_count = 0;
+typedef struct {
+    file_task_t *task;
+    int is_large;
+    int slots_used;
+} task_claim_t;
+
+static pthread_t *g_workers = NULL;
+static int g_worker_count = 0;
 static int g_large_worker_count = 0;
 static off_t g_chunk_size = 0;
 
-/* -------------------- small-file queue -------------------- */
+/* -------------------- scheduler state -------------------- */
 
-static pthread_mutex_t g_small_queue_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  g_small_queue_cond = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t g_queue_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_queue_cond = PTHREAD_COND_INITIALIZER;
 static file_task_t    *g_small_queue_head = NULL;
 static file_task_t    *g_small_queue_tail = NULL;
-static int             g_small_queue_done = 0;
-static uint64_t        g_small_queue_depth = 0;
-static uint64_t        g_small_workers_active = 0;
-
-/* -------------------- large-file queue -------------------- */
-
-static pthread_t g_large_dispatcher_thread;
-static pthread_mutex_t g_large_queue_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  g_large_queue_cond = PTHREAD_COND_INITIALIZER;
 static file_task_t    *g_large_queue_head = NULL;
 static file_task_t    *g_large_queue_tail = NULL;
-static int             g_large_queue_done = 0;
+static int             g_queue_done = 0;
+static uint64_t        g_small_queue_depth = 0;
 static uint64_t        g_large_queue_depth = 0;
+static uint64_t        g_small_workers_active = 0;
 static uint64_t        g_large_workers_active = 0;
+static int             g_capacity_in_use = 0;
+
+static int g_workers_error = 0;
+static pthread_mutex_t g_workers_error_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* -------------------- runtime config -------------------- */
 
@@ -80,19 +83,19 @@ static int env_int_or_default(const char *name, int defval, int minval, int maxv
 
 static void init_runtime_config(void)
 {
-    if (g_small_worker_count > 0 && g_large_worker_count > 0 && g_chunk_size > 0) {
+    if (g_worker_count > 0 && g_large_worker_count > 0 && g_chunk_size > 0) {
         return;
     }
 
-    g_small_worker_count = env_int_or_default("DIRECT_COPY_SMALL_WORKERS",
-                                              SMALL_FILE_WORKERS,
-                                              1,
-                                              512);
+    g_worker_count = env_int_or_default("DIRECT_COPY_MAX_WORKERS",
+                                        MAX_WORKER_SLOTS,
+                                        1,
+                                        512);
 
     g_large_worker_count = env_int_or_default("DIRECT_COPY_LARGE_WORKERS",
                                               LARGE_FILE_WORKERS,
                                               1,
-                                              128);
+                                              g_worker_count);
 
     int chunk_mb = env_int_or_default("DIRECT_COPY_CHUNK_MB",
                                       (int)(CHUNK_SIZE / (1024 * 1024)),
@@ -108,12 +111,10 @@ static off_t runtime_large_threshold(void)
     return g_chunk_size * 10;
 }
 
-/* -------------------- generic queue helpers -------------------- */
+/* -------------------- scheduler helpers -------------------- */
 
 static int enqueue_task(file_task_t **head,
                         file_task_t **tail,
-                        pthread_mutex_t *lock,
-                        pthread_cond_t *cond,
                         uint64_t *depth,
                         const char *src,
                         const char *dst,
@@ -130,7 +131,7 @@ static int enqueue_task(file_task_t **head,
     t->src_st = *src_st;
     t->next = NULL;
 
-    pthread_mutex_lock(lock);
+    pthread_mutex_lock(&g_queue_lock);
     if (*tail) {
         (*tail)->next = t;
     } else {
@@ -138,51 +139,106 @@ static int enqueue_task(file_task_t **head,
     }
     *tail = t;
     (*depth)++;
-    pthread_cond_signal(cond);
-    pthread_mutex_unlock(lock);
+    pthread_cond_broadcast(&g_queue_cond);
+    pthread_mutex_unlock(&g_queue_lock);
 
     return 0;
 }
 
-static file_task_t *dequeue_task(file_task_t **head,
-                                 file_task_t **tail,
-                                 pthread_mutex_t *lock,
-                                 pthread_cond_t *cond,
-                                 int *done_flag,
-                                 uint64_t *depth,
-                                 uint64_t *active)
+static file_task_t *pop_task(file_task_t **head, file_task_t **tail)
 {
-    pthread_mutex_lock(lock);
-
-    while (!*head && !*done_flag) {
-        pthread_cond_wait(cond, lock);
-    }
-
-    if (!*head && *done_flag) {
-        pthread_mutex_unlock(lock);
-        return NULL;
-    }
-
     file_task_t *t = *head;
     *head = t->next;
     if (!*head) {
         *tail = NULL;
     }
-
-    (*depth)--;
-    (*active)++;
-    pthread_mutex_unlock(lock);
-
+    t->next = NULL;
     return t;
 }
 
-static void finish_task(pthread_mutex_t *lock, uint64_t *active)
+static task_claim_t dequeue_schedulable_task(void)
 {
-    pthread_mutex_lock(lock);
-    if (*active > 0) {
-        (*active)--;
+    task_claim_t claim;
+    memset(&claim, 0, sizeof(claim));
+
+    pthread_mutex_lock(&g_queue_lock);
+
+    for (;;) {
+        if (g_large_queue_head && g_capacity_in_use + g_large_worker_count <= g_worker_count) {
+            claim.task = pop_task(&g_large_queue_head, &g_large_queue_tail);
+            g_large_queue_depth--;
+            g_large_workers_active++;
+            g_capacity_in_use += g_large_worker_count;
+            claim.is_large = 1;
+            claim.slots_used = g_large_worker_count;
+            break;
+        }
+
+        if (g_small_queue_head && g_capacity_in_use < g_worker_count) {
+            claim.task = pop_task(&g_small_queue_head, &g_small_queue_tail);
+            g_small_queue_depth--;
+            g_small_workers_active++;
+            g_capacity_in_use += 1;
+            claim.is_large = 0;
+            claim.slots_used = 1;
+            break;
+        }
+
+        if (!g_small_queue_head && !g_large_queue_head && g_queue_done) {
+            break;
+        }
+
+        pthread_cond_wait(&g_queue_cond, &g_queue_lock);
     }
-    pthread_mutex_unlock(lock);
+
+    pthread_mutex_unlock(&g_queue_lock);
+    return claim;
+}
+
+static void finish_task(int is_large, int slots_used)
+{
+    pthread_mutex_lock(&g_queue_lock);
+
+    g_capacity_in_use -= slots_used;
+    if (g_capacity_in_use < 0) {
+        g_capacity_in_use = 0;
+    }
+
+    if (is_large) {
+        if (g_large_workers_active > 0) {
+            g_large_workers_active--;
+        }
+    } else {
+        if (g_small_workers_active > 0) {
+            g_small_workers_active--;
+        }
+    }
+
+    pthread_cond_broadcast(&g_queue_cond);
+    pthread_mutex_unlock(&g_queue_lock);
+}
+
+static void mark_worker_error(void)
+{
+    pthread_mutex_lock(&g_workers_error_lock);
+    g_workers_error = 1;
+    pthread_mutex_unlock(&g_workers_error_lock);
+}
+
+static void clear_worker_error(void)
+{
+    pthread_mutex_lock(&g_workers_error_lock);
+    g_workers_error = 0;
+    pthread_mutex_unlock(&g_workers_error_lock);
+}
+
+int workers_status(void)
+{
+    int v;
+    pthread_mutex_lock(&g_workers_error_lock);
+    v = g_workers_error;
+    pthread_mutex_unlock(&g_workers_error_lock);
+    return v;
 }
 
 /* -------------------- copy helpers -------------------- */
@@ -203,17 +259,19 @@ static int open_write_existing_maybe_direct(const char *path, int *used_direct)
         *used_direct = 0;
     }
 
-    fd = open(path, O_WRONLY | O_DIRECT);
-    if (fd >= 0) {
-        if (used_direct) {
-            *used_direct = 1;
+    if (direct_io_enabled()) {
+        fd = open(path, O_WRONLY | O_DIRECT);
+        if (fd >= 0) {
+            if (used_direct) {
+                *used_direct = 1;
+            }
+            return fd;
         }
-        return fd;
-    }
 
-    if (!direct_io_fallback_errno_local(errno)) {
-        perror(path);
-        return -1;
+        if (!direct_io_fallback_errno_local(errno)) {
+            perror(path);
+            return -1;
+        }
     }
 
     fd = open(path, O_WRONLY);
@@ -351,6 +409,9 @@ static int copy_file_serial_small(const char *src, const char *dst, const struct
 
     if (ftruncate(fd_out, size) != 0) {
         perror("ftruncate");
+        close(fd_in);
+        close(fd_out);
+        return -1;
     }
 
     if (posix_memalign(&buf, ALIGNMENT, (size_t)g_chunk_size) != 0) {
@@ -556,10 +617,6 @@ static int copy_file_parallel_large(const char *src, const char *dst, const stru
         goto out;
     }
 
-    stats_begin_current_file(src, (uint64_t)src_st->st_size, 1);
-    stats_set_active_parallel_ctx(&ctx);
-
-    /* Split the aligned bulk area into contiguous regions, dd-style */
     off_t base = 0;
     off_t per = (ctx.worker_count > 0) ? (ctx.bulk_end / ctx.worker_count) : ctx.bulk_end;
     per = (per / ALIGNMENT) * ALIGNMENT;
@@ -591,7 +648,6 @@ static int copy_file_parallel_large(const char *src, const char *dst, const stru
         pids[i] = pid;
     }
 
-    /* Parent monitors progress and child completion */
     while (1) {
         int completed = 0;
 
@@ -623,14 +679,13 @@ static int copy_file_parallel_large(const char *src, const char *dst, const stru
 
         uint64_t total_done = sum_worker_bytes(ctx.workers, ctx.worker_count);
         if (total_done > accounted) {
-            stats_advance_current_file(total_done - accounted);
+            stats_add_bytes(total_done - accounted);
             accounted = total_done;
         }
 
         if (failed) {
             kill_remaining_children(pids, ctx.worker_count, done);
 
-            /* wait for all remaining */
             for (int i = 0; i < ctx.worker_count; i++) {
                 if (!done[i] && pids[i] > 0) {
                     int status = 0;
@@ -648,33 +703,28 @@ static int copy_file_parallel_large(const char *src, const char *dst, const stru
         usleep(MONITOR_INTERVAL_MS * 1000);
     }
 
-    /* Final progress sync */
     {
         uint64_t total_done = sum_worker_bytes(ctx.workers, ctx.worker_count);
         if (total_done > accounted) {
-            stats_advance_current_file(total_done - accounted);
+            stats_add_bytes(total_done - accounted);
             accounted = total_done;
         }
     }
 
     if (failed) {
-        goto out_with_current;
+        goto out;
     }
 
-    if (copy_tail_buffered(src, dst, ctx.bulk_end, src_st->st_size, 1) != 0) {
-        goto out_with_current;
+    if (copy_tail_buffered(src, dst, ctx.bulk_end, src_st->st_size, 0) != 0) {
+        goto out;
     }
 
     if (finalize_copied_file(dst, src_st) != 0) {
-        goto out_with_current;
+        goto out;
     }
 
     stats_inc_files_copied();
     rc = 0;
-
-out_with_current:
-    stats_clear_active_parallel_ctx();
-    stats_end_current_file();
 
 out:
     if (ctx.workers) {
@@ -687,53 +737,30 @@ out:
 
 /* -------------------- worker threads -------------------- */
 
-static void *small_file_worker_main(void *arg)
+static void *worker_main(void *arg)
 {
     (void)arg;
 
     for (;;) {
-        file_task_t *t = dequeue_task(&g_small_queue_head,
-                                      &g_small_queue_tail,
-                                      &g_small_queue_lock,
-                                      &g_small_queue_cond,
-                                      &g_small_queue_done,
-                                      &g_small_queue_depth,
-                                      &g_small_workers_active);
-        if (!t) {
+        task_claim_t claim = dequeue_schedulable_task();
+        if (!claim.task) {
             break;
         }
 
-        if (copy_file_serial_small(t->src, t->dst, &t->src_st) == 0) {
-            stats_inc_files_copied();
+        if (claim.is_large) {
+            if (copy_file_parallel_large(claim.task->src, claim.task->dst, &claim.task->src_st) != 0) {
+                mark_worker_error();
+            }
+        } else {
+            if (copy_file_serial_small(claim.task->src, claim.task->dst, &claim.task->src_st) == 0) {
+                stats_inc_files_copied();
+            } else {
+                mark_worker_error();
+            }
         }
 
-        free(t);
-        finish_task(&g_small_queue_lock, &g_small_workers_active);
-    }
-
-    return NULL;
-}
-
-static void *large_file_dispatcher_main(void *arg)
-{
-    (void)arg;
-
-    for (;;) {
-        file_task_t *t = dequeue_task(&g_large_queue_head,
-                                      &g_large_queue_tail,
-                                      &g_large_queue_lock,
-                                      &g_large_queue_cond,
-                                      &g_large_queue_done,
-                                      &g_large_queue_depth,
-                                      &g_large_workers_active);
-        if (!t) {
-            break;
-        }
-
-        (void)copy_file_parallel_large(t->src, t->dst, &t->src_st);
-
-        free(t);
-        finish_task(&g_large_queue_lock, &g_large_workers_active);
+        free(claim.task);
+        finish_task(claim.is_large, claim.slots_used);
     }
 
     return NULL;
@@ -744,39 +771,32 @@ static void *large_file_dispatcher_main(void *arg)
 int workers_start(void)
 {
     init_runtime_config();
+    clear_worker_error();
 
-    pthread_mutex_lock(&g_small_queue_lock);
-    g_small_queue_done = 0;
+    pthread_mutex_lock(&g_queue_lock);
+    g_queue_done = 0;
     g_small_queue_head = NULL;
     g_small_queue_tail = NULL;
-    g_small_queue_depth = 0;
-    g_small_workers_active = 0;
-    pthread_mutex_unlock(&g_small_queue_lock);
-
-    pthread_mutex_lock(&g_large_queue_lock);
-    g_large_queue_done = 0;
     g_large_queue_head = NULL;
     g_large_queue_tail = NULL;
+    g_small_queue_depth = 0;
     g_large_queue_depth = 0;
+    g_small_workers_active = 0;
     g_large_workers_active = 0;
-    pthread_mutex_unlock(&g_large_queue_lock);
+    g_capacity_in_use = 0;
+    pthread_mutex_unlock(&g_queue_lock);
 
-    g_small_workers = calloc((size_t)g_small_worker_count, sizeof(*g_small_workers));
-    if (!g_small_workers) {
+    g_workers = calloc((size_t)g_worker_count, sizeof(*g_workers));
+    if (!g_workers) {
         perror("calloc");
         return -1;
     }
 
-    for (int i = 0; i < g_small_worker_count; i++) {
-        if (pthread_create(&g_small_workers[i], NULL, small_file_worker_main, NULL) != 0) {
+    for (int i = 0; i < g_worker_count; i++) {
+        if (pthread_create(&g_workers[i], NULL, worker_main, NULL) != 0) {
             perror("pthread_create");
             return -1;
         }
-    }
-
-    if (pthread_create(&g_large_dispatcher_thread, NULL, large_file_dispatcher_main, NULL) != 0) {
-        perror("pthread_create");
-        return -1;
     }
 
     return 0;
@@ -784,24 +804,17 @@ int workers_start(void)
 
 void workers_stop(void)
 {
-    pthread_mutex_lock(&g_small_queue_lock);
-    g_small_queue_done = 1;
-    pthread_cond_broadcast(&g_small_queue_cond);
-    pthread_mutex_unlock(&g_small_queue_lock);
+    pthread_mutex_lock(&g_queue_lock);
+    g_queue_done = 1;
+    pthread_cond_broadcast(&g_queue_cond);
+    pthread_mutex_unlock(&g_queue_lock);
 
-    for (int i = 0; i < g_small_worker_count; i++) {
-        pthread_join(g_small_workers[i], NULL);
+    for (int i = 0; i < g_worker_count; i++) {
+        pthread_join(g_workers[i], NULL);
     }
 
-    pthread_mutex_lock(&g_large_queue_lock);
-    g_large_queue_done = 1;
-    pthread_cond_broadcast(&g_large_queue_cond);
-    pthread_mutex_unlock(&g_large_queue_lock);
-
-    pthread_join(g_large_dispatcher_thread, NULL);
-
-    free(g_small_workers);
-    g_small_workers = NULL;
+    free(g_workers);
+    g_workers = NULL;
 }
 
 int workers_enqueue_small_file(const char *src, const char *dst, const struct stat *src_st)
@@ -811,8 +824,6 @@ int workers_enqueue_small_file(const char *src, const char *dst, const struct st
     if (src_st->st_size > runtime_large_threshold()) {
         return enqueue_task(&g_large_queue_head,
                             &g_large_queue_tail,
-                            &g_large_queue_lock,
-                            &g_large_queue_cond,
                             &g_large_queue_depth,
                             src,
                             dst,
@@ -821,8 +832,6 @@ int workers_enqueue_small_file(const char *src, const char *dst, const struct st
 
     return enqueue_task(&g_small_queue_head,
                         &g_small_queue_tail,
-                        &g_small_queue_lock,
-                        &g_small_queue_cond,
                         &g_small_queue_depth,
                         src,
                         dst,
@@ -833,8 +842,6 @@ int workers_enqueue_large_file(const char *src, const char *dst, const struct st
 {
     return enqueue_task(&g_large_queue_head,
                         &g_large_queue_tail,
-                        &g_large_queue_lock,
-                        &g_large_queue_cond,
                         &g_large_queue_depth,
                         src,
                         dst,
@@ -844,35 +851,35 @@ int workers_enqueue_large_file(const char *src, const char *dst, const struct st
 uint64_t workers_small_queue_depth(void)
 {
     uint64_t v;
-    pthread_mutex_lock(&g_small_queue_lock);
+    pthread_mutex_lock(&g_queue_lock);
     v = g_small_queue_depth;
-    pthread_mutex_unlock(&g_small_queue_lock);
+    pthread_mutex_unlock(&g_queue_lock);
     return v;
 }
 
 uint64_t workers_small_active_count(void)
 {
     uint64_t v;
-    pthread_mutex_lock(&g_small_queue_lock);
+    pthread_mutex_lock(&g_queue_lock);
     v = g_small_workers_active;
-    pthread_mutex_unlock(&g_small_queue_lock);
+    pthread_mutex_unlock(&g_queue_lock);
     return v;
 }
 
 uint64_t workers_large_queue_depth(void)
 {
     uint64_t v;
-    pthread_mutex_lock(&g_large_queue_lock);
+    pthread_mutex_lock(&g_queue_lock);
     v = g_large_queue_depth;
-    pthread_mutex_unlock(&g_large_queue_lock);
+    pthread_mutex_unlock(&g_queue_lock);
     return v;
 }
 
 uint64_t workers_large_active_count(void)
 {
     uint64_t v;
-    pthread_mutex_lock(&g_large_queue_lock);
+    pthread_mutex_lock(&g_queue_lock);
     v = g_large_workers_active;
-    pthread_mutex_unlock(&g_large_queue_lock);
+    pthread_mutex_unlock(&g_queue_lock);
     return v;
 }

@@ -18,7 +18,7 @@ void stats_end_current_file(void);
 
 void stats_set_active_parallel_ctx(parallel_ctx_t *ctx);
 void stats_clear_active_parallel_ctx(void);
-parallel_ctx_t *stats_get_active_parallel_ctx(void);
+int stats_copy_active_parallel_workers(chunk_worker_stat_t *out, int max_workers);
 
 void stats_record_speed_sample(void);
 double stats_elapsed_sec(void);

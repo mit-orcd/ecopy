@@ -81,9 +81,40 @@ void stats_end_current_file(void) {
     pthread_mutex_unlock(&g_lock);
 }
 
-void stats_set_active_parallel_ctx(parallel_ctx_t *ctx){ pthread_mutex_lock(&g_lock); g_active_parallel_ctx = ctx; pthread_mutex_unlock(&g_lock);} 
-void stats_clear_active_parallel_ctx(void){ pthread_mutex_lock(&g_lock); g_active_parallel_ctx = NULL; pthread_mutex_unlock(&g_lock);} 
-parallel_ctx_t *stats_get_active_parallel_ctx(void){ parallel_ctx_t *ctx; pthread_mutex_lock(&g_lock); ctx = g_active_parallel_ctx; pthread_mutex_unlock(&g_lock); return ctx; }
+void stats_set_active_parallel_ctx(parallel_ctx_t *ctx)
+{
+    pthread_mutex_lock(&g_lock);
+    g_active_parallel_ctx = ctx;
+    pthread_mutex_unlock(&g_lock);
+}
+
+void stats_clear_active_parallel_ctx(void)
+{
+    pthread_mutex_lock(&g_lock);
+    g_active_parallel_ctx = NULL;
+    pthread_mutex_unlock(&g_lock);
+}
+
+int stats_copy_active_parallel_workers(chunk_worker_stat_t *out, int max_workers)
+{
+    int count = 0;
+
+    if (!out || max_workers <= 0) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&g_lock);
+    if (g_active_parallel_ctx && g_active_parallel_ctx->workers && g_active_parallel_ctx->worker_count > 0) {
+        count = g_active_parallel_ctx->worker_count;
+        if (count > max_workers) {
+            count = max_workers;
+        }
+        memcpy(out, g_active_parallel_ctx->workers, (size_t)count * sizeof(*out));
+    }
+    pthread_mutex_unlock(&g_lock);
+
+    return count;
+}
 
 void stats_record_speed_sample(void) {
     pthread_mutex_lock(&g_lock);
