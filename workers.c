@@ -14,29 +14,63 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/wait.h>
-#include <sys/mman.h>
-#include <signal.h>
 #include <limits.h>
+#include <time.h>
 
 /*
  * Runtime overrides:
  *
  *   DIRECT_COPY_MAX_WORKERS
  *   DIRECT_COPY_LARGE_WORKERS
+ *   DIRECT_COPY_LARGE_FILE_INFLIGHT
  *   DIRECT_COPY_CHUNK_MB
  *   DIRECT_COPY_DISABLE_COPY_FILE_RANGE
  */
 
+typedef enum {
+    WORK_NONE = 0,
+    WORK_SMALL_FILE,
+    WORK_LARGE_FILE_START,
+    WORK_LARGE_CHUNK
+} work_kind_t;
+
+typedef struct large_file_ctx {
+    char src[PATH_MAX];
+    char dst[PATH_MAX];
+    struct stat src_st;
+    off_t bulk_end;
+    off_t next_offset;
+    int fd_in;
+    int fd_out;
+    int in_direct;
+    int out_direct;
+    int copy_range_enabled;
+    int inflight_chunks;
+    int failed;
+    struct large_file_ctx *next;
+} large_file_ctx_t;
+
+typedef struct chunk_task {
+    large_file_ctx_t *ctx;
+    off_t start;
+    off_t end;
+    struct chunk_task *next;
+} chunk_task_t;
+
 typedef struct {
-    file_task_t *task;
-    int is_large;
-    int slots_used;
-} task_claim_t;
+    work_kind_t kind;
+    file_task_t *file_task;
+    chunk_task_t *chunk_task;
+} work_claim_t;
+
+static __thread void *g_large_chunk_buf = NULL;
+static __thread size_t g_large_chunk_buf_sz = 0;
 
 static pthread_t *g_workers = NULL;
 static int g_worker_count = 0;
 static int g_large_worker_count = 0;
+static int g_large_file_inflight = 0;
+static int g_max_active_large_files = 0;
 static off_t g_chunk_size = 0;
 
 /* -------------------- scheduler state -------------------- */
@@ -47,12 +81,14 @@ static file_task_t    *g_small_queue_head = NULL;
 static file_task_t    *g_small_queue_tail = NULL;
 static file_task_t    *g_large_queue_head = NULL;
 static file_task_t    *g_large_queue_tail = NULL;
+static chunk_task_t   *g_chunk_queue_head = NULL;
+static chunk_task_t   *g_chunk_queue_tail = NULL;
 static int             g_queue_done = 0;
 static uint64_t        g_small_queue_depth = 0;
 static uint64_t        g_large_queue_depth = 0;
+static uint64_t        g_chunk_queue_depth = 0;
 static uint64_t        g_small_workers_active = 0;
 static uint64_t        g_large_workers_active = 0;
-static int             g_capacity_in_use = 0;
 
 static int g_workers_error = 0;
 static pthread_mutex_t g_workers_error_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -84,7 +120,7 @@ static int env_int_or_default(const char *name, int defval, int minval, int maxv
 
 static void init_runtime_config(void)
 {
-    if (g_worker_count > 0 && g_large_worker_count > 0 && g_chunk_size > 0) {
+    if (g_worker_count > 0 && g_large_worker_count > 0 && g_large_file_inflight > 0 && g_chunk_size > 0) {
         return;
     }
 
@@ -98,12 +134,21 @@ static void init_runtime_config(void)
                                               1,
                                               g_worker_count);
 
+    g_large_file_inflight = env_int_or_default("DIRECT_COPY_LARGE_FILE_INFLIGHT",
+                                               g_large_worker_count,
+                                               1,
+                                               1024);
+
     int chunk_mb = env_int_or_default("DIRECT_COPY_CHUNK_MB",
                                       (int)(CHUNK_SIZE / (1024 * 1024)),
                                       1,
                                       4096);
 
     g_chunk_size = (off_t)chunk_mb * 1024 * 1024;
+    g_max_active_large_files = g_worker_count / g_large_worker_count;
+    if (g_max_active_large_files < 1) {
+        g_max_active_large_files = 1;
+    }
 }
 
 static off_t runtime_large_threshold(void)
@@ -112,7 +157,7 @@ static off_t runtime_large_threshold(void)
     return g_chunk_size * 10;
 }
 
-/* -------------------- scheduler helpers -------------------- */
+/* -------------------- queue helpers -------------------- */
 
 static int enqueue_task(file_task_t **head,
                         file_task_t **tail,
@@ -146,7 +191,7 @@ static int enqueue_task(file_task_t **head,
     return 0;
 }
 
-static file_task_t *pop_task(file_task_t **head, file_task_t **tail)
+static file_task_t *pop_file_task(file_task_t **head, file_task_t **tail)
 {
     file_task_t *t = *head;
     *head = t->next;
@@ -157,66 +202,30 @@ static file_task_t *pop_task(file_task_t **head, file_task_t **tail)
     return t;
 }
 
-static task_claim_t dequeue_schedulable_task(void)
+static chunk_task_t *pop_chunk_task_locked(void)
 {
-    task_claim_t claim;
-    memset(&claim, 0, sizeof(claim));
-
-    pthread_mutex_lock(&g_queue_lock);
-
-    for (;;) {
-        if (g_large_queue_head && g_capacity_in_use + g_large_worker_count <= g_worker_count) {
-            claim.task = pop_task(&g_large_queue_head, &g_large_queue_tail);
-            g_large_queue_depth--;
-            g_large_workers_active++;
-            g_capacity_in_use += g_large_worker_count;
-            claim.is_large = 1;
-            claim.slots_used = g_large_worker_count;
-            break;
-        }
-
-        if (g_small_queue_head && g_capacity_in_use < g_worker_count) {
-            claim.task = pop_task(&g_small_queue_head, &g_small_queue_tail);
-            g_small_queue_depth--;
-            g_small_workers_active++;
-            g_capacity_in_use += 1;
-            claim.is_large = 0;
-            claim.slots_used = 1;
-            break;
-        }
-
-        if (!g_small_queue_head && !g_large_queue_head && g_queue_done) {
-            break;
-        }
-
-        pthread_cond_wait(&g_queue_cond, &g_queue_lock);
+    chunk_task_t *t = g_chunk_queue_head;
+    g_chunk_queue_head = t->next;
+    if (!g_chunk_queue_head) {
+        g_chunk_queue_tail = NULL;
     }
-
-    pthread_mutex_unlock(&g_queue_lock);
-    return claim;
+    t->next = NULL;
+    if (g_chunk_queue_depth > 0) {
+        g_chunk_queue_depth--;
+    }
+    return t;
 }
 
-static void finish_task(int is_large, int slots_used)
+static void push_chunk_task_locked(chunk_task_t *task)
 {
-    pthread_mutex_lock(&g_queue_lock);
-
-    g_capacity_in_use -= slots_used;
-    if (g_capacity_in_use < 0) {
-        g_capacity_in_use = 0;
-    }
-
-    if (is_large) {
-        if (g_large_workers_active > 0) {
-            g_large_workers_active--;
-        }
+    task->next = NULL;
+    if (g_chunk_queue_tail) {
+        g_chunk_queue_tail->next = task;
     } else {
-        if (g_small_workers_active > 0) {
-            g_small_workers_active--;
-        }
+        g_chunk_queue_head = task;
     }
-
-    pthread_cond_broadcast(&g_queue_cond);
-    pthread_mutex_unlock(&g_queue_lock);
+    g_chunk_queue_tail = task;
+    g_chunk_queue_depth++;
 }
 
 static void mark_worker_error(void)
@@ -243,6 +252,13 @@ int workers_status(void)
 }
 
 /* -------------------- copy helpers -------------------- */
+
+static uint64_t monotonic_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
 
 static int direct_io_fallback_errno_local(int err)
 {
@@ -312,7 +328,9 @@ static int copy_file_range_with_progress(int fd_in,
         size_t step = remaining;
         off_t old_in = *in_off;
 
+        uint64_t cfr_start_ns = monotonic_ns();
         ssize_t moved = copy_file_range(fd_in, in_off, fd_out, out_off, step, 0);
+        stats_record_copy_file_range_io(monotonic_ns() - cfr_start_ns);
         if (moved < 0) {
             if (copy_file_range_unsupported_errno_local(errno)) {
                 return 1;
@@ -334,42 +352,6 @@ static int copy_file_range_with_progress(int fd_in,
     return 0;
 }
 
-static int copy_file_range_with_worker_stats(int fd_in,
-                                             int fd_out,
-                                             off_t *in_off,
-                                             off_t *out_off,
-                                             size_t len,
-                                             chunk_worker_stat_t *ws)
-{
-    size_t remaining = len;
-
-    while (remaining > 0) {
-        size_t step = remaining;
-        off_t old_in = *in_off;
-
-        ssize_t moved = copy_file_range(fd_in, in_off, fd_out, out_off, step, 0);
-        if (moved < 0) {
-            if (copy_file_range_unsupported_errno_local(errno)) {
-                return 1;
-            }
-            perror("copy_file_range");
-            return -1;
-        }
-        if (moved == 0) {
-            fprintf(stderr, "copy_file_range hit EOF early\n");
-            return -1;
-        }
-
-        ws->bytes_done += (uint64_t)moved;
-        ws->copy_file_range_calls++;
-        ws->copy_file_range_bytes += (uint64_t)moved;
-        advise_source_consumed(fd_in, old_in, (off_t)moved);
-        remaining -= (size_t)moved;
-    }
-
-    return 0;
-}
-
 static int open_write_existing_maybe_direct(const char *path, int *used_direct)
 {
     int fd;
@@ -384,6 +366,7 @@ static int open_write_existing_maybe_direct(const char *path, int *used_direct)
             if (used_direct) {
                 *used_direct = 1;
             }
+            stats_record_write_open(1);
             return fd;
         }
 
@@ -399,6 +382,7 @@ static int open_write_existing_maybe_direct(const char *path, int *used_direct)
         return -1;
     }
 
+    stats_record_write_open(0);
     return fd;
 }
 
@@ -469,7 +453,9 @@ static int copy_tail_buffered(const char *src,
         size_t len = (size_t)this_len_off;
         off_t chunk_start = pos;
 
+        uint64_t read_start_ns = monotonic_ns();
         ssize_t r = read(fd_in, buf, len);
+        stats_record_read_io(monotonic_ns() - read_start_ns);
         if (r < 0) {
             perror("read tail");
             close(fd_in);
@@ -482,7 +468,9 @@ static int copy_tail_buffered(const char *src,
 
         size_t done = 0;
         while (done < (size_t)r) {
+            uint64_t write_start_ns = monotonic_ns();
             ssize_t w = write(fd_out, buf + done, (size_t)r - done);
+            stats_record_write_io(monotonic_ns() - write_start_ns);
             if (w < 0) {
                 perror("write tail");
                 close(fd_in);
@@ -590,7 +578,9 @@ static int copy_file_serial_small(const char *src, const char *dst, const struct
 
         size_t done = 0;
         while (done < len) {
+            uint64_t write_start_ns = monotonic_ns();
             ssize_t w = write(fd_out, (char *)buf + done, len - done);
+            stats_record_write_io(monotonic_ns() - write_start_ns);
             if (w < 0) {
                 perror("write");
                 free(buf);
@@ -617,328 +607,312 @@ static int copy_file_serial_small(const char *src, const char *dst, const struct
     return finalize_copied_file(dst, src_st);
 }
 
-/* -------------------- large-file forked copy -------------------- */
+/* -------------------- large-file chunk scheduler -------------------- */
 
-static uint64_t sum_worker_bytes(chunk_worker_stat_t *workers, int count)
+static int schedule_more_chunks_locked(large_file_ctx_t *ctx)
 {
-    uint64_t total = 0;
-    for (int i = 0; i < count; i++) {
-        total += workers[i].bytes_done;
+    while (!ctx->failed &&
+           ctx->inflight_chunks < g_large_file_inflight &&
+           ctx->next_offset < ctx->bulk_end) {
+        off_t start = ctx->next_offset;
+        off_t remain = ctx->bulk_end - start;
+        off_t span = (remain >= g_chunk_size) ? g_chunk_size : remain;
+        off_t end = start + span;
+
+        chunk_task_t *task = calloc(1, sizeof(*task));
+        if (!task) {
+            perror("calloc");
+            ctx->failed = 1;
+            return -1;
+        }
+
+        task->ctx = ctx;
+        task->start = start;
+        task->end = end;
+        push_chunk_task_locked(task);
+        ctx->next_offset = end;
+        ctx->inflight_chunks++;
     }
-    return total;
+
+    return 0;
 }
 
-static void accumulate_worker_copy_file_range_usage(chunk_worker_stat_t *workers,
-                                                    int count,
-                                                    uint64_t *calls,
-                                                    uint64_t *bytes,
-                                                    uint64_t *fallbacks)
+static void cleanup_large_file_ctx(large_file_ctx_t *ctx)
 {
-    uint64_t total_calls = 0;
-    uint64_t total_bytes = 0;
-    uint64_t total_fallbacks = 0;
-
-    for (int i = 0; i < count; i++) {
-        total_calls += workers[i].copy_file_range_calls;
-        total_bytes += workers[i].copy_file_range_bytes;
-        total_fallbacks += workers[i].copy_file_range_fallbacks;
+    if (!ctx) {
+        return;
     }
 
-    if (calls) {
-        *calls = total_calls;
+    if (ctx->fd_in >= 0) {
+        close(ctx->fd_in);
     }
-    if (bytes) {
-        *bytes = total_bytes;
+    if (ctx->fd_out >= 0) {
+        close(ctx->fd_out);
     }
-    if (fallbacks) {
-        *fallbacks = total_fallbacks;
-    }
+    free(ctx);
 }
 
-static void kill_remaining_children(pid_t *pids, int count, int *done)
+static int finalize_large_file_ctx(large_file_ctx_t *ctx)
 {
-    for (int i = 0; i < count; i++) {
-        if (!done[i] && pids[i] > 0) {
-            kill(pids[i], SIGTERM);
+    int rc = 0;
+
+    if (!ctx->failed) {
+        if (copy_tail_buffered(ctx->src, ctx->dst, ctx->bulk_end, ctx->src_st.st_size, 0) != 0) {
+            rc = -1;
+        } else if (finalize_copied_file(ctx->dst, &ctx->src_st) != 0) {
+            rc = -1;
+        } else {
+            stats_inc_files_copied();
         }
-    }
-}
-
-static int child_copy_range(const char *src,
-                            const char *dst,
-                            off_t start,
-                            off_t end,
-                            chunk_worker_stat_t *ws)
-{
-    int fd_in = -1;
-    int fd_out = -1;
-    int in_direct = 0;
-    int out_direct = 0;
-    void *buf = NULL;
-    int rc = 1;
-    int copy_range_available = copy_file_range_enabled();
-
-    fd_in = open_read_maybe_direct(src, &in_direct);
-    if (fd_in < 0) {
-        return 1;
+    } else {
+        rc = -1;
     }
 
-    fd_out = open_write_existing_maybe_direct(dst, &out_direct);
-    if (fd_out < 0) {
-        close(fd_in);
-        return 1;
-    }
-
-    if (!in_direct) {
-        advise_source_streaming(fd_in);
-    }
-    if (!out_direct) {
-        advise_dest_streaming(fd_out);
-    }
-
-    if (posix_memalign(&buf, ALIGNMENT, (size_t)g_chunk_size) != 0) {
-        fprintf(stderr, "posix_memalign failed\n");
-        close(fd_in);
-        close(fd_out);
-        return 1;
-    }
-
-    ws->active = 1;
-    ws->bytes_done = 0;
-    ws->chunks_done = 0;
-
-    off_t pos = start;
-
-    while (pos < end) {
-        off_t remain = end - pos;
-        off_t this_len_off = (remain >= g_chunk_size) ? g_chunk_size : remain;
-        size_t len = (size_t)this_len_off;
-
-        if (!in_direct && !out_direct && copy_range_available) {
-            off_t in_off = pos;
-            off_t out_off = pos;
-            int cfr_rc = copy_file_range_with_worker_stats(fd_in, fd_out, &in_off, &out_off, len, ws);
-            if (cfr_rc == 0) {
-                pos += this_len_off;
-                ws->chunks_done++;
-                continue;
-            }
-            if (cfr_rc < 0) {
-                goto out;
-            }
-            ws->copy_file_range_fallbacks++;
-            copy_range_available = 0;
-        }
-
-        ssize_t r = pread(fd_in, buf, len, pos);
-        if (r < 0) {
-            perror("pread");
-            goto out;
-        }
-        if ((size_t)r != len) {
-            fprintf(stderr, "short pread at off %lld: expected %zu got %zd\n",
-                    (long long)pos, len, r);
-            goto out;
-        }
-
-        size_t done = 0;
-        while (done < len) {
-            ssize_t w = pwrite(fd_out,
-                               (char *)buf + done,
-                               len - done,
-                               pos + (off_t)done);
-            if (w < 0) {
-                perror("pwrite");
-                goto out;
-            }
-            if (w == 0) {
-                fprintf(stderr, "zero pwrite at off %lld\n",
-                        (long long)(pos + (off_t)done));
-                goto out;
-            }
-            done += (size_t)w;
-        }
-
-        advise_source_consumed(fd_in, pos, len);
-        pos += this_len_off;
-        ws->bytes_done += (uint64_t)len;
-        ws->chunks_done++;
-    }
-
-    rc = 0;
-
-out:
-    ws->active = 0;
-
-    free(buf);
-    if (fd_in >= 0) close(fd_in);
-    if (fd_out >= 0) close(fd_out);
+    cleanup_large_file_ctx(ctx);
     return rc;
 }
 
-static int copy_file_parallel_large(const char *src, const char *dst, const struct stat *src_st)
+static int start_large_file_copy(file_task_t *task)
 {
-    init_runtime_config();
-
-    parallel_ctx_t ctx;
-    pid_t *pids = NULL;
-    int *done = NULL;
-    int rc = -1;
-    uint64_t accounted = 0;
-    uint64_t cfr_calls = 0;
-    uint64_t cfr_bytes = 0;
-    uint64_t cfr_fallbacks = 0;
-    int failed = 0;
-
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.file_size = src_st->st_size;
-    ctx.bulk_end = (src_st->st_size / ALIGNMENT) * ALIGNMENT;
-    ctx.worker_count = g_large_worker_count;
-
-    ctx.workers = mmap(NULL,
-                       (size_t)ctx.worker_count * sizeof(*ctx.workers),
-                       PROT_READ | PROT_WRITE,
-                       MAP_SHARED | MAP_ANONYMOUS,
-                       -1,
-                       0);
-    if (ctx.workers == MAP_FAILED) {
-        perror("mmap");
-        ctx.workers = NULL;
+    large_file_ctx_t *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        perror("calloc");
         return -1;
     }
-    memset(ctx.workers, 0, (size_t)ctx.worker_count * sizeof(*ctx.workers));
 
-    pids = calloc((size_t)ctx.worker_count, sizeof(*pids));
-    done = calloc((size_t)ctx.worker_count, sizeof(*done));
-    if (!pids || !done) {
-        perror("calloc");
-        goto out;
+    snprintf(ctx->src, sizeof(ctx->src), "%s", task->src);
+    snprintf(ctx->dst, sizeof(ctx->dst), "%s", task->dst);
+    ctx->src_st = task->src_st;
+    ctx->bulk_end = (task->src_st.st_size / ALIGNMENT) * ALIGNMENT;
+    ctx->next_offset = 0;
+    ctx->fd_in = -1;
+    ctx->fd_out = -1;
+    ctx->copy_range_enabled = copy_file_range_enabled();
+
+    if (prepare_destination_file(ctx->dst, &ctx->src_st) != 0) {
+        cleanup_large_file_ctx(ctx);
+        return -1;
     }
 
-    if (prepare_destination_file(dst, src_st) != 0) {
-        goto out;
+    ctx->fd_in = open_read_maybe_direct(ctx->src, &ctx->in_direct);
+    if (ctx->fd_in < 0) {
+        cleanup_large_file_ctx(ctx);
+        return -1;
     }
 
-    off_t base = 0;
-    off_t per = (ctx.worker_count > 0) ? (ctx.bulk_end / ctx.worker_count) : ctx.bulk_end;
-    per = (per / ALIGNMENT) * ALIGNMENT;
-
-    for (int i = 0; i < ctx.worker_count; i++) {
-        off_t start = base;
-        off_t end;
-
-        if (i == ctx.worker_count - 1) {
-            end = ctx.bulk_end;
-        } else {
-            end = start + per;
-        }
-        base = end;
-
-        pid_t pid = fork();
-        if (pid < 0) {
-            perror("fork");
-            failed = 1;
-            kill_remaining_children(pids, i, done);
-            break;
-        }
-
-        if (pid == 0) {
-            int child_rc = child_copy_range(src, dst, start, end, &ctx.workers[i]);
-            _exit(child_rc == 0 ? 0 : 1);
-        }
-
-        pids[i] = pid;
+    ctx->fd_out = open_write_existing_maybe_direct(ctx->dst, &ctx->out_direct);
+    if (ctx->fd_out < 0) {
+        cleanup_large_file_ctx(ctx);
+        return -1;
     }
 
-    while (1) {
-        int completed = 0;
+    if (!ctx->in_direct) {
+        advise_source_streaming(ctx->fd_in);
+    }
+    if (!ctx->out_direct) {
+        advise_dest_streaming(ctx->fd_out);
+    }
 
-        for (int i = 0; i < ctx.worker_count; i++) {
-            if (done[i] || pids[i] <= 0) {
-                if (done[i]) {
-                    completed++;
-                }
-                continue;
-            }
+    pthread_mutex_lock(&g_queue_lock);
+    if (schedule_more_chunks_locked(ctx) != 0) {
+        pthread_mutex_unlock(&g_queue_lock);
+        cleanup_large_file_ctx(ctx);
+        return -1;
+    }
+    pthread_cond_broadcast(&g_queue_cond);
+    pthread_mutex_unlock(&g_queue_lock);
 
-            int status = 0;
-            pid_t r = waitpid(pids[i], &status, WNOHANG);
-            if (r == 0) {
-                /* still running */
-            } else if (r < 0) {
-                perror("waitpid");
-                failed = 1;
-                done[i] = 1;
-                completed++;
+    return 0;
+}
+
+static int copy_large_chunk(chunk_task_t *task)
+{
+    large_file_ctx_t *ctx = task->ctx;
+    void *buf = NULL;
+    int rc = 0;
+
+    if (!ctx) {
+        free(task);
+        return -1;
+    }
+
+    pthread_mutex_lock(&g_queue_lock);
+    int skip = ctx->failed;
+    pthread_mutex_unlock(&g_queue_lock);
+
+    if (!skip) {
+        if (!g_large_chunk_buf || g_large_chunk_buf_sz < (size_t)g_chunk_size) {
+            free(g_large_chunk_buf);
+            g_large_chunk_buf = NULL;
+            g_large_chunk_buf_sz = 0;
+            if (posix_memalign(&g_large_chunk_buf, ALIGNMENT, (size_t)g_chunk_size) != 0) {
+                fprintf(stderr, "posix_memalign failed\n");
+                rc = -1;
+                skip = 1;
             } else {
-                done[i] = 1;
-                completed++;
-                if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-                    failed = 1;
-                }
+                g_large_chunk_buf_sz = (size_t)g_chunk_size;
+                stats_record_large_chunk_buffer_alloc();
             }
         }
+        buf = g_large_chunk_buf;
+    }
 
-        uint64_t total_done = sum_worker_bytes(ctx.workers, ctx.worker_count);
-        if (total_done > accounted) {
-            stats_add_bytes(total_done - accounted);
-            accounted = total_done;
-        }
+    if (!skip) {
+        off_t pos = task->start;
+        int copy_range_available = ctx->copy_range_enabled && !ctx->in_direct && !ctx->out_direct;
 
-        if (failed) {
-            kill_remaining_children(pids, ctx.worker_count, done);
+        while (pos < task->end) {
+            off_t remain = task->end - pos;
+            off_t this_len_off = (remain >= g_chunk_size) ? g_chunk_size : remain;
+            size_t len = (size_t)this_len_off;
 
-            for (int i = 0; i < ctx.worker_count; i++) {
-                if (!done[i] && pids[i] > 0) {
-                    int status = 0;
-                    (void)waitpid(pids[i], &status, 0);
-                    done[i] = 1;
+            if (copy_range_available) {
+                off_t in_off = pos;
+                off_t out_off = pos;
+                int cfr_rc = copy_file_range_with_progress(ctx->fd_in, ctx->fd_out,
+                                                           &in_off, &out_off,
+                                                           len, 0);
+                if (cfr_rc == 0) {
+                    pos += this_len_off;
+                    continue;
                 }
+                if (cfr_rc < 0) {
+                    rc = -1;
+                    break;
+                }
+
+                pthread_mutex_lock(&g_queue_lock);
+                ctx->copy_range_enabled = 0;
+                pthread_mutex_unlock(&g_queue_lock);
+                stats_record_copy_file_range_fallback();
+                copy_range_available = 0;
             }
-            break;
+
+            uint64_t read_start_ns = monotonic_ns();
+            ssize_t r = pread(ctx->fd_in, buf, len, pos);
+            stats_record_read_io(monotonic_ns() - read_start_ns);
+            if (r < 0) {
+                perror("pread");
+                rc = -1;
+                break;
+            }
+            if ((size_t)r != len) {
+                fprintf(stderr, "short pread at off %lld: expected %zu got %zd\n",
+                        (long long)pos, len, r);
+                rc = -1;
+                break;
+            }
+
+            size_t done = 0;
+            while (done < len) {
+                uint64_t write_start_ns = monotonic_ns();
+                ssize_t w = pwrite(ctx->fd_out,
+                                   (char *)buf + done,
+                                   len - done,
+                                   pos + (off_t)done);
+                stats_record_write_io(monotonic_ns() - write_start_ns);
+                if (w < 0) {
+                    perror("pwrite");
+                    rc = -1;
+                    break;
+                }
+                if (w == 0) {
+                    fprintf(stderr, "zero pwrite at off %lld\n",
+                            (long long)(pos + (off_t)done));
+                    rc = -1;
+                    break;
+                }
+                done += (size_t)w;
+            }
+            if (rc != 0) {
+                break;
+            }
+
+            advise_source_consumed(ctx->fd_in, pos, len);
+            pos += this_len_off;
+            stats_add_bytes((uint64_t)len);
         }
+    }
 
-        if (completed == ctx.worker_count) {
-            break;
+    int finalize_now = 0;
+    pthread_mutex_lock(&g_queue_lock);
+    if (rc != 0) {
+        ctx->failed = 1;
+    }
+    if (ctx->inflight_chunks > 0) {
+        ctx->inflight_chunks--;
+    }
+    if (!ctx->failed) {
+        (void)schedule_more_chunks_locked(ctx);
+    }
+    if ((ctx->failed || ctx->next_offset >= ctx->bulk_end) && ctx->inflight_chunks == 0) {
+        if (g_large_workers_active > 0) {
+            g_large_workers_active--;
         }
-
-        usleep(MONITOR_INTERVAL_MS * 1000);
+        finalize_now = 1;
     }
+    pthread_cond_broadcast(&g_queue_cond);
+    pthread_mutex_unlock(&g_queue_lock);
 
-    {
-        uint64_t total_done = sum_worker_bytes(ctx.workers, ctx.worker_count);
-        if (total_done > accounted) {
-            stats_add_bytes(total_done - accounted);
-            accounted = total_done;
+    free(task);
+
+    if (finalize_now) {
+        if (finalize_large_file_ctx(ctx) != 0) {
+            return -1;
         }
     }
 
-    accumulate_worker_copy_file_range_usage(ctx.workers, ctx.worker_count,
-                                            &cfr_calls, &cfr_bytes, &cfr_fallbacks);
-    stats_add_copy_file_range_usage(cfr_calls, cfr_bytes, cfr_fallbacks);
-
-    if (failed) {
-        goto out;
-    }
-
-    if (copy_tail_buffered(src, dst, ctx.bulk_end, src_st->st_size, 0) != 0) {
-        goto out;
-    }
-
-    if (finalize_copied_file(dst, src_st) != 0) {
-        goto out;
-    }
-
-    stats_inc_files_copied();
-    rc = 0;
-
-out:
-    if (ctx.workers) {
-        munmap(ctx.workers, (size_t)ctx.worker_count * sizeof(*ctx.workers));
-    }
-    free(pids);
-    free(done);
     return rc;
+}
+
+/* -------------------- scheduler -------------------- */
+
+static work_claim_t dequeue_work(void)
+{
+    work_claim_t claim;
+    memset(&claim, 0, sizeof(claim));
+
+    pthread_mutex_lock(&g_queue_lock);
+
+    for (;;) {
+        if (g_chunk_queue_head) {
+            claim.kind = WORK_LARGE_CHUNK;
+            claim.chunk_task = pop_chunk_task_locked();
+            break;
+        }
+
+        if (g_small_queue_head) {
+            claim.kind = WORK_SMALL_FILE;
+            claim.file_task = pop_file_task(&g_small_queue_head, &g_small_queue_tail);
+            if (g_small_queue_depth > 0) {
+                g_small_queue_depth--;
+            }
+            g_small_workers_active++;
+            break;
+        }
+
+        if (g_large_queue_head && (int)g_large_workers_active < g_max_active_large_files) {
+            claim.kind = WORK_LARGE_FILE_START;
+            claim.file_task = pop_file_task(&g_large_queue_head, &g_large_queue_tail);
+            if (g_large_queue_depth > 0) {
+                g_large_queue_depth--;
+            }
+            g_large_workers_active++;
+            break;
+        }
+
+        if (!g_small_queue_head && !g_large_queue_head && !g_chunk_queue_head &&
+            g_queue_done && g_large_workers_active == 0 && g_small_workers_active == 0) {
+            break;
+        }
+
+        uint64_t wait_start_ns = monotonic_ns();
+        pthread_cond_wait(&g_queue_cond, &g_queue_lock);
+        stats_record_queue_wait_ns(monotonic_ns() - wait_start_ns);
+    }
+
+    pthread_mutex_unlock(&g_queue_lock);
+    return claim;
 }
 
 /* -------------------- worker threads -------------------- */
@@ -948,27 +922,54 @@ static void *worker_main(void *arg)
     (void)arg;
 
     for (;;) {
-        task_claim_t claim = dequeue_schedulable_task();
-        if (!claim.task) {
+        work_claim_t claim = dequeue_work();
+        if (claim.kind == WORK_NONE) {
             break;
         }
 
-        if (claim.is_large) {
-            if (copy_file_parallel_large(claim.task->src, claim.task->dst, &claim.task->src_st) != 0) {
-                mark_worker_error();
-            }
-        } else {
-            if (copy_file_serial_small(claim.task->src, claim.task->dst, &claim.task->src_st) == 0) {
+        if (claim.kind == WORK_SMALL_FILE) {
+            if (copy_file_serial_small(claim.file_task->src, claim.file_task->dst, &claim.file_task->src_st) == 0) {
                 stats_inc_files_copied();
             } else {
                 mark_worker_error();
             }
+
+            free(claim.file_task);
+
+            pthread_mutex_lock(&g_queue_lock);
+            if (g_small_workers_active > 0) {
+                g_small_workers_active--;
+            }
+            pthread_cond_broadcast(&g_queue_cond);
+            pthread_mutex_unlock(&g_queue_lock);
+            continue;
         }
 
-        free(claim.task);
-        finish_task(claim.is_large, claim.slots_used);
+        if (claim.kind == WORK_LARGE_FILE_START) {
+            if (start_large_file_copy(claim.file_task) != 0) {
+                mark_worker_error();
+                pthread_mutex_lock(&g_queue_lock);
+                if (g_large_workers_active > 0) {
+                    g_large_workers_active--;
+                }
+                pthread_cond_broadcast(&g_queue_cond);
+                pthread_mutex_unlock(&g_queue_lock);
+            }
+            free(claim.file_task);
+            continue;
+        }
+
+        if (claim.kind == WORK_LARGE_CHUNK) {
+            if (copy_large_chunk(claim.chunk_task) != 0) {
+                mark_worker_error();
+            }
+            continue;
+        }
     }
 
+    free(g_large_chunk_buf);
+    g_large_chunk_buf = NULL;
+    g_large_chunk_buf_sz = 0;
     return NULL;
 }
 
@@ -985,11 +986,13 @@ int workers_start(void)
     g_small_queue_tail = NULL;
     g_large_queue_head = NULL;
     g_large_queue_tail = NULL;
+    g_chunk_queue_head = NULL;
+    g_chunk_queue_tail = NULL;
     g_small_queue_depth = 0;
     g_large_queue_depth = 0;
+    g_chunk_queue_depth = 0;
     g_small_workers_active = 0;
     g_large_workers_active = 0;
-    g_capacity_in_use = 0;
     pthread_mutex_unlock(&g_queue_lock);
 
     g_workers = calloc((size_t)g_worker_count, sizeof(*g_workers));
@@ -1088,4 +1091,47 @@ uint64_t workers_large_active_count(void)
     v = g_large_workers_active;
     pthread_mutex_unlock(&g_queue_lock);
     return v;
+}
+
+int workers_max_workers(void)
+{
+    init_runtime_config();
+    return g_worker_count;
+}
+
+int workers_large_workers(void)
+{
+    init_runtime_config();
+    return g_large_worker_count;
+}
+
+int workers_large_file_inflight(void)
+{
+    init_runtime_config();
+    return g_large_file_inflight;
+}
+
+int workers_max_active_large_files(void)
+{
+    init_runtime_config();
+    return g_max_active_large_files;
+}
+
+int workers_chunk_mb(void)
+{
+    init_runtime_config();
+    return (int)(g_chunk_size / (1024 * 1024));
+}
+
+void workers_print_runtime_summary(void)
+{
+    init_runtime_config();
+    printf("Options used:\n");
+    printf("  direct_io enabled           : %s\n", direct_io_enabled() ? "yes" : "no");
+    printf("  copy_file_range enabled     : %s\n", copy_file_range_enabled() ? "yes" : "no");
+    printf("  max workers                 : %d\n", g_worker_count);
+    printf("  large workers divisor       : %d\n", g_large_worker_count);
+    printf("  active large file limit     : %d\n", g_max_active_large_files);
+    printf("  large file inflight chunks  : %d\n", g_large_file_inflight);
+    printf("  chunk size MiB              : %d\n", (int)(g_chunk_size / (1024 * 1024)));
 }

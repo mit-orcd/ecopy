@@ -37,7 +37,7 @@ DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_WORKERS=4 /tmp/direct_copy /src /ds
 ```
 
 ```bash
-DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=128 DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_WORKERS=4 /tmp/direct_copy /src /dst
+DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=128 DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_WORKERS=4 DIRECT_COPY_LARGE_FILE_INFLIGHT=8 /tmp/direct_copy /src /dst
 ```
 
 ## Scheduler Model
@@ -45,7 +45,9 @@ DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=128 DIRECT_COPY_MAX_WORKERS
 The current design uses a shared slot budget.
 
 - Small files consume `1` worker slot.
-- Large files consume `DIRECT_COPY_LARGE_WORKERS` slots because they fan out into that many chunk workers.
+- Large files are activated in parallel based on `DIRECT_COPY_MAX_WORKERS / DIRECT_COPY_LARGE_WORKERS`.
+- Each active large file can keep up to `DIRECT_COPY_LARGE_FILE_INFLIGHT` chunk tasks queued or in flight.
+- Large chunk workers reuse a worker-local aligned buffer instead of allocating one buffer per chunk task.
 - The total budget is capped by `DIRECT_COPY_MAX_WORKERS`.
 
 This avoids the older problem where fixed small-file and large-file pools wasted capacity when one side of the workload
@@ -55,11 +57,13 @@ Default behavior:
 
 - `DIRECT_COPY_MAX_WORKERS = 16`
 - `DIRECT_COPY_LARGE_WORKERS = 4`
+- `DIRECT_COPY_LARGE_FILE_INFLIGHT = 4`
 
 So by default:
 
 - all-small workloads can run up to `16` files in parallel
-- all-large workloads can run up to `4` large files in parallel, each with `4` chunk workers
+- all-large workloads can run up to `4` large files in parallel by default
+- each active large file can keep up to `4` chunk tasks in flight by default
 - mixed workloads share the same slot pool instead of reserving idle capacity for one class of work
 
 ## Copy Strategy
@@ -81,10 +85,12 @@ With the current defaults, that is `640 MiB`.
 Large-file copy works like this:
 
 1. The target file is created and pre-sized.
-2. The aligned bulk region is split into contiguous ranges.
-3. Those ranges are copied in parallel by chunk workers.
-4. Any remaining unaligned tail bytes are copied in a buffered tail pass.
-5. Final metadata is restored after data copy completes.
+2. The large file is activated into the global chunk scheduler.
+3. Aligned ranges are emitted as chunk tasks instead of assigning one fixed quarter-file slice to each worker.
+4. Each active large file can keep up to `DIRECT_COPY_LARGE_FILE_INFLIGHT` chunk tasks queued or in flight.
+5. Worker threads pull chunk tasks from the shared global queue, which improves load balancing and keeps more I/O in flight.
+6. Any remaining unaligned tail bytes are copied in a buffered tail pass.
+7. Final metadata is restored after data copy completes.
 
 This gives wide sequential I/O on large files without forcing all workloads into a chunk scheduler.
 
@@ -139,13 +145,25 @@ Default:
 
 ### `DIRECT_COPY_LARGE_WORKERS`
 
-Chunk workers consumed by each active large file.
+Concurrency divisor used to determine how many large files may be active at once. The default active-large-file limit is roughly `DIRECT_COPY_MAX_WORKERS / DIRECT_COPY_LARGE_WORKERS`. 
 
 Default:
 
 ```text
 4
 ```
+
+### `DIRECT_COPY_LARGE_FILE_INFLIGHT`
+
+Maximum number of chunk tasks that each active large file may keep queued or in flight at once.
+
+Default:
+
+```text
+4
+```
+
+This is the closest runtime knob to per-file queue depth for large-file NFS/RDMA tuning. Higher values can create more in-flight I/O, but can also increase contention.
 
 ### `DIRECT_COPY_CHUNK_MB`
 
@@ -189,20 +207,23 @@ For NFS/RDMA or other high-throughput flash-backed paths, the best settings are 
 A good starting point for large-file tests is:
 
 ```bash
-DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_WORKERS=4 DIRECT_COPY_CHUNK_MB=128 /tmp/direct_copy /src /dst
+DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_WORKERS=4 DIRECT_COPY_LARGE_FILE_INFLIGHT=8 DIRECT_COPY_CHUNK_MB=128 /tmp/direct_copy /src /dst
 ```
 
 A useful benchmark matrix is:
 
 ```bash
-DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=64  DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_WORKERS=4 /tmp/direct_copy /src /dst
-DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=128 DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_WORKERS=4 /tmp/direct_copy /src /dst
-DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=256 DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_WORKERS=4 /tmp/direct_copy /src /dst
+DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=64  DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_WORKERS=4 DIRECT_COPY_LARGE_FILE_INFLIGHT=8 /tmp/direct_copy /src /dst
+DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=128 DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_WORKERS=4 DIRECT_COPY_LARGE_FILE_INFLIGHT=8 /tmp/direct_copy /src /dst
+DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=256 DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_WORKERS=4 DIRECT_COPY_LARGE_FILE_INFLIGHT=8 /tmp/direct_copy /src /dst
 ```
 
 Things to watch while tuning:
 
 - completed copy throughput reported by `direct_copy`
+- `Read opens` and `Write opens` counters to confirm actual direct-vs-buffered behavior
+- `Queue wait seconds`, `Read time seconds`, `Write time seconds`, and `cfr time seconds` to identify where workers are stalling
+- `Large chunk buffer allocs` to confirm the large-file path is reusing worker-local buffers instead of churning allocations
 - final `copy_file_range` counters in the summary, to confirm whether the fast path was actually used
 - target-side sustained write throughput
 - source-side sustained read throughput

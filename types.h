@@ -23,6 +23,18 @@ typedef struct {
     uint64_t copy_file_range_bytes;
     uint64_t copy_file_range_fallbacks;
     uint64_t planned_copy_bytes;
+    uint64_t read_direct_opens;
+    uint64_t read_buffered_opens;
+    uint64_t write_direct_opens;
+    uint64_t write_buffered_opens;
+    uint64_t queue_wait_ns;
+    uint64_t read_syscalls;
+    uint64_t read_ns;
+    uint64_t write_syscalls;
+    uint64_t write_ns;
+    uint64_t copy_file_range_syscalls;
+    uint64_t copy_file_range_ns;
+    uint64_t large_chunk_buffer_allocs;
     int traversal_done;
     struct timespec start_ts;
 } stats_t;

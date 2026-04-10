@@ -56,6 +56,7 @@ int open_read_maybe_direct(const char *path, int *used_direct) {
         fd = open(path, O_RDONLY | O_DIRECT);
         if (fd >= 0) {
             if (used_direct) *used_direct = 1;
+            stats_record_read_open(1);
             return fd;
         }
         if (!direct_io_fallback_errno(errno)) {
@@ -69,6 +70,7 @@ int open_read_maybe_direct(const char *path, int *used_direct) {
         perror(path);
         return -1;
     }
+    stats_record_read_open(0);
     return fd;
 }
 
@@ -80,6 +82,7 @@ int open_write_maybe_direct(const char *path, mode_t mode, int *used_direct) {
         fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, mode);
         if (fd >= 0) {
             if (used_direct) *used_direct = 1;
+            stats_record_write_open(1);
             return fd;
         }
         if (!direct_io_fallback_errno(errno)) {
@@ -93,6 +96,7 @@ int open_write_maybe_direct(const char *path, mode_t mode, int *used_direct) {
         perror(path);
         return -1;
     }
+    stats_record_write_open(0);
     return fd;
 }
 

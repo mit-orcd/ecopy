@@ -102,11 +102,13 @@ int main(int argc, char **argv) {
         progress_stop();
         printf("\n");
         stats_print_final();
+        workers_print_runtime_summary();
         return 1;
     }
     progress_stop();
     printf("\n");
     stats_print_final();
+    workers_print_runtime_summary();
 
     if (traversal_status() != 0 || workers_status() != 0) {
         return 1;

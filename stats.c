@@ -61,6 +61,32 @@ void stats_set_traversal_done(void) {
     g_stats.traversal_done = 1;
     pthread_mutex_unlock(&g_lock);
 }
+
+void stats_record_read_open(int used_direct) {
+    pthread_mutex_lock(&g_lock);
+    if (used_direct) {
+        g_stats.read_direct_opens++;
+    } else {
+        g_stats.read_buffered_opens++;
+    }
+    pthread_mutex_unlock(&g_lock);
+}
+
+void stats_record_write_open(int used_direct) {
+    pthread_mutex_lock(&g_lock);
+    if (used_direct) {
+        g_stats.write_direct_opens++;
+    } else {
+        g_stats.write_buffered_opens++;
+    }
+    pthread_mutex_unlock(&g_lock);
+}
+
+void stats_record_queue_wait_ns(uint64_t ns) { pthread_mutex_lock(&g_lock); g_stats.queue_wait_ns += ns; pthread_mutex_unlock(&g_lock); }
+void stats_record_read_io(uint64_t ns) { pthread_mutex_lock(&g_lock); g_stats.read_syscalls++; g_stats.read_ns += ns; pthread_mutex_unlock(&g_lock); }
+void stats_record_write_io(uint64_t ns) { pthread_mutex_lock(&g_lock); g_stats.write_syscalls++; g_stats.write_ns += ns; pthread_mutex_unlock(&g_lock); }
+void stats_record_copy_file_range_io(uint64_t ns) { pthread_mutex_lock(&g_lock); g_stats.copy_file_range_syscalls++; g_stats.copy_file_range_ns += ns; pthread_mutex_unlock(&g_lock); }
+void stats_record_large_chunk_buffer_alloc(void) { pthread_mutex_lock(&g_lock); g_stats.large_chunk_buffer_allocs++; pthread_mutex_unlock(&g_lock); }
 void stats_inc_files_seen(void){ pthread_mutex_lock(&g_lock); g_stats.files_seen++; pthread_mutex_unlock(&g_lock);} 
 void stats_inc_files_copied(void){ pthread_mutex_lock(&g_lock); g_stats.files_copied++; pthread_mutex_unlock(&g_lock);} 
 void stats_inc_files_skipped(void){ pthread_mutex_lock(&g_lock); g_stats.files_skipped++; pthread_mutex_unlock(&g_lock);} 
@@ -220,6 +246,18 @@ void stats_print_final(void) {
     printf("copy_file_range calls     : %" PRIu64 "\n", s.copy_file_range_calls);
     printf("copy_file_range bytes     : %" PRIu64 "\n", s.copy_file_range_bytes);
     printf("copy_file_range fallbacks : %" PRIu64 "\n", s.copy_file_range_fallbacks);
+    printf("Read opens   direct      : %" PRIu64 "\n", s.read_direct_opens);
+    printf("Read opens   buffered    : %" PRIu64 "\n", s.read_buffered_opens);
+    printf("Write opens  direct      : %" PRIu64 "\n", s.write_direct_opens);
+    printf("Write opens  buffered    : %" PRIu64 "\n", s.write_buffered_opens);
+    printf("Queue wait   seconds     : %.3f\n", (double)s.queue_wait_ns / 1e9);
+    printf("Read syscalls            : %" PRIu64 "\n", s.read_syscalls);
+    printf("Read time    seconds     : %.3f\n", (double)s.read_ns / 1e9);
+    printf("Write syscalls           : %" PRIu64 "\n", s.write_syscalls);
+    printf("Write time   seconds     : %.3f\n", (double)s.write_ns / 1e9);
+    printf("cfr syscalls             : %" PRIu64 "\n", s.copy_file_range_syscalls);
+    printf("cfr time     seconds     : %.3f\n", (double)s.copy_file_range_ns / 1e9);
+    printf("Large chunk buffer allocs: %" PRIu64 "\n", s.large_chunk_buffer_allocs);
     printf("GiB copied    : %.2f\n", gib);
     printf("Elapsed       : %.2f s\n", sec);
     printf("Avg speed     : %.2f GiB/s\n", avg);
