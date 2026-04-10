@@ -31,28 +31,57 @@ int copy_file_range_enabled(void) {
     return g_copy_file_range_enabled;
 }
 
+static int env_disable_flag(const char *name)
+{
+    const char *env = getenv(name);
+    return env && *env && strcmp(env, "0") != 0;
+}
+
 int direct_io_enabled(void) {
-    static int g_direct_io_enabled = -1;
+    return read_direct_io_enabled() && write_direct_io_enabled();
+}
 
-    if (g_direct_io_enabled >= 0) {
-        return g_direct_io_enabled;
+int read_direct_io_enabled(void)
+{
+    static int g_read_direct_io_enabled = -1;
+
+    if (g_read_direct_io_enabled >= 0) {
+        return g_read_direct_io_enabled;
     }
 
-    const char *env = getenv("DIRECT_COPY_DISABLE_DIRECT_IO");
-    if (!env || !*env || strcmp(env, "0") == 0) {
-        g_direct_io_enabled = 1;
+    if (env_disable_flag("DIRECT_COPY_DISABLE_READ_DIRECT_IO") ||
+        env_disable_flag("DIRECT_COPY_DISABLE_DIRECT_IO")) {
+        g_read_direct_io_enabled = 0;
     } else {
-        g_direct_io_enabled = 0;
+        g_read_direct_io_enabled = 1;
     }
 
-    return g_direct_io_enabled;
+    return g_read_direct_io_enabled;
+}
+
+int write_direct_io_enabled(void)
+{
+    static int g_write_direct_io_enabled = -1;
+
+    if (g_write_direct_io_enabled >= 0) {
+        return g_write_direct_io_enabled;
+    }
+
+    if (env_disable_flag("DIRECT_COPY_DISABLE_WRITE_DIRECT_IO") ||
+        env_disable_flag("DIRECT_COPY_DISABLE_DIRECT_IO")) {
+        g_write_direct_io_enabled = 0;
+    } else {
+        g_write_direct_io_enabled = 1;
+    }
+
+    return g_write_direct_io_enabled;
 }
 
 int open_read_maybe_direct(const char *path, int *used_direct) {
     int fd;
     if (used_direct) *used_direct = 0;
 
-    if (direct_io_enabled()) {
+    if (read_direct_io_enabled()) {
         fd = open(path, O_RDONLY | O_DIRECT);
         if (fd >= 0) {
             if (used_direct) *used_direct = 1;
@@ -78,7 +107,7 @@ int open_write_maybe_direct(const char *path, mode_t mode, int *used_direct) {
     int fd;
     if (used_direct) *used_direct = 0;
 
-    if (direct_io_enabled()) {
+    if (write_direct_io_enabled()) {
         fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, mode);
         if (fd >= 0) {
             if (used_direct) *used_direct = 1;

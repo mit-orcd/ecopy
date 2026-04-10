@@ -35,6 +35,13 @@ typedef struct {
     uint64_t copy_file_range_syscalls;
     uint64_t copy_file_range_ns;
     uint64_t large_chunk_buffer_allocs;
+    uint64_t reader_buffer_wait_ns;
+    uint64_t reader_buffer_waits;
+    uint64_t writer_data_wait_ns;
+    uint64_t writer_data_waits;
+    uint64_t ready_queue_peak;
+    uint64_t ready_queue_samples;
+    uint64_t ready_queue_total;
     int traversal_done;
     struct timespec start_ts;
 } stats_t;

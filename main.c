@@ -94,6 +94,7 @@ int main(int argc, char **argv) {
 
     stats_init();
     if (workers_start() != 0) return 1;
+    workers_print_startup_config();
     if (progress_start() != 0) { workers_stop(); return 1; }
     if (traversal_start(src_abs, dst_abs) != 0) { progress_stop(); workers_stop(); return 1; }
     traversal_wait();

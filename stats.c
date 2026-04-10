@@ -87,6 +87,9 @@ void stats_record_read_io(uint64_t ns) { pthread_mutex_lock(&g_lock); g_stats.re
 void stats_record_write_io(uint64_t ns) { pthread_mutex_lock(&g_lock); g_stats.write_syscalls++; g_stats.write_ns += ns; pthread_mutex_unlock(&g_lock); }
 void stats_record_copy_file_range_io(uint64_t ns) { pthread_mutex_lock(&g_lock); g_stats.copy_file_range_syscalls++; g_stats.copy_file_range_ns += ns; pthread_mutex_unlock(&g_lock); }
 void stats_record_large_chunk_buffer_alloc(void) { pthread_mutex_lock(&g_lock); g_stats.large_chunk_buffer_allocs++; pthread_mutex_unlock(&g_lock); }
+void stats_record_reader_buffer_wait_ns(uint64_t ns) { pthread_mutex_lock(&g_lock); g_stats.reader_buffer_wait_ns += ns; g_stats.reader_buffer_waits++; pthread_mutex_unlock(&g_lock); }
+void stats_record_writer_data_wait_ns(uint64_t ns) { pthread_mutex_lock(&g_lock); g_stats.writer_data_wait_ns += ns; g_stats.writer_data_waits++; pthread_mutex_unlock(&g_lock); }
+void stats_record_ready_queue_depth(uint64_t depth) { pthread_mutex_lock(&g_lock); if (depth > g_stats.ready_queue_peak) g_stats.ready_queue_peak = depth; g_stats.ready_queue_total += depth; g_stats.ready_queue_samples++; pthread_mutex_unlock(&g_lock); }
 void stats_inc_files_seen(void){ pthread_mutex_lock(&g_lock); g_stats.files_seen++; pthread_mutex_unlock(&g_lock);} 
 void stats_inc_files_copied(void){ pthread_mutex_lock(&g_lock); g_stats.files_copied++; pthread_mutex_unlock(&g_lock);} 
 void stats_inc_files_skipped(void){ pthread_mutex_lock(&g_lock); g_stats.files_skipped++; pthread_mutex_unlock(&g_lock);} 
@@ -258,6 +261,12 @@ void stats_print_final(void) {
     printf("cfr syscalls             : %" PRIu64 "\n", s.copy_file_range_syscalls);
     printf("cfr time     seconds     : %.3f\n", (double)s.copy_file_range_ns / 1e9);
     printf("Large chunk buffer allocs: %" PRIu64 "\n", s.large_chunk_buffer_allocs);
+    printf("Reader buf waits        : %" PRIu64 "\n", s.reader_buffer_waits);
+    printf("Reader buf wait seconds : %.3f\n", (double)s.reader_buffer_wait_ns / 1e9);
+    printf("Writer data waits       : %" PRIu64 "\n", s.writer_data_waits);
+    printf("Writer data wait seconds: %.3f\n", (double)s.writer_data_wait_ns / 1e9);
+    printf("Ready queue peak        : %" PRIu64 "\n", s.ready_queue_peak);
+    printf("Ready queue avg depth   : %.2f\n", s.ready_queue_samples ? (double)s.ready_queue_total / (double)s.ready_queue_samples : 0.0);
     printf("GiB copied    : %.2f\n", gib);
     printf("Elapsed       : %.2f s\n", sec);
     printf("Avg speed     : %.2f GiB/s\n", avg);

@@ -33,6 +33,10 @@ DIRECT_COPY_DISABLE_DIRECT_IO=1 /tmp/direct_copy /orcd/datasets/001/GLM51/ /scra
 ```
 
 ```bash
+DIRECT_COPY_DISABLE_READ_DIRECT_IO=1 DIRECT_COPY_DISABLE_WRITE_DIRECT_IO=0 /tmp/direct_copy /src /dst
+```
+
+```bash
 DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_WORKERS=4 /tmp/direct_copy /src /dst
 ```
 
@@ -46,8 +50,8 @@ The current design uses a shared slot budget.
 
 - Small files consume `1` worker slot.
 - Large files are activated in parallel based on `DIRECT_COPY_MAX_WORKERS / DIRECT_COPY_LARGE_WORKERS`.
-- Each active large file can keep up to `DIRECT_COPY_LARGE_FILE_INFLIGHT` chunk tasks queued or in flight.
-- Large chunk workers reuse a worker-local aligned buffer instead of allocating one buffer per chunk task.
+- Each active large file gets a bounded large-file pipeline with preallocated aligned chunk buffers.
+- Readers fill buffers, writers drain a ready queue, and the per-file in-flight depth is capped by `DIRECT_COPY_LARGE_FILE_INFLIGHT`.
 - The total budget is capped by `DIRECT_COPY_MAX_WORKERS`.
 
 This avoids the older problem where fixed small-file and large-file pools wasted capacity when one side of the workload
@@ -85,14 +89,15 @@ With the current defaults, that is `640 MiB`.
 Large-file copy works like this:
 
 1. The target file is created and pre-sized.
-2. The large file is activated into the global chunk scheduler.
-3. Aligned ranges are emitted as chunk tasks instead of assigning one fixed quarter-file slice to each worker.
-4. Each active large file can keep up to `DIRECT_COPY_LARGE_FILE_INFLIGHT` chunk tasks queued or in flight.
-5. Worker threads pull chunk tasks from the shared global queue, which improves load balancing and keeps more I/O in flight.
-6. Any remaining unaligned tail bytes are copied in a buffered tail pass.
-7. Final metadata is restored after data copy completes.
+2. The large file is activated into its own bounded pipeline.
+3. A pool of aligned chunk buffers is preallocated up front.
+4. Reader threads use `pread()` to fill free buffers and push them into a ready-to-write queue.
+5. Writer threads drain that ready queue with `pwrite()`.
+6. `DIRECT_COPY_LARGE_FILE_INFLIGHT` limits how many chunk buffers each active large file may keep in flight at once.
+7. Any remaining unaligned tail bytes are copied in a buffered tail pass.
+8. Final metadata is restored after data copy completes.
 
-This gives wide sequential I/O on large files without forcing all workloads into a chunk scheduler.
+This gives a real read-buffer-write pipeline for large files, with bounded queue depth and instrumentation that tells us whether readers are waiting for buffers or writers are waiting for data.
 
 ## Buffered I/O Streaming Optimizations
 
@@ -165,6 +170,19 @@ Default:
 
 This is the closest runtime knob to per-file queue depth for large-file NFS/RDMA tuning. Higher values can create more in-flight I/O, but can also increase contention.
 
+In the final runtime summary, `large file readers/file` and `large file writers/file` show the actual split used for each active large-file pipeline.
+
+### `DIRECT_COPY_LARGE_READERS`
+
+Optional explicit override for large-file reader threads per active large file.
+
+### `DIRECT_COPY_LARGE_WRITERS`
+
+Optional explicit override for large-file writer threads per active large file.
+
+Set these two together when you want a deterministic split such as `3 readers / 1 writer` or `6 readers / 2 writers`.
+When both are set, their sum becomes the effective per-file large-worker total and is used to compute the active-large-file limit.
+
 ### `DIRECT_COPY_CHUNK_MB`
 
 Chunk size in MiB used for aligned bulk transfer.
@@ -191,15 +209,31 @@ DIRECT_COPY_DISABLE_COPY_FILE_RANGE=1 DIRECT_COPY_DISABLE_DIRECT_IO=1 /tmp/direc
 
 ### `DIRECT_COPY_DISABLE_DIRECT_IO`
 
-When unset or set to `0`, the tool tries direct I/O first.
+Legacy global switch. When unset or set to `0`, the tool allows direct I/O on both reads and writes.
 
-When set to any non-empty value other than `0`, the tool disables direct I/O and uses buffered I/O paths instead.
+When set to any non-empty value other than `0`, the tool disables direct I/O on both sides and uses buffered I/O paths instead.
 
 Example:
 
 ```bash
 DIRECT_COPY_DISABLE_DIRECT_IO=1 /tmp/direct_copy /src /dst
 ```
+
+### `DIRECT_COPY_DISABLE_READ_DIRECT_IO`
+
+When set to any non-empty value other than `0`, the tool disables direct I/O for source reads while leaving the write side unchanged.
+
+Example:
+
+```bash
+DIRECT_COPY_DISABLE_READ_DIRECT_IO=1 DIRECT_COPY_DISABLE_WRITE_DIRECT_IO=0 /tmp/direct_copy /src /dst
+```
+
+### `DIRECT_COPY_DISABLE_WRITE_DIRECT_IO`
+
+When set to any non-empty value other than `0`, the tool disables direct I/O for destination writes while leaving the read side unchanged.
+
+The per-side switches override the old all-or-nothing behavior and make mixed mode possible, such as buffered reads from NFS and direct writes to local flash.
 
 ## Performance Tuning
 
@@ -223,7 +257,8 @@ Things to watch while tuning:
 - completed copy throughput reported by `direct_copy`
 - `Read opens` and `Write opens` counters to confirm actual direct-vs-buffered behavior
 - `Queue wait seconds`, `Read time seconds`, `Write time seconds`, and `cfr time seconds` to identify where workers are stalling
-- `Large chunk buffer allocs` to confirm the large-file path is reusing worker-local buffers instead of churning allocations
+- `Reader buf waits`, `Reader buf wait seconds`, `Writer data waits`, `Writer data wait seconds`, and `Ready queue peak/avg depth` to see whether the large-file pipeline is backpressured by reads, writes, or buffer availability
+- `Large chunk buffer allocs` to confirm the large-file path preallocated and reused its bounded buffer pool
 - final `copy_file_range` counters in the summary, to confirm whether the fast path was actually used
 - target-side sustained write throughput
 - source-side sustained read throughput

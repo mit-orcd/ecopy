@@ -11,6 +11,7 @@ int workers_large_file_inflight(void);
 int workers_max_active_large_files(void);
 int workers_chunk_mb(void);
 void workers_print_runtime_summary(void);
+void workers_print_startup_config(void);
 void workers_stop(void);
 int workers_status(void);
 int workers_enqueue_small_file(const char *src, const char *dst, const struct stat *src_st);
