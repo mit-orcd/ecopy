@@ -19,7 +19,7 @@ dataset movement, not full filesystem replication.
 ## Usage
 
 ```bash
-/tmp/direct_copy <source_dir> <target_dir>
+/tmp/direct_copy [-v] <source_dir> <target_dir>
 ```
 
 Examples:
@@ -49,7 +49,7 @@ DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=128 DIRECT_COPY_MAX_WORKERS
 The current design uses a shared slot budget.
 
 - Small files consume `1` worker slot.
-- Large files are activated in parallel based on `DIRECT_COPY_MAX_WORKERS / DIRECT_COPY_LARGE_WORKERS`.
+- Large files are activated in parallel based on `DIRECT_COPY_MAX_WORKERS / (DIRECT_COPY_LARGE_READERS + DIRECT_COPY_LARGE_WRITERS)` when explicit reader/writer counts are in use.
 - Each active large file gets a bounded large-file pipeline with preallocated aligned chunk buffers.
 - Readers fill buffers, writers drain a ready queue, and the per-file in-flight depth is capped by `DIRECT_COPY_LARGE_FILE_INFLIGHT`.
 - The total budget is capped by `DIRECT_COPY_MAX_WORKERS`.
@@ -59,15 +59,18 @@ was idle.
 
 Default behavior:
 
-- `DIRECT_COPY_MAX_WORKERS = 16`
-- `DIRECT_COPY_LARGE_WORKERS = 4`
-- `DIRECT_COPY_LARGE_FILE_INFLIGHT = 4`
+- `DIRECT_COPY_MAX_WORKERS = 256`
+- `DIRECT_COPY_LARGE_READERS = 4`
+- `DIRECT_COPY_LARGE_WRITERS = 2`
+- `DIRECT_COPY_LARGE_FILE_INFLIGHT = 16`
+- `DIRECT_COPY_CHUNK_MB = 1`
 
 So by default:
 
-- all-small workloads can run up to `16` files in parallel
-- all-large workloads can run up to `4` large files in parallel by default
-- each active large file can keep up to `4` chunk tasks in flight by default
+- all-small workloads can run up to `256` files in parallel
+- all-large workloads can run up to about `42` large files in parallel by default
+- each active large file uses `4` readers and `2` writers by default
+- each active large file can keep up to `16` chunk buffers in flight by default
 - mixed workloads share the same slot pool instead of reserving idle capacity for one class of work
 
 ## Copy Strategy
@@ -84,7 +87,7 @@ A file is treated as large when its size exceeds:
 10 * CHUNK_SIZE
 ```
 
-With the current defaults, that is `640 MiB`.
+With the current defaults, that is `10 MiB`.
 
 Large-file copy works like this:
 
@@ -145,7 +148,7 @@ Total shared slot budget across all work.
 Default:
 
 ```text
-16
+256
 ```
 
 ### `DIRECT_COPY_LARGE_WORKERS`
@@ -155,7 +158,7 @@ Concurrency divisor used to determine how many large files may be active at once
 Default:
 
 ```text
-4
+6
 ```
 
 ### `DIRECT_COPY_LARGE_FILE_INFLIGHT`
@@ -165,7 +168,7 @@ Maximum number of chunk tasks that each active large file may keep queued or in 
 Default:
 
 ```text
-4
+16
 ```
 
 This is the closest runtime knob to per-file queue depth for large-file NFS/RDMA tuning. Higher values can create more in-flight I/O, but can also increase contention.
@@ -176,9 +179,21 @@ In the final runtime summary, `large file readers/file` and `large file writers/
 
 Optional explicit override for large-file reader threads per active large file.
 
+Default:
+
+```text
+4
+```
+
 ### `DIRECT_COPY_LARGE_WRITERS`
 
 Optional explicit override for large-file writer threads per active large file.
+
+Default:
+
+```text
+2
+```
 
 Set these two together when you want a deterministic split such as `3 readers / 1 writer` or `6 readers / 2 writers`.
 When both are set, their sum becomes the effective per-file large-worker total and is used to compute the active-large-file limit.
@@ -190,7 +205,7 @@ Chunk size in MiB used for aligned bulk transfer.
 Default:
 
 ```text
-64
+1
 ```
 
 Larger values may help high-bandwidth sequential workloads, but the best setting is environment-dependent.
@@ -238,10 +253,10 @@ The per-side switches override the old all-or-nothing behavior and make mixed mo
 ## Performance Tuning
 
 For NFS/RDMA or other high-throughput flash-backed paths, the best settings are workload- and environment-dependent.
-A good starting point for large-file tests is:
+The current built-in defaults are already tuned toward a high-concurrency large-file profile:
 
 ```bash
-DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_WORKERS=4 DIRECT_COPY_LARGE_FILE_INFLIGHT=8 DIRECT_COPY_CHUNK_MB=128 /tmp/direct_copy /src /dst
+DIRECT_COPY_DISABLE_READ_DIRECT_IO=0 DIRECT_COPY_DISABLE_WRITE_DIRECT_IO=0 DIRECT_COPY_MAX_WORKERS=256 DIRECT_COPY_LARGE_READERS=4 DIRECT_COPY_LARGE_WRITERS=2 DIRECT_COPY_LARGE_FILE_INFLIGHT=16 DIRECT_COPY_CHUNK_MB=1 /tmp/direct_copy /src /dst
 ```
 
 A useful benchmark matrix is:

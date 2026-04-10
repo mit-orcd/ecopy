@@ -4,11 +4,11 @@
 #include <sys/types.h>
 
 #define ALIGNMENT 4096
-#define CHUNK_SIZE ((off_t)(64ULL * 1024ULL * 1024ULL))
+#define CHUNK_SIZE ((off_t)(1ULL * 1024ULL * 1024ULL))
 #define PARALLEL_THRESHOLD ((off_t)(10 * CHUNK_SIZE))
 
-#define MAX_WORKER_SLOTS 16
-#define LARGE_FILE_WORKERS 4
+#define MAX_WORKER_SLOTS 256
+#define LARGE_FILE_WORKERS 6
 
 #define MONITOR_INTERVAL_MS 200
 #define SPEED_WINDOW_SEC 10

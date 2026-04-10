@@ -150,19 +150,19 @@ static void init_runtime_config(void)
                                               g_worker_count);
 
     g_explicit_large_readers = env_int_or_default("DIRECT_COPY_LARGE_READERS",
-                                                  0,
+                                                  4,
                                                   0,
                                                   g_worker_count);
     g_explicit_large_writers = env_int_or_default("DIRECT_COPY_LARGE_WRITERS",
-                                                  0,
+                                                  2,
                                                   0,
                                                   g_worker_count);
 
     if ((g_explicit_large_readers > 0) != (g_explicit_large_writers > 0)) {
         fprintf(stderr,
                 "DIRECT_COPY_LARGE_READERS and DIRECT_COPY_LARGE_WRITERS must be set together\n");
-        g_explicit_large_readers = 0;
-        g_explicit_large_writers = 0;
+        g_explicit_large_readers = 4;
+        g_explicit_large_writers = 2;
     }
 
     if (g_explicit_large_readers > 0 && g_explicit_large_writers > 0) {
