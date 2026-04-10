@@ -49,11 +49,26 @@ void stats_add_bytes(uint64_t bytes) {
     g_stats.bytes_copied += bytes;
     pthread_mutex_unlock(&g_lock);
 }
+
+void stats_add_planned_copy_bytes(uint64_t bytes) {
+    pthread_mutex_lock(&g_lock);
+    g_stats.planned_copy_bytes += bytes;
+    pthread_mutex_unlock(&g_lock);
+}
+
+void stats_set_traversal_done(void) {
+    pthread_mutex_lock(&g_lock);
+    g_stats.traversal_done = 1;
+    pthread_mutex_unlock(&g_lock);
+}
 void stats_inc_files_seen(void){ pthread_mutex_lock(&g_lock); g_stats.files_seen++; pthread_mutex_unlock(&g_lock);} 
 void stats_inc_files_copied(void){ pthread_mutex_lock(&g_lock); g_stats.files_copied++; pthread_mutex_unlock(&g_lock);} 
 void stats_inc_files_skipped(void){ pthread_mutex_lock(&g_lock); g_stats.files_skipped++; pthread_mutex_unlock(&g_lock);} 
 void stats_inc_dirs_seen(void){ pthread_mutex_lock(&g_lock); g_stats.dirs_seen++; pthread_mutex_unlock(&g_lock);} 
 void stats_inc_dirs_created(void){ pthread_mutex_lock(&g_lock); g_stats.dirs_created++; pthread_mutex_unlock(&g_lock);} 
+void stats_record_copy_file_range_call(uint64_t bytes) { pthread_mutex_lock(&g_lock); g_stats.copy_file_range_calls++; g_stats.copy_file_range_bytes += bytes; pthread_mutex_unlock(&g_lock); }
+void stats_record_copy_file_range_fallback(void) { pthread_mutex_lock(&g_lock); g_stats.copy_file_range_fallbacks++; pthread_mutex_unlock(&g_lock); }
+void stats_add_copy_file_range_usage(uint64_t calls, uint64_t bytes, uint64_t fallbacks) { pthread_mutex_lock(&g_lock); g_stats.copy_file_range_calls += calls; g_stats.copy_file_range_bytes += bytes; g_stats.copy_file_range_fallbacks += fallbacks; pthread_mutex_unlock(&g_lock); } 
 
 void stats_begin_current_file(const char *path, uint64_t total_bytes, int is_parallel) {
     pthread_mutex_lock(&g_lock);
@@ -176,6 +191,8 @@ void stats_get_progress_snapshot(progress_snapshot_t *snap) {
     snap->files_skipped = g_stats.files_skipped;
     snap->dirs_seen = g_stats.dirs_seen;
     snap->dirs_created = g_stats.dirs_created;
+    snap->planned_copy_bytes = g_stats.planned_copy_bytes;
+    snap->traversal_done = g_stats.traversal_done;
     snap->current_file_done = g_current_file_done;
     snap->current_file_total = g_current_file_total;
     snap->current_file_parallel = g_current_file_parallel;
@@ -200,6 +217,9 @@ void stats_print_final(void) {
     printf("Dirs seen     : %" PRIu64 "\n", s.dirs_seen);
     printf("Dirs created  : %" PRIu64 "\n", s.dirs_created);
     printf("Bytes copied  : %" PRIu64 "\n", s.bytes_copied);
+    printf("copy_file_range calls     : %" PRIu64 "\n", s.copy_file_range_calls);
+    printf("copy_file_range bytes     : %" PRIu64 "\n", s.copy_file_range_bytes);
+    printf("copy_file_range fallbacks : %" PRIu64 "\n", s.copy_file_range_fallbacks);
     printf("GiB copied    : %.2f\n", gib);
     printf("Elapsed       : %.2f s\n", sec);
     printf("Avg speed     : %.2f GiB/s\n", avg);

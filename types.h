@@ -19,6 +19,11 @@ typedef struct {
     uint64_t dirs_seen;
     uint64_t dirs_created;
     uint64_t bytes_copied;
+    uint64_t copy_file_range_calls;
+    uint64_t copy_file_range_bytes;
+    uint64_t copy_file_range_fallbacks;
+    uint64_t planned_copy_bytes;
+    int traversal_done;
     struct timespec start_ts;
 } stats_t;
 
@@ -31,6 +36,9 @@ typedef struct {
 typedef struct {
     uint64_t bytes_done;
     uint64_t chunks_done;
+    uint64_t copy_file_range_calls;
+    uint64_t copy_file_range_bytes;
+    uint64_t copy_file_range_fallbacks;
     int active;
 } chunk_worker_stat_t;
 
@@ -67,6 +75,8 @@ typedef struct {
     uint64_t files_skipped;
     uint64_t dirs_seen;
     uint64_t dirs_created;
+    uint64_t planned_copy_bytes;
+    int traversal_done;
     uint64_t current_file_done;
     uint64_t current_file_total;
     int current_file_parallel;

@@ -6,11 +6,16 @@
 
 void stats_init(void);
 void stats_add_bytes(uint64_t bytes);
+void stats_add_planned_copy_bytes(uint64_t bytes);
+void stats_set_traversal_done(void);
 void stats_inc_files_seen(void);
 void stats_inc_files_copied(void);
 void stats_inc_files_skipped(void);
 void stats_inc_dirs_seen(void);
 void stats_inc_dirs_created(void);
+void stats_record_copy_file_range_call(uint64_t bytes);
+void stats_record_copy_file_range_fallback(void);
+void stats_add_copy_file_range_usage(uint64_t calls, uint64_t bytes, uint64_t fallbacks);
 
 void stats_begin_current_file(const char *path, uint64_t total_bytes, int is_parallel);
 void stats_advance_current_file(uint64_t bytes);

@@ -25,6 +25,7 @@
  *   DIRECT_COPY_MAX_WORKERS
  *   DIRECT_COPY_LARGE_WORKERS
  *   DIRECT_COPY_CHUNK_MB
+ *   DIRECT_COPY_DISABLE_COPY_FILE_RANGE
  */
 
 typedef struct {
@@ -251,6 +252,124 @@ static int direct_io_fallback_errno_local(int err)
            err == ENOSYS;
 }
 
+static int copy_file_range_unsupported_errno_local(int err)
+{
+    return err == ENOSYS ||
+           err == EXDEV ||
+           err == EINVAL ||
+           err == EOPNOTSUPP ||
+           err == ENOTSUP ||
+           err == EPERM;
+}
+
+static void advise_source_streaming(int fd)
+{
+    if (fd < 0) {
+        return;
+    }
+
+    (void)posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+    (void)posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
+}
+
+static void advise_dest_streaming(int fd)
+{
+    if (fd < 0) {
+        return;
+    }
+
+    (void)posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+}
+
+static void advise_source_consumed(int fd, off_t start, off_t len)
+{
+    if (fd < 0 || len <= 0) {
+        return;
+    }
+
+    (void)posix_fadvise(fd, start, len, POSIX_FADV_DONTNEED);
+}
+
+static void record_progress_bytes(uint64_t bytes, int use_current_file_stats)
+{
+    if (use_current_file_stats) {
+        stats_advance_current_file(bytes);
+    } else {
+        stats_add_bytes(bytes);
+    }
+}
+
+static int copy_file_range_with_progress(int fd_in,
+                                         int fd_out,
+                                         off_t *in_off,
+                                         off_t *out_off,
+                                         size_t len,
+                                         int use_current_file_stats)
+{
+    size_t remaining = len;
+
+    while (remaining > 0) {
+        size_t step = remaining;
+        off_t old_in = *in_off;
+
+        ssize_t moved = copy_file_range(fd_in, in_off, fd_out, out_off, step, 0);
+        if (moved < 0) {
+            if (copy_file_range_unsupported_errno_local(errno)) {
+                return 1;
+            }
+            perror("copy_file_range");
+            return -1;
+        }
+        if (moved == 0) {
+            fprintf(stderr, "copy_file_range hit EOF early\n");
+            return -1;
+        }
+
+        record_progress_bytes((uint64_t)moved, use_current_file_stats);
+        stats_record_copy_file_range_call((uint64_t)moved);
+        advise_source_consumed(fd_in, old_in, (off_t)moved);
+        remaining -= (size_t)moved;
+    }
+
+    return 0;
+}
+
+static int copy_file_range_with_worker_stats(int fd_in,
+                                             int fd_out,
+                                             off_t *in_off,
+                                             off_t *out_off,
+                                             size_t len,
+                                             chunk_worker_stat_t *ws)
+{
+    size_t remaining = len;
+
+    while (remaining > 0) {
+        size_t step = remaining;
+        off_t old_in = *in_off;
+
+        ssize_t moved = copy_file_range(fd_in, in_off, fd_out, out_off, step, 0);
+        if (moved < 0) {
+            if (copy_file_range_unsupported_errno_local(errno)) {
+                return 1;
+            }
+            perror("copy_file_range");
+            return -1;
+        }
+        if (moved == 0) {
+            fprintf(stderr, "copy_file_range hit EOF early\n");
+            return -1;
+        }
+
+        ws->bytes_done += (uint64_t)moved;
+        ws->copy_file_range_calls++;
+        ws->copy_file_range_bytes += (uint64_t)moved;
+        advise_source_consumed(fd_in, old_in, (off_t)moved);
+        remaining -= (size_t)moved;
+    }
+
+    return 0;
+}
+
 static int open_write_existing_maybe_direct(const char *path, int *used_direct)
 {
     int fd;
@@ -324,6 +443,9 @@ static int copy_tail_buffered(const char *src,
         return -1;
     }
 
+    advise_source_streaming(fd_in);
+    advise_dest_streaming(fd_out);
+
     if (lseek(fd_in, start, SEEK_SET) < 0) {
         perror("lseek src");
         close(fd_in);
@@ -345,6 +467,7 @@ static int copy_tail_buffered(const char *src,
         off_t remain = end - pos;
         off_t this_len_off = (remain < (off_t)sizeof(buf)) ? remain : (off_t)sizeof(buf);
         size_t len = (size_t)this_len_off;
+        off_t chunk_start = pos;
 
         ssize_t r = read(fd_in, buf, len);
         if (r < 0) {
@@ -370,11 +493,8 @@ static int copy_tail_buffered(const char *src,
         }
 
         pos += r;
-        if (use_current_file_stats) {
-            stats_advance_current_file((uint64_t)r);
-        } else {
-            stats_add_bytes((uint64_t)r);
-        }
+        record_progress_bytes((uint64_t)r, use_current_file_stats);
+        advise_source_consumed(fd_in, chunk_start, r);
     }
 
     close(fd_in);
@@ -391,6 +511,7 @@ static int copy_file_serial_small(const char *src, const char *dst, const struct
     int in_direct = 0;
     int out_direct = 0;
     void *buf = NULL;
+    int copy_range_available = copy_file_range_enabled();
 
     off_t size = src_st->st_size;
     off_t bulk_end = (size / ALIGNMENT) * ALIGNMENT;
@@ -414,6 +535,13 @@ static int copy_file_serial_small(const char *src, const char *dst, const struct
         return -1;
     }
 
+    if (!in_direct) {
+        advise_source_streaming(fd_in);
+    }
+    if (!out_direct) {
+        advise_dest_streaming(fd_out);
+    }
+
     if (posix_memalign(&buf, ALIGNMENT, (size_t)g_chunk_size) != 0) {
         fprintf(stderr, "posix_memalign failed\n");
         close(fd_in);
@@ -425,6 +553,24 @@ static int copy_file_serial_small(const char *src, const char *dst, const struct
         off_t remain = bulk_end - pos;
         off_t this_len_off = (remain >= g_chunk_size) ? g_chunk_size : remain;
         size_t len = (size_t)this_len_off;
+
+        if (!in_direct && !out_direct && copy_range_available) {
+            off_t in_off = pos;
+            off_t out_off = pos;
+            int cfr_rc = copy_file_range_with_progress(fd_in, fd_out, &in_off, &out_off, len, 0);
+            if (cfr_rc == 0) {
+                pos += this_len_off;
+                continue;
+            }
+            if (cfr_rc < 0) {
+                free(buf);
+                close(fd_in);
+                close(fd_out);
+                return -1;
+            }
+            stats_record_copy_file_range_fallback();
+            copy_range_available = 0;
+        }
 
         ssize_t r = read(fd_in, buf, len);
         if (r < 0) {
@@ -455,6 +601,7 @@ static int copy_file_serial_small(const char *src, const char *dst, const struct
             done += (size_t)w;
         }
 
+        advise_source_consumed(fd_in, pos, r);
         pos += this_len_off;
         stats_add_bytes((uint64_t)len);
     }
@@ -481,6 +628,33 @@ static uint64_t sum_worker_bytes(chunk_worker_stat_t *workers, int count)
     return total;
 }
 
+static void accumulate_worker_copy_file_range_usage(chunk_worker_stat_t *workers,
+                                                    int count,
+                                                    uint64_t *calls,
+                                                    uint64_t *bytes,
+                                                    uint64_t *fallbacks)
+{
+    uint64_t total_calls = 0;
+    uint64_t total_bytes = 0;
+    uint64_t total_fallbacks = 0;
+
+    for (int i = 0; i < count; i++) {
+        total_calls += workers[i].copy_file_range_calls;
+        total_bytes += workers[i].copy_file_range_bytes;
+        total_fallbacks += workers[i].copy_file_range_fallbacks;
+    }
+
+    if (calls) {
+        *calls = total_calls;
+    }
+    if (bytes) {
+        *bytes = total_bytes;
+    }
+    if (fallbacks) {
+        *fallbacks = total_fallbacks;
+    }
+}
+
 static void kill_remaining_children(pid_t *pids, int count, int *done)
 {
     for (int i = 0; i < count; i++) {
@@ -502,6 +676,7 @@ static int child_copy_range(const char *src,
     int out_direct = 0;
     void *buf = NULL;
     int rc = 1;
+    int copy_range_available = copy_file_range_enabled();
 
     fd_in = open_read_maybe_direct(src, &in_direct);
     if (fd_in < 0) {
@@ -512,6 +687,13 @@ static int child_copy_range(const char *src,
     if (fd_out < 0) {
         close(fd_in);
         return 1;
+    }
+
+    if (!in_direct) {
+        advise_source_streaming(fd_in);
+    }
+    if (!out_direct) {
+        advise_dest_streaming(fd_out);
     }
 
     if (posix_memalign(&buf, ALIGNMENT, (size_t)g_chunk_size) != 0) {
@@ -531,6 +713,22 @@ static int child_copy_range(const char *src,
         off_t remain = end - pos;
         off_t this_len_off = (remain >= g_chunk_size) ? g_chunk_size : remain;
         size_t len = (size_t)this_len_off;
+
+        if (!in_direct && !out_direct && copy_range_available) {
+            off_t in_off = pos;
+            off_t out_off = pos;
+            int cfr_rc = copy_file_range_with_worker_stats(fd_in, fd_out, &in_off, &out_off, len, ws);
+            if (cfr_rc == 0) {
+                pos += this_len_off;
+                ws->chunks_done++;
+                continue;
+            }
+            if (cfr_rc < 0) {
+                goto out;
+            }
+            ws->copy_file_range_fallbacks++;
+            copy_range_available = 0;
+        }
 
         ssize_t r = pread(fd_in, buf, len, pos);
         if (r < 0) {
@@ -561,6 +759,7 @@ static int child_copy_range(const char *src,
             done += (size_t)w;
         }
 
+        advise_source_consumed(fd_in, pos, len);
         pos += this_len_off;
         ws->bytes_done += (uint64_t)len;
         ws->chunks_done++;
@@ -586,6 +785,9 @@ static int copy_file_parallel_large(const char *src, const char *dst, const stru
     int *done = NULL;
     int rc = -1;
     uint64_t accounted = 0;
+    uint64_t cfr_calls = 0;
+    uint64_t cfr_bytes = 0;
+    uint64_t cfr_fallbacks = 0;
     int failed = 0;
 
     memset(&ctx, 0, sizeof(ctx));
@@ -710,6 +912,10 @@ static int copy_file_parallel_large(const char *src, const char *dst, const stru
             accounted = total_done;
         }
     }
+
+    accumulate_worker_copy_file_range_usage(ctx.workers, ctx.worker_count,
+                                            &cfr_calls, &cfr_bytes, &cfr_fallbacks);
+    stats_add_copy_file_range_usage(cfr_calls, cfr_bytes, cfr_fallbacks);
 
     if (failed) {
         goto out;

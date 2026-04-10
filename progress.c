@@ -12,6 +12,7 @@
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <inttypes.h>
+#include <stdint.h>
 
 static pthread_t g_monitor_thread;
 static int g_monitor_stop = 0;
@@ -40,6 +41,25 @@ static void trim_to_width(char *s, int width) {
     s[width - 3] = '.';
     s[width - 2] = '.';
     s[width - 1] = '\0';
+}
+
+static void format_duration(double sec, char *out, size_t out_sz)
+{
+    if (!out || out_sz == 0) {
+        return;
+    }
+
+    if (sec < 0.0) {
+        sec = 0.0;
+    }
+
+    uint64_t total = (uint64_t)(sec + 0.5);
+    uint64_t hours = total / 3600;
+    uint64_t minutes = (total % 3600) / 60;
+    uint64_t seconds = total % 60;
+
+    snprintf(out, out_sz, "%02" PRIu64 ":%02" PRIu64 ":%02" PRIu64,
+             hours, minutes, seconds);
 }
 
 static void append_chunk_worker_stats(char *out, size_t out_sz, int *n_io) {
@@ -76,11 +96,14 @@ static void build_progress_line(char *out, size_t out_sz) {
     uint64_t sa = workers_small_active_count();
     uint64_t lq = workers_large_queue_depth();
     uint64_t la = workers_large_active_count();
+    char elapsed_buf[32];
+    char remaining_buf[32];
 
     stats_get_progress_snapshot(&snap);
+    format_duration(snap.elapsed_sec, elapsed_buf, sizeof(elapsed_buf));
 
     int n = snprintf(out, out_sz,
-        "%.2f GiB, %.2f GiB/s, %" PRIu64 " files, %" PRIu64 " dirs | sq:%" PRIu64 " sa:%" PRIu64 " lq:%" PRIu64 " la:%" PRIu64,
+        "%.2f GiB, %.2f GiB/s, %" PRIu64 " files, %" PRIu64 " dirs | sq:%" PRIu64 " sa:%" PRIu64 " lq:%" PRIu64 " la:%" PRIu64 " | el:%s",
         stats_bytes_to_gib(snap.bytes_copied),
         snap.rolling_gibs,
         snap.files_seen,
@@ -88,7 +111,19 @@ static void build_progress_line(char *out, size_t out_sz) {
         sq,
         sa,
         lq,
-        la);
+        la,
+        elapsed_buf);
+
+    if (snap.traversal_done && snap.planned_copy_bytes > snap.bytes_copied && snap.rolling_gibs > 0.0 && n > 0 && (size_t)n < out_sz) {
+        uint64_t remaining_bytes = snap.planned_copy_bytes - snap.bytes_copied;
+        double remaining_sec = stats_bytes_to_gib(remaining_bytes) / snap.rolling_gibs;
+        format_duration(remaining_sec, remaining_buf, sizeof(remaining_buf));
+        n += snprintf(out + n, out_sz - (size_t)n, " | left:%s", remaining_buf);
+    } else if (snap.traversal_done && n > 0 && (size_t)n < out_sz) {
+        n += snprintf(out + n, out_sz - (size_t)n, " | left:00:00:00");
+    } else if (n > 0 && (size_t)n < out_sz) {
+        n += snprintf(out + n, out_sz - (size_t)n, " | left:scan");
+    }
 
     if (snap.current_file_total > 0 && n > 0 && (size_t)n < out_sz) {
         double pct = 100.0 * (double)snap.current_file_done / (double)snap.current_file_total;

@@ -11,6 +11,7 @@ same time.
 - Skips unchanged files based on `size + mtime`.
 - Preserves important metadata from the source.
 - Uses a shared worker-slot scheduler so small and large file workloads can share the same concurrency budget.
+- Supports either direct I/O or buffered I/O, with runtime controls for both.
 
 The tool intentionally ignores non-regular payloads such as symlinks, devices, FIFOs, and sockets. It is tuned for
 dataset movement, not full filesystem replication.
@@ -35,6 +36,10 @@ DIRECT_COPY_DISABLE_DIRECT_IO=1 /tmp/direct_copy /orcd/datasets/001/GLM51/ /scra
 DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_WORKERS=4 /tmp/direct_copy /src /dst
 ```
 
+```bash
+DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=128 DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_WORKERS=4 /tmp/direct_copy /src /dst
+```
+
 ## Scheduler Model
 
 The current design uses a shared slot budget.
@@ -55,12 +60,13 @@ So by default:
 
 - all-small workloads can run up to `16` files in parallel
 - all-large workloads can run up to `4` large files in parallel, each with `4` chunk workers
+- mixed workloads share the same slot pool instead of reserving idle capacity for one class of work
 
 ## Copy Strategy
 
 ### Small Files
 
-Smaller files are copied with a straightforward read/write loop.
+Small files use a simple copy path. When direct I/O is disabled, the buffered path can also use streaming hints and opportunistic `copy_file_range()` acceleration.
 
 ### Large Files
 
@@ -81,6 +87,20 @@ Large-file copy works like this:
 5. Final metadata is restored after data copy completes.
 
 This gives wide sequential I/O on large files without forcing all workloads into a chunk scheduler.
+
+## Buffered I/O Streaming Optimizations
+
+When direct I/O is disabled with `DIRECT_COPY_DISABLE_DIRECT_IO=1`, the copy path enables a few extra optimizations for
+large sequential transfers:
+
+- `posix_fadvise(..., POSIX_FADV_SEQUENTIAL)` to tell the kernel the source stream is sequential
+- `posix_fadvise(..., POSIX_FADV_WILLNEED)` to encourage readahead on the source stream
+- `posix_fadvise(..., POSIX_FADV_DONTNEED)` after source ranges are consumed, to reduce page-cache pollution
+- opportunistic `copy_file_range()` for buffered copies, with automatic fallback to normal read/write if unsupported
+- optional runtime disable switch for controlled A/B testing on filesystems where `copy_file_range()` is inconsistent or unhelpful
+
+These hints are most relevant on buffered I/O paths over fast storage or network filesystems where the best-performing
+behavior depends on the kernel, client, and server stack.
 
 ## Metadata Preservation
 
@@ -137,6 +157,20 @@ Default:
 64
 ```
 
+Larger values may help high-bandwidth sequential workloads, but the best setting is environment-dependent.
+
+### `DIRECT_COPY_DISABLE_COPY_FILE_RANGE`
+
+When unset or set to `0`, the tool may use `copy_file_range()` on buffered copy paths when the kernel and filesystem support it.
+
+When set to any non-empty value other than `0`, the tool skips `copy_file_range()` entirely and uses the normal buffered read/write path.
+
+Example:
+
+```bash
+DIRECT_COPY_DISABLE_COPY_FILE_RANGE=1 DIRECT_COPY_DISABLE_DIRECT_IO=1 /tmp/direct_copy /src /dst
+```
+
 ### `DIRECT_COPY_DISABLE_DIRECT_IO`
 
 When unset or set to `0`, the tool tries direct I/O first.
@@ -148,6 +182,32 @@ Example:
 ```bash
 DIRECT_COPY_DISABLE_DIRECT_IO=1 /tmp/direct_copy /src /dst
 ```
+
+## Performance Tuning
+
+For NFS/RDMA or other high-throughput flash-backed paths, the best settings are workload- and environment-dependent.
+A good starting point for large-file tests is:
+
+```bash
+DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_WORKERS=4 DIRECT_COPY_CHUNK_MB=128 /tmp/direct_copy /src /dst
+```
+
+A useful benchmark matrix is:
+
+```bash
+DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=64  DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_WORKERS=4 /tmp/direct_copy /src /dst
+DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=128 DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_WORKERS=4 /tmp/direct_copy /src /dst
+DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=256 DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_WORKERS=4 /tmp/direct_copy /src /dst
+```
+
+Things to watch while tuning:
+
+- completed copy throughput reported by `direct_copy`
+- final `copy_file_range` counters in the summary, to confirm whether the fast path was actually used
+- target-side sustained write throughput
+- source-side sustained read throughput
+- client CPU usage and run queue pressure
+- whether more concurrency improves throughput or just adds contention
 
 ## Design Decisions
 
@@ -165,6 +225,18 @@ payload as already synchronized and then refreshes metadata so the target still 
 
 On some flash and NFS/RDMA stacks, `O_DIRECT` helps. On others, buffered I/O with kernel readahead and writeback is
 faster. The switch exists because the best choice is environment-dependent.
+
+### Why Add Buffered I/O Hints?
+
+When direct I/O is disabled, the kernel can often help a lot with sequential streaming if it knows the access pattern.
+The `posix_fadvise()` hints are a low-risk way to encourage readahead and avoid keeping already-consumed data hot in
+page cache.
+
+### Why Use `copy_file_range()` Opportunistically?
+
+Some kernels and filesystems handle buffered range copies more efficiently than a userspace read/write loop. Others do
+not. The tool treats `copy_file_range()` as an optimization, not a dependency, and falls back automatically when it is
+unsupported or unsuitable.
 
 ### Why A Final Directory Metadata Pass?
 

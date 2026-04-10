@@ -14,6 +14,23 @@ static int direct_io_fallback_errno(int err) {
     return err == EINVAL || err == EOPNOTSUPP || err == ENOTSUP || err == ENOSYS;
 }
 
+int copy_file_range_enabled(void) {
+    static int g_copy_file_range_enabled = -1;
+
+    if (g_copy_file_range_enabled >= 0) {
+        return g_copy_file_range_enabled;
+    }
+
+    const char *env = getenv("DIRECT_COPY_DISABLE_COPY_FILE_RANGE");
+    if (!env || !*env || strcmp(env, "0") == 0) {
+        g_copy_file_range_enabled = 1;
+    } else {
+        g_copy_file_range_enabled = 0;
+    }
+
+    return g_copy_file_range_enabled;
+}
+
 int direct_io_enabled(void) {
     static int g_direct_io_enabled = -1;
 
