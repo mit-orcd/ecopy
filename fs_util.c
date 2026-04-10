@@ -14,6 +14,10 @@ static int direct_io_fallback_errno(int err) {
     return err == EINVAL || err == EOPNOTSUPP || err == ENOTSUP || err == ENOSYS;
 }
 
+static int chown_permission_errno(int err) {
+    return err == EPERM || err == EACCES;
+}
+
 int copy_file_range_enabled(void) {
     static int g_copy_file_range_enabled = -1;
 
@@ -164,9 +168,19 @@ int same_size_and_mtime(const struct stat *a, const struct stat *b) {
 }
 
 int preserve_path_metadata(const char *dst, const struct stat *src_st) {
+    static int warned_chown_permission = 0;
+
     if (chown(dst, src_st->st_uid, src_st->st_gid) != 0) {
-        perror("chown");
-        return -1;
+        if (chown_permission_errno(errno)) {
+            if (!warned_chown_permission) {
+                fprintf(stderr,
+                        "Warning: chown not permitted; continuing without preserving uid/gid ownership.\n");
+                warned_chown_permission = 1;
+            }
+        } else {
+            perror("chown");
+            return -1;
+        }
     }
     if (chmod(dst, src_st->st_mode & 07777) != 0) {
         perror("chmod");
