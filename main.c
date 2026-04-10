@@ -13,7 +13,7 @@
 #include <unistd.h>
 
 static void usage(const char *prog) {
-    fprintf(stderr, "Usage: %s <source_dir> <target_dir>\n", prog);
+    fprintf(stderr, "Usage: %s [-v] <source_dir> <target_dir>\n", prog);
 }
 
 static int to_abs_path(const char *in, char *out, size_t out_sz) {
@@ -77,13 +77,27 @@ int main(int argc, char **argv) {
     struct stat st;
     char src_abs[PATH_MAX];
     char dst_abs[PATH_MAX];
+    const char *src_arg;
+    const char *dst_arg;
+    int verbose = 0;
 
-    if (argc != 3) { usage(argv[0]); return 1; }
-    if (lstat(argv[1], &st) != 0) { perror(argv[1]); return 1; }
-    if (!S_ISDIR(st.st_mode)) { fprintf(stderr, "Source is not a directory: %s\n", argv[1]); return 1; }
+    if (argc == 4 && strcmp(argv[1], "-v") == 0) {
+        verbose = 1;
+        src_arg = argv[2];
+        dst_arg = argv[3];
+    } else if (argc == 3) {
+        src_arg = argv[1];
+        dst_arg = argv[2];
+    } else {
+        usage(argv[0]);
+        return 1;
+    }
 
-    if (to_canonical_dir_path(argv[1], src_abs, sizeof(src_abs)) != 0 ||
-        to_canonical_dir_path(argv[2], dst_abs, sizeof(dst_abs)) != 0) {
+    if (lstat(src_arg, &st) != 0) { perror(src_arg); return 1; }
+    if (!S_ISDIR(st.st_mode)) { fprintf(stderr, "Source is not a directory: %s\n", src_arg); return 1; }
+
+    if (to_canonical_dir_path(src_arg, src_abs, sizeof(src_abs)) != 0 ||
+        to_canonical_dir_path(dst_arg, dst_abs, sizeof(dst_abs)) != 0) {
         return 1;
     }
 
@@ -94,7 +108,9 @@ int main(int argc, char **argv) {
 
     stats_init();
     if (workers_start() != 0) return 1;
-    workers_print_startup_config();
+    if (verbose) {
+        workers_print_startup_config();
+    }
     if (progress_start() != 0) { workers_stop(); return 1; }
     if (traversal_start(src_abs, dst_abs) != 0) { progress_stop(); workers_stop(); return 1; }
     traversal_wait();
