@@ -190,9 +190,5 @@ int preserve_path_metadata(const char *dst, const struct stat *src_st) {
 }
 
 int finalize_copied_file(const char *dst, const struct stat *src_st) {
-    if (truncate(dst, src_st->st_size) != 0) {
-        perror("truncate");
-        return -1;
-    }
     return preserve_path_metadata(dst, src_st);
 }
