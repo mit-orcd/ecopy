@@ -1126,16 +1126,6 @@ static work_claim_t dequeue_work(void)
     pthread_mutex_lock(&g_queue_lock);
 
     for (;;) {
-        if (g_small_queue_head) {
-            claim.kind = WORK_SMALL_FILE;
-            claim.file_task = pop_file_task(&g_small_queue_head, &g_small_queue_tail);
-            if (g_small_queue_depth > 0) {
-                g_small_queue_depth--;
-            }
-            g_small_workers_active++;
-            break;
-        }
-
         if (g_large_queue_head && (int)g_large_workers_active < g_max_active_large_files) {
             claim.kind = WORK_LARGE_FILE_START;
             claim.file_task = pop_file_task(&g_large_queue_head, &g_large_queue_tail);
@@ -1143,6 +1133,16 @@ static work_claim_t dequeue_work(void)
                 g_large_queue_depth--;
             }
             g_large_workers_active++;
+            break;
+        }
+
+        if (g_small_queue_head) {
+            claim.kind = WORK_SMALL_FILE;
+            claim.file_task = pop_file_task(&g_small_queue_head, &g_small_queue_tail);
+            if (g_small_queue_depth > 0) {
+                g_small_queue_depth--;
+            }
+            g_small_workers_active++;
             break;
         }
 
