@@ -716,17 +716,24 @@ static int copy_file_serial_small(const char *src, const char *dst, const struct
             close(fd_out);
             return -1;
         }
-        free(buf);
-        close(fd_in);
-        close(fd_out);
-    } else {
-        free(buf);
-        close(fd_in);
-        close(fd_out);
-
-        if (copy_tail_buffered(src, dst, bulk_end, size, 0) != 0) {
+        if (finalize_copied_file_fd(fd_out, dst, src_st) != 0) {
+            free(buf);
+            close(fd_in);
+            close(fd_out);
             return -1;
         }
+        free(buf);
+        close(fd_in);
+        close(fd_out);
+        return 0;
+    }
+
+    free(buf);
+    close(fd_in);
+    close(fd_out);
+
+    if (copy_tail_buffered(src, dst, bulk_end, size, 0) != 0) {
+        return -1;
     }
 
     return finalize_copied_file(dst, src_st);
@@ -936,7 +943,7 @@ static void finish_large_file_ctx(large_file_ctx_t *ctx)
     if (!ctx->failed) {
         if (copy_tail_buffered(ctx->src, ctx->dst, ctx->bulk_end, ctx->src_st.st_size, 0) != 0) {
             rc = -1;
-        } else if (finalize_copied_file(ctx->dst, &ctx->src_st) != 0) {
+        } else if (finalize_copied_file_fd(ctx->fd_out, ctx->dst, &ctx->src_st) != 0) {
             rc = -1;
         } else {
             stats_inc_files_copied();

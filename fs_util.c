@@ -167,10 +167,11 @@ int same_size_and_mtime(const struct stat *a, const struct stat *b) {
            a->st_mtim.tv_nsec == b->st_mtim.tv_nsec;
 }
 
-int preserve_path_metadata(const char *dst, const struct stat *src_st) {
+int preserve_fd_metadata(int fd, const char *path_for_warning, const struct stat *src_st) {
     static int warned_chown_permission = 0;
+    struct timespec ts[2];
 
-    if (chown(dst, src_st->st_uid, src_st->st_gid) != 0) {
+    if (fchown(fd, src_st->st_uid, src_st->st_gid) != 0) {
         if (chown_permission_errno(errno)) {
             if (!warned_chown_permission) {
                 fprintf(stderr,
@@ -178,17 +179,51 @@ int preserve_path_metadata(const char *dst, const struct stat *src_st) {
                 warned_chown_permission = 1;
             }
         } else {
-            perror("chown");
+            if (path_for_warning && *path_for_warning) {
+                fprintf(stderr, "%s: ", path_for_warning);
+            }
+            perror("fchown");
             return -1;
         }
     }
-    if (chmod(dst, src_st->st_mode & 07777) != 0) {
-        perror("chmod");
+
+    if (fchmod(fd, src_st->st_mode & 07777) != 0) {
+        if (path_for_warning && *path_for_warning) {
+            fprintf(stderr, "%s: ", path_for_warning);
+        }
+        perror("fchmod");
         return -1;
     }
-    return set_file_times(dst, src_st);
+
+    ts[0] = src_st->st_atim;
+    ts[1] = src_st->st_mtim;
+    if (futimens(fd, ts) != 0) {
+        if (path_for_warning && *path_for_warning) {
+            fprintf(stderr, "%s: ", path_for_warning);
+        }
+        perror("futimens");
+        return -1;
+    }
+
+    return 0;
+}
+
+int preserve_path_metadata(const char *dst, const struct stat *src_st) {
+    int fd = open(dst, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        perror(dst);
+        return -1;
+    }
+
+    int rc = preserve_fd_metadata(fd, dst, src_st);
+    close(fd);
+    return rc;
 }
 
 int finalize_copied_file(const char *dst, const struct stat *src_st) {
     return preserve_path_metadata(dst, src_st);
+}
+
+int finalize_copied_file_fd(int fd, const char *path_for_warning, const struct stat *src_st) {
+    return preserve_fd_metadata(fd, path_for_warning, src_st);
 }
