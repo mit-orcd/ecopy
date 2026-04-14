@@ -60,7 +60,8 @@ was idle.
 
 Default behavior:
 
-- `DIRECT_COPY_MAX_WORKERS = 32`
+- `DIRECT_COPY_MAX_WORKERS = 256`
+- `DIRECT_COPY_SMALL_MAX_WORKERS = 32`
 - `DIRECT_COPY_LARGE_READERS = 4`
 - `DIRECT_COPY_LARGE_WRITERS = 2`
 - `DIRECT_COPY_LARGE_FILE_INFLIGHT = 16`
@@ -71,11 +72,11 @@ Default behavior:
 
 So by default:
 
-- all-small workloads can run up to `32` files in parallel
-- all-large workloads can run up to about `5` large files in parallel by default
+- all-small workloads can run up to `32` files in parallel by default
+- all-large workloads can run up to about `42` large files in parallel by default when small-file work is absent
 - each active large file uses `4` readers and `2` writers by default
 - each active large file can keep up to `16` chunk buffers in flight by default
-- mixed workloads share the same slot pool instead of reserving idle capacity for one class of work
+- mixed workloads use a shared total slot pool, but small-file work is capped separately so it cannot consume the entire machine by default
 - traversal is backpressured once queued file work reaches the configured cap
 
 ## Copy Strategy
@@ -157,8 +158,20 @@ Total shared slot budget across all work.
 Default:
 
 ```text
+256
+```
+
+### `DIRECT_COPY_SMALL_MAX_WORKERS`
+
+Maximum number of active small-file workers allowed at once. This cap works alongside `DIRECT_COPY_MAX_WORKERS` so large-file pipelines can still use the remaining slot budget.
+
+Default:
+
+```text
 32
 ```
+
+Example: with the defaults, small-file work can use up to `32` slots while large-file work can still fan out over the remaining capacity.
 
 ### `DIRECT_COPY_LARGE_WORKERS`
 
@@ -310,7 +323,7 @@ For NFS/RDMA or other high-throughput flash-backed paths, the best settings are 
 The current built-in defaults are already tuned toward a high-concurrency large-file profile:
 
 ```bash
-DIRECT_COPY_DISABLE_READ_DIRECT_IO=0 DIRECT_COPY_DISABLE_WRITE_DIRECT_IO=0 DIRECT_COPY_MAX_WORKERS=256 DIRECT_COPY_LARGE_READERS=4 DIRECT_COPY_LARGE_WRITERS=2 DIRECT_COPY_LARGE_FILE_INFLIGHT=16 DIRECT_COPY_CHUNK_MB=1 DIRECT_COPY_LARGE_THRESHOLD_MB=128 DIRECT_COPY_TRAVERSAL_WORKERS=8 /tmp/direct_copy /src /dst
+DIRECT_COPY_DISABLE_READ_DIRECT_IO=0 DIRECT_COPY_DISABLE_WRITE_DIRECT_IO=0 DIRECT_COPY_MAX_WORKERS=256 DIRECT_COPY_SMALL_MAX_WORKERS=32 DIRECT_COPY_LARGE_READERS=4 DIRECT_COPY_LARGE_WRITERS=2 DIRECT_COPY_LARGE_FILE_INFLIGHT=16 DIRECT_COPY_CHUNK_MB=1 DIRECT_COPY_LARGE_THRESHOLD_MB=128 DIRECT_COPY_TRAVERSAL_WORKERS=8 /tmp/direct_copy /src /dst
 ```
 
 For small-file or metadata-heavy trees, try buffered I/O first. A practical starting point is:

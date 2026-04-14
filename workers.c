@@ -89,6 +89,7 @@ static int g_max_active_large_files = 0;
 static off_t g_chunk_size = 0;
 static off_t g_large_threshold = 0;
 static int g_max_queued_files = 0;
+static int g_small_worker_limit = 0;
 
 /* -------------------- scheduler state -------------------- */
 
@@ -139,7 +140,7 @@ static int env_int_or_default(const char *name, int defval, int minval, int maxv
 
 static void init_runtime_config(void)
 {
-    if (g_worker_count > 0 && g_large_worker_count > 0 && g_large_file_inflight > 0 && g_chunk_size > 0 && g_large_threshold > 0 && g_max_queued_files > 0) {
+    if (g_worker_count > 0 && g_large_worker_count > 0 && g_large_file_inflight > 0 && g_chunk_size > 0 && g_large_threshold > 0 && g_max_queued_files > 0 && g_small_worker_limit > 0) {
         return;
     }
 
@@ -198,6 +199,11 @@ static void init_runtime_config(void)
                                             262144,
                                             1,
                                             10000000);
+
+    g_small_worker_limit = env_int_or_default("DIRECT_COPY_SMALL_MAX_WORKERS",
+                                             SMALL_WORKER_SLOTS,
+                                             1,
+                                             g_worker_count);
 
     g_max_active_large_files = g_worker_count / g_large_worker_count;
     if (g_max_active_large_files < 1) {
@@ -1131,6 +1137,11 @@ fail:
 
 /* -------------------- scheduler -------------------- */
 
+static int total_worker_slots_used_locked(void)
+{
+    return (int)g_small_workers_active + (int)(g_large_workers_active * (uint64_t)g_large_worker_count);
+}
+
 static work_claim_t dequeue_work(void)
 {
     work_claim_t claim;
@@ -1139,7 +1150,11 @@ static work_claim_t dequeue_work(void)
     pthread_mutex_lock(&g_queue_lock);
 
     for (;;) {
-        if (g_large_queue_head && (int)g_large_workers_active < g_max_active_large_files) {
+        int total_slots_used = total_worker_slots_used_locked();
+
+        if (g_large_queue_head &&
+            (int)g_large_workers_active < g_max_active_large_files &&
+            total_slots_used + g_large_worker_count <= g_worker_count) {
             claim.kind = WORK_LARGE_FILE_START;
             claim.file_task = pop_file_task(&g_large_queue_head, &g_large_queue_tail);
             if (g_large_queue_depth > 0) {
@@ -1149,7 +1164,9 @@ static work_claim_t dequeue_work(void)
             break;
         }
 
-        if (g_small_queue_head) {
+        if (g_small_queue_head &&
+            (int)g_small_workers_active < g_small_worker_limit &&
+            total_slots_used + 1 <= g_worker_count) {
             claim.kind = WORK_SMALL_FILE;
             claim.file_task = pop_file_task(&g_small_queue_head, &g_small_queue_tail);
             if (g_small_queue_depth > 0) {
@@ -1411,6 +1428,7 @@ void workers_print_runtime_summary(void)
     printf("  write direct_io enabled     : %s\n", write_direct_io_enabled() ? "yes" : "no");
     printf("  copy_file_range enabled     : %s\n", copy_file_range_enabled() ? "yes" : "no");
     printf("  max workers                 : %d\n", g_worker_count);
+    printf("  small worker limit          : %d\n", g_small_worker_limit);
     printf("  large workers total         : %d\n", g_large_worker_count);
     printf("  active large file limit     : %d\n", g_max_active_large_files);
     printf("  large file readers/file     : %d\n", reader_count);
@@ -1432,6 +1450,7 @@ void workers_print_startup_config(void)
 
     printf("Resolved config:\n");
     printf("  max workers                 : %d\n", g_worker_count);
+    printf("  small worker limit          : %d\n", g_small_worker_limit);
     printf("  large workers total         : %d\n", g_large_worker_count);
     printf("  active large file limit     : %d\n", g_max_active_large_files);
     printf("  large file readers/file     : %d\n", reader_count);
