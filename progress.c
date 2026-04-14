@@ -103,9 +103,10 @@ static void build_progress_line(char *out, size_t out_sz) {
     format_duration(snap.elapsed_sec, elapsed_buf, sizeof(elapsed_buf));
 
     int n = snprintf(out, out_sz,
-        "%.2f GiB, %.2f GiB/s, %" PRIu64 " files, %" PRIu64 " dirs | sq:%" PRIu64 " sa:%" PRIu64 " lq:%" PRIu64 " la:%" PRIu64 " | el:%s",
+        "%.2f GiB, %.2f GiB/s, %" PRIu64 "/%" PRIu64 " files, %" PRIu64 " dirs | sq:%" PRIu64 " sa:%" PRIu64 " lq:%" PRIu64 " la:%" PRIu64 " | el:%s",
         stats_bytes_to_gib(snap.bytes_copied),
         snap.rolling_gibs,
+        snap.files_copied + snap.files_skipped,
         snap.files_seen,
         snap.dirs_seen,
         sq,

@@ -317,7 +317,15 @@ void stats_get_progress_snapshot(progress_snapshot_t *snap) {
     snap->elapsed_sec = stats_elapsed_sec();
 }
 
-void stats_print_final(void) {
+
+void stats_get_final(stats_t *out) {
+    if (!out) return;
+    pthread_mutex_lock(&g_lock);
+    *out = g_stats;
+    pthread_mutex_unlock(&g_lock);
+}
+
+void stats_print_final(int verbose) {
     stats_t s;
     pthread_mutex_lock(&g_lock);
     s = g_stats;
@@ -332,6 +340,14 @@ void stats_print_final(void) {
     printf("Files skipped : %" PRIu64 "\n", s.files_skipped);
     printf("Dirs seen     : %" PRIu64 "\n", s.dirs_seen);
     printf("Dirs created  : %" PRIu64 "\n", s.dirs_created);
+    printf("GiB copied    : %.2f\n", gib);
+    printf("Elapsed       : %.2f s\n", sec);
+    printf("Avg speed     : %.2f GiB/s\n", avg);
+
+    if (!verbose) {
+        return;
+    }
+
     printf("Bytes copied  : %" PRIu64 "\n", s.bytes_copied);
     printf("copy_file_range calls     : %" PRIu64 "\n", s.copy_file_range_calls);
     printf("copy_file_range bytes     : %" PRIu64 "\n", s.copy_file_range_bytes);
@@ -372,7 +388,5 @@ void stats_print_final(void) {
         double shutdown_tail_sec = ts_to_sec(&s.shutdown_done_ts) - ts_to_sec(&s.finalize_done_ts);
         printf("Shutdown tail seconds : %.2f\n", shutdown_tail_sec);
     }
-    printf("GiB copied    : %.2f\n", gib);
-    printf("Elapsed       : %.2f s\n", sec);
-    printf("Avg speed     : %.2f GiB/s\n", avg);
 }
+

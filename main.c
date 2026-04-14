@@ -3,6 +3,7 @@
 #include "progress.h"
 #include "workers.h"
 #include "traversal.h"
+#include "suggestion.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,7 +14,7 @@
 #include <unistd.h>
 
 static void usage(const char *prog) {
-    fprintf(stderr, "Usage: %s [-v] <source_dir> <target_dir>\n", prog);
+    fprintf(stderr, "Usage: %s [-v|--verbose] <source_dir> <target_dir>\n", prog);
 }
 
 static int to_abs_path(const char *in, char *out, size_t out_sz) {
@@ -81,7 +82,7 @@ int main(int argc, char **argv) {
     const char *dst_arg;
     int verbose = 0;
 
-    if (argc == 4 && strcmp(argv[1], "-v") == 0) {
+    if (argc == 4 && (strcmp(argv[1], "-v") == 0 || strcmp(argv[1], "--verbose") == 0)) {
         verbose = 1;
         src_arg = argv[2];
         dst_arg = argv[3];
@@ -119,15 +120,21 @@ int main(int argc, char **argv) {
         progress_stop();
         stats_set_shutdown_done();
         printf("\n");
-        stats_print_final();
-        workers_print_runtime_summary();
+        stats_print_final(verbose);
+        if (verbose) {
+            workers_print_runtime_summary();
+        }
+        suggestion_print_next_run();
         return 1;
     }
     progress_stop();
     stats_set_shutdown_done();
     printf("\n");
-    stats_print_final();
-    workers_print_runtime_summary();
+    stats_print_final(verbose);
+    if (verbose) {
+        workers_print_runtime_summary();
+    }
+    suggestion_print_next_run();
 
     if (traversal_status() != 0 || workers_status() != 0) {
         return 1;

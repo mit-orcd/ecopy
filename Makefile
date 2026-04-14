@@ -8,7 +8,8 @@ OBJS = \
 	workers.o \
 	stats.o \
 	progress.o \
-	fs_util.o
+	fs_util.o \
+	suggestion.o
 
 all: direct_copy
 

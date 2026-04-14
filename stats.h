@@ -47,7 +47,8 @@ double stats_shutdown_elapsed_sec(void);
 double stats_avg_gibs(void);
 double stats_rolling_gibs(void);
 void stats_get_progress_snapshot(progress_snapshot_t *snap);
-void stats_print_final(void);
+void stats_get_final(stats_t *out);
+void stats_print_final(int verbose);
 double stats_bytes_to_gib(uint64_t bytes);
 
 #endif

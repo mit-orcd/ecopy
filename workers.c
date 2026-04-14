@@ -1409,6 +1409,28 @@ int workers_large_threshold_mb(void)
     return (int)(g_large_threshold / (1024 * 1024));
 }
 
+
+int workers_small_worker_limit(void)
+{
+    init_runtime_config();
+    return g_small_worker_limit;
+}
+
+int workers_max_queued_files(void)
+{
+    init_runtime_config();
+    return g_max_queued_files;
+}
+
+int workers_traversal_workers(void)
+{
+    const char *s = getenv("DIRECT_COPY_TRAVERSAL_WORKERS");
+    if (!s || !*s) {
+        return 8;
+    }
+    return env_int_or_default("DIRECT_COPY_TRAVERSAL_WORKERS", 8, 1, 128);
+}
+
 int workers_file_is_large(off_t size)
 {
     return size > runtime_large_threshold();

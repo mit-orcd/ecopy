@@ -20,8 +20,11 @@ dataset movement, not full filesystem replication.
 ## Usage
 
 ```bash
-/tmp/direct_copy [-v] <source_dir> <target_dir>
+/tmp/direct_copy [-v|--verbose] <source_dir> <target_dir>
 ```
+
+Use `-v` or `--verbose` to print the resolved startup configuration and the full diagnostic block in the final report.
+The final report always prints one suggested next-run tuning experiment based on the same workload; verbose mode adds the full diagnostic counters behind that suggestion.
 
 Examples:
 
