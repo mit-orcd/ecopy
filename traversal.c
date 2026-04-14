@@ -58,7 +58,7 @@ static int process_file(const char *src, const char *dst)
         }
     }
     stats_add_planned_copy_bytes((uint64_t)src_st.st_size);
-    if (src_st.st_size > PARALLEL_THRESHOLD) return workers_enqueue_large_file(src, dst, &src_st);
+    if (workers_file_is_large(src_st.st_size)) return workers_enqueue_large_file(src, dst, &src_st);
     return workers_enqueue_small_file(src, dst, &src_st);
 }
 

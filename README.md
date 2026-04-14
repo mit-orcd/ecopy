@@ -64,6 +64,7 @@ Default behavior:
 - `DIRECT_COPY_LARGE_WRITERS = 2`
 - `DIRECT_COPY_LARGE_FILE_INFLIGHT = 16`
 - `DIRECT_COPY_CHUNK_MB = 1`
+- `DIRECT_COPY_LARGE_THRESHOLD_MB = 128`
 
 So by default:
 
@@ -81,13 +82,15 @@ Small files use a simple copy path. When direct I/O is disabled, the buffered pa
 
 ### Large Files
 
-A file is treated as large when its size exceeds:
+A file is treated as large when its size exceeds `DIRECT_COPY_LARGE_THRESHOLD_MB`. This threshold is independent of chunk size.
+
+Default:
 
 ```text
-10 * CHUNK_SIZE
+128 MiB
 ```
 
-With the current defaults, that is `10 MiB`.
+This keeps large-file classification stable even when `DIRECT_COPY_CHUNK_MB` is tuned down for other reasons.
 
 Large-file copy works like this:
 
@@ -210,6 +213,18 @@ Default:
 
 Larger values may help high-bandwidth sequential workloads, but the best setting is environment-dependent.
 
+### `DIRECT_COPY_LARGE_THRESHOLD_MB`
+
+File-size threshold in MiB used to decide when a file enters the large-file pipeline. This is intentionally separate from `DIRECT_COPY_CHUNK_MB`.
+
+Default:
+
+```text
+128
+```
+
+Use this when you want to keep medium-sized files on the simpler small-file path while still experimenting with small chunk sizes for true large-file transfers.
+
 ### `DIRECT_COPY_DISABLE_COPY_FILE_RANGE`
 
 When unset or set to `0`, the tool may use `copy_file_range()` on buffered copy paths when the kernel and filesystem support it.
@@ -265,7 +280,7 @@ For NFS/RDMA or other high-throughput flash-backed paths, the best settings are 
 The current built-in defaults are already tuned toward a high-concurrency large-file profile:
 
 ```bash
-DIRECT_COPY_DISABLE_READ_DIRECT_IO=0 DIRECT_COPY_DISABLE_WRITE_DIRECT_IO=0 DIRECT_COPY_MAX_WORKERS=256 DIRECT_COPY_LARGE_READERS=4 DIRECT_COPY_LARGE_WRITERS=2 DIRECT_COPY_LARGE_FILE_INFLIGHT=16 DIRECT_COPY_CHUNK_MB=1 /tmp/direct_copy /src /dst
+DIRECT_COPY_DISABLE_READ_DIRECT_IO=0 DIRECT_COPY_DISABLE_WRITE_DIRECT_IO=0 DIRECT_COPY_MAX_WORKERS=256 DIRECT_COPY_LARGE_READERS=4 DIRECT_COPY_LARGE_WRITERS=2 DIRECT_COPY_LARGE_FILE_INFLIGHT=16 DIRECT_COPY_CHUNK_MB=1 DIRECT_COPY_LARGE_THRESHOLD_MB=128 /tmp/direct_copy /src /dst
 ```
 
 For small-file or metadata-heavy trees, try buffered I/O first. A practical starting point is:
