@@ -60,7 +60,7 @@ was idle.
 
 Default behavior:
 
-- `DIRECT_COPY_MAX_WORKERS = 256`
+- `DIRECT_COPY_MAX_WORKERS = 32`
 - `DIRECT_COPY_LARGE_READERS = 4`
 - `DIRECT_COPY_LARGE_WRITERS = 2`
 - `DIRECT_COPY_LARGE_FILE_INFLIGHT = 16`
@@ -71,8 +71,8 @@ Default behavior:
 
 So by default:
 
-- all-small workloads can run up to `256` files in parallel
-- all-large workloads can run up to about `42` large files in parallel by default
+- all-small workloads can run up to `32` files in parallel
+- all-large workloads can run up to about `5` large files in parallel by default
 - each active large file uses `4` readers and `2` writers by default
 - each active large file can keep up to `16` chunk buffers in flight by default
 - mixed workloads share the same slot pool instead of reserving idle capacity for one class of work
@@ -157,7 +157,7 @@ Total shared slot budget across all work.
 Default:
 
 ```text
-256
+32
 ```
 
 ### `DIRECT_COPY_LARGE_WORKERS`
