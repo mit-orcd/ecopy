@@ -43,7 +43,14 @@ typedef struct {
     uint64_t ready_queue_samples;
     uint64_t ready_queue_total;
     int traversal_done;
+    int file_work_drained;
+    int finalize_done;
+    int shutdown_done;
     struct timespec start_ts;
+    struct timespec traversal_done_ts;
+    struct timespec file_work_drained_ts;
+    struct timespec finalize_done_ts;
+    struct timespec shutdown_done_ts;
 } stats_t;
 
 typedef struct {

@@ -117,12 +117,14 @@ int main(int argc, char **argv) {
     workers_stop();
     if (traversal_finalize_metadata() != 0) {
         progress_stop();
+        stats_set_shutdown_done();
         printf("\n");
         stats_print_final();
         workers_print_runtime_summary();
         return 1;
     }
     progress_stop();
+    stats_set_shutdown_done();
     printf("\n");
     stats_print_final();
     workers_print_runtime_summary();

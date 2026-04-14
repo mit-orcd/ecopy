@@ -59,6 +59,28 @@ void stats_add_planned_copy_bytes(uint64_t bytes) {
 void stats_set_traversal_done(void) {
     pthread_mutex_lock(&g_lock);
     g_stats.traversal_done = 1;
+    clock_gettime(CLOCK_MONOTONIC, &g_stats.traversal_done_ts);
+    pthread_mutex_unlock(&g_lock);
+}
+
+void stats_set_file_work_drained(void) {
+    pthread_mutex_lock(&g_lock);
+    g_stats.file_work_drained = 1;
+    clock_gettime(CLOCK_MONOTONIC, &g_stats.file_work_drained_ts);
+    pthread_mutex_unlock(&g_lock);
+}
+
+void stats_set_finalize_done(void) {
+    pthread_mutex_lock(&g_lock);
+    g_stats.finalize_done = 1;
+    clock_gettime(CLOCK_MONOTONIC, &g_stats.finalize_done_ts);
+    pthread_mutex_unlock(&g_lock);
+}
+
+void stats_set_shutdown_done(void) {
+    pthread_mutex_lock(&g_lock);
+    g_stats.shutdown_done = 1;
+    clock_gettime(CLOCK_MONOTONIC, &g_stats.shutdown_done_ts);
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -178,6 +200,70 @@ double stats_elapsed_sec(void) {
     return ts_to_sec(&now) - ts_to_sec(&start);
 }
 
+double stats_traversal_elapsed_sec(void) {
+    struct timespec start, done;
+    int traversal_done;
+
+    pthread_mutex_lock(&g_lock);
+    start = g_stats.start_ts;
+    done = g_stats.traversal_done_ts;
+    traversal_done = g_stats.traversal_done;
+    pthread_mutex_unlock(&g_lock);
+
+    if (!traversal_done) {
+        return 0.0;
+    }
+    return ts_to_sec(&done) - ts_to_sec(&start);
+}
+
+double stats_file_work_drained_elapsed_sec(void) {
+    struct timespec start, done;
+    int file_work_drained;
+
+    pthread_mutex_lock(&g_lock);
+    start = g_stats.start_ts;
+    done = g_stats.file_work_drained_ts;
+    file_work_drained = g_stats.file_work_drained;
+    pthread_mutex_unlock(&g_lock);
+
+    if (!file_work_drained) {
+        return 0.0;
+    }
+    return ts_to_sec(&done) - ts_to_sec(&start);
+}
+
+double stats_finalize_elapsed_sec(void) {
+    struct timespec start, done;
+    int file_work_drained;
+
+    pthread_mutex_lock(&g_lock);
+    start = g_stats.file_work_drained_ts;
+    done = g_stats.finalize_done_ts;
+    file_work_drained = g_stats.file_work_drained;
+    pthread_mutex_unlock(&g_lock);
+
+    if (!file_work_drained || done.tv_sec == 0) {
+        return 0.0;
+    }
+    return ts_to_sec(&done) - ts_to_sec(&start);
+}
+
+double stats_shutdown_elapsed_sec(void) {
+    struct timespec start, done;
+    int finalize_done;
+
+    pthread_mutex_lock(&g_lock);
+    start = g_stats.finalize_done_ts;
+    done = g_stats.shutdown_done_ts;
+    finalize_done = g_stats.finalize_done;
+    pthread_mutex_unlock(&g_lock);
+
+    if (!finalize_done || done.tv_sec == 0) {
+        return 0.0;
+    }
+    return ts_to_sec(&done) - ts_to_sec(&start);
+}
+
 double stats_avg_gibs(void) {
     uint64_t bytes;
     double elapsed = stats_elapsed_sec();
@@ -236,7 +322,8 @@ void stats_print_final(void) {
     pthread_mutex_lock(&g_lock);
     s = g_stats;
     pthread_mutex_unlock(&g_lock);
-    double sec = stats_elapsed_sec();
+    double sec = s.shutdown_done ? ts_to_sec(&s.shutdown_done_ts) - ts_to_sec(&s.start_ts)
+                                 : stats_elapsed_sec();
     double gib = stats_bytes_to_gib(s.bytes_copied);
     double avg = sec > 0.0 ? gib / sec : 0.0;
     printf("Done.\n");
@@ -267,6 +354,24 @@ void stats_print_final(void) {
     printf("Writer data wait seconds: %.3f\n", (double)s.writer_data_wait_ns / 1e9);
     printf("Ready queue peak        : %" PRIu64 "\n", s.ready_queue_peak);
     printf("Ready queue avg depth   : %.2f\n", s.ready_queue_samples ? (double)s.ready_queue_total / (double)s.ready_queue_samples : 0.0);
+    if (s.traversal_done) {
+        double traversal_sec = ts_to_sec(&s.traversal_done_ts) - ts_to_sec(&s.start_ts);
+        printf("Traversal seen seconds : %.2f\n", traversal_sec);
+    }
+    if (s.file_work_drained) {
+        double drained_sec = ts_to_sec(&s.file_work_drained_ts) - ts_to_sec(&s.start_ts);
+        printf("File work drained sec : %.2f\n", drained_sec);
+    }
+    if (s.file_work_drained && s.finalize_done) {
+        double finalize_phase_sec = ts_to_sec(&s.finalize_done_ts) - ts_to_sec(&s.file_work_drained_ts);
+        double finalize_done_sec = ts_to_sec(&s.finalize_done_ts) - ts_to_sec(&s.start_ts);
+        printf("Finalize dir seconds  : %.2f\n", finalize_phase_sec);
+        printf("Finalize done sec     : %.2f\n", finalize_done_sec);
+    }
+    if (s.finalize_done && s.shutdown_done) {
+        double shutdown_tail_sec = ts_to_sec(&s.shutdown_done_ts) - ts_to_sec(&s.finalize_done_ts);
+        printf("Shutdown tail seconds : %.2f\n", shutdown_tail_sec);
+    }
     printf("GiB copied    : %.2f\n", gib);
     printf("Elapsed       : %.2f s\n", sec);
     printf("Avg speed     : %.2f GiB/s\n", avg);

@@ -1270,6 +1270,8 @@ void workers_stop(void)
     }
     pthread_mutex_unlock(&g_queue_lock);
 
+    stats_set_file_work_drained();
+
     free(g_workers);
     g_workers = NULL;
 }

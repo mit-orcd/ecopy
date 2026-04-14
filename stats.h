@@ -8,6 +8,9 @@ void stats_init(void);
 void stats_add_bytes(uint64_t bytes);
 void stats_add_planned_copy_bytes(uint64_t bytes);
 void stats_set_traversal_done(void);
+void stats_set_file_work_drained(void);
+void stats_set_finalize_done(void);
+void stats_set_shutdown_done(void);
 void stats_record_read_open(int used_direct);
 void stats_record_write_open(int used_direct);
 void stats_record_queue_wait_ns(uint64_t ns);
@@ -37,6 +40,10 @@ int stats_copy_active_parallel_workers(chunk_worker_stat_t *out, int max_workers
 
 void stats_record_speed_sample(void);
 double stats_elapsed_sec(void);
+double stats_traversal_elapsed_sec(void);
+double stats_file_work_drained_elapsed_sec(void);
+double stats_finalize_elapsed_sec(void);
+double stats_shutdown_elapsed_sec(void);
 double stats_avg_gibs(void);
 double stats_rolling_gibs(void);
 void stats_get_progress_snapshot(progress_snapshot_t *snap);
