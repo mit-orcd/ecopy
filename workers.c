@@ -496,6 +496,70 @@ static int prepare_destination_file(const char *dst, const struct stat *src_st)
     return 0;
 }
 
+static int copy_tail_buffered_fds(int fd_in,
+                                 int fd_out,
+                                 off_t start,
+                                 off_t end,
+                                 int use_current_file_stats)
+{
+    if (start >= end) {
+        return 0;
+    }
+
+    if (lseek(fd_in, start, SEEK_SET) < 0) {
+        perror("lseek src");
+        return -1;
+    }
+
+    if (lseek(fd_out, start, SEEK_SET) < 0) {
+        perror("lseek dst");
+        return -1;
+    }
+
+    {
+        char buf[ALIGNMENT];
+        off_t pos = start;
+
+        while (pos < end) {
+            off_t remain = end - pos;
+            off_t this_len_off = (remain < (off_t)sizeof(buf)) ? remain : (off_t)sizeof(buf);
+            size_t len = (size_t)this_len_off;
+            off_t chunk_start = pos;
+
+            uint64_t read_start_ns = monotonic_ns();
+            ssize_t r = read(fd_in, buf, len);
+            stats_record_read_io(monotonic_ns() - read_start_ns);
+            if (r < 0) {
+                perror("read tail");
+                return -1;
+            }
+            if (r == 0) {
+                break;
+            }
+
+            {
+                size_t done = 0;
+                while (done < (size_t)r) {
+                    uint64_t write_start_ns = monotonic_ns();
+                    ssize_t w = write(fd_out, buf + done, (size_t)r - done);
+                    stats_record_write_io(monotonic_ns() - write_start_ns);
+                    if (w < 0) {
+                        perror("write tail");
+                        return -1;
+                    }
+                    done += (size_t)w;
+                }
+            }
+
+            pos += r;
+            record_progress_bytes((uint64_t)r, use_current_file_stats);
+            advise_source_consumed(fd_in, chunk_start, r);
+        }
+    }
+
+    return 0;
+}
+
 static int copy_tail_buffered(const char *src,
                               const char *dst,
                               off_t start,
@@ -524,68 +588,11 @@ static int copy_tail_buffered(const char *src,
     advise_source_streaming(fd_in);
     advise_dest_streaming(fd_out);
 
-    if (lseek(fd_in, start, SEEK_SET) < 0) {
-        perror("lseek src");
-        close(fd_in);
-        close(fd_out);
-        return -1;
-    }
-
-    if (lseek(fd_out, start, SEEK_SET) < 0) {
-        perror("lseek dst");
-        close(fd_in);
-        close(fd_out);
-        return -1;
-    }
-
-    {
-        char buf[ALIGNMENT];
-        off_t pos = start;
-
-        while (pos < end) {
-            off_t remain = end - pos;
-            off_t this_len_off = (remain < (off_t)sizeof(buf)) ? remain : (off_t)sizeof(buf);
-            size_t len = (size_t)this_len_off;
-            off_t chunk_start = pos;
-
-            uint64_t read_start_ns = monotonic_ns();
-            ssize_t r = read(fd_in, buf, len);
-            stats_record_read_io(monotonic_ns() - read_start_ns);
-            if (r < 0) {
-                perror("read tail");
-                close(fd_in);
-                close(fd_out);
-                return -1;
-            }
-            if (r == 0) {
-                break;
-            }
-
-            {
-                size_t done = 0;
-                while (done < (size_t)r) {
-                    uint64_t write_start_ns = monotonic_ns();
-                    ssize_t w = write(fd_out, buf + done, (size_t)r - done);
-                    stats_record_write_io(monotonic_ns() - write_start_ns);
-                    if (w < 0) {
-                        perror("write tail");
-                        close(fd_in);
-                        close(fd_out);
-                        return -1;
-                    }
-                    done += (size_t)w;
-                }
-            }
-
-            pos += r;
-            record_progress_bytes((uint64_t)r, use_current_file_stats);
-            advise_source_consumed(fd_in, chunk_start, r);
-        }
-    }
+    int rc = copy_tail_buffered_fds(fd_in, fd_out, start, end, use_current_file_stats);
 
     close(fd_in);
     close(fd_out);
-    return 0;
+    return rc;
 }
 
 static int copy_file_serial_small(const char *src, const char *dst, const struct stat *src_st)
@@ -702,12 +709,24 @@ static int copy_file_serial_small(const char *src, const char *dst, const struct
         stats_add_bytes((uint64_t)len);
     }
 
-    free(buf);
-    close(fd_in);
-    close(fd_out);
+    if (!in_direct && !out_direct) {
+        if (copy_tail_buffered_fds(fd_in, fd_out, bulk_end, size, 0) != 0) {
+            free(buf);
+            close(fd_in);
+            close(fd_out);
+            return -1;
+        }
+        free(buf);
+        close(fd_in);
+        close(fd_out);
+    } else {
+        free(buf);
+        close(fd_in);
+        close(fd_out);
 
-    if (copy_tail_buffered(src, dst, bulk_end, size, 0) != 0) {
-        return -1;
+        if (copy_tail_buffered(src, dst, bulk_end, size, 0) != 0) {
+            return -1;
+        }
     }
 
     return finalize_copied_file(dst, src_st);
