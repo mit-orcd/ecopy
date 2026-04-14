@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "fs_util.h"
 #include "stats.h"
+#include "progress.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -93,13 +94,15 @@ int open_read_maybe_direct(const char *path, int *used_direct) {
             return fd;
         }
         if (!direct_io_fallback_errno(errno)) {
-            perror(path);
+            progress_interrupt();
+        perror(path);
             return -1;
         }
     }
 
     fd = open(path, O_RDONLY);
     if (fd < 0) {
+        progress_interrupt();
         perror(path);
         return -1;
     }
@@ -119,13 +122,15 @@ int open_write_maybe_direct(const char *path, mode_t mode, int *used_direct) {
             return fd;
         }
         if (!direct_io_fallback_errno(errno)) {
-            perror(path);
+            progress_interrupt();
+        perror(path);
             return -1;
         }
     }
 
     fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, mode);
     if (fd < 0) {
+        progress_interrupt();
         perror(path);
         return -1;
     }
@@ -135,14 +140,21 @@ int open_write_maybe_direct(const char *path, mode_t mode, int *used_direct) {
 
 int ensure_dir_exists(const char *path, mode_t mode) {
     struct stat st;
+    mode_t create_mode;
+
     if (lstat(path, &st) == 0) {
         if (!S_ISDIR(st.st_mode)) {
+            progress_interrupt();
             fprintf(stderr, "Target exists but is not a directory: %s\n", path);
             return -1;
         }
         return 0;
     }
-    if (mkdir(path, mode) != 0) {
+
+    /* Keep newly created directories writable/searchable until final metadata restore. */
+    create_mode = (mode & 07777) | S_IRUSR | S_IWUSR | S_IXUSR;
+    if (mkdir(path, create_mode) != 0) {
+        progress_interrupt();
         perror(path);
         return -1;
     }
@@ -155,6 +167,7 @@ int set_file_times(const char *dst, const struct stat *src_st) {
     ts[0] = src_st->st_atim;
     ts[1] = src_st->st_mtim;
     if (utimensat(AT_FDCWD, dst, ts, 0) != 0) {
+        progress_interrupt();
         perror("utimensat");
         return -1;
     }
@@ -174,6 +187,7 @@ int preserve_fd_metadata(int fd, const char *path_for_warning, const struct stat
     if (fchown(fd, src_st->st_uid, src_st->st_gid) != 0) {
         if (chown_permission_errno(errno)) {
             if (!warned_chown_permission) {
+                progress_interrupt();
                 fprintf(stderr,
                         "Warning: chown not permitted; continuing without preserving uid/gid ownership.\n");
                 warned_chown_permission = 1;
@@ -182,6 +196,7 @@ int preserve_fd_metadata(int fd, const char *path_for_warning, const struct stat
             if (path_for_warning && *path_for_warning) {
                 fprintf(stderr, "%s: ", path_for_warning);
             }
+            progress_interrupt();
             perror("fchown");
             return -1;
         }
@@ -191,6 +206,7 @@ int preserve_fd_metadata(int fd, const char *path_for_warning, const struct stat
         if (path_for_warning && *path_for_warning) {
             fprintf(stderr, "%s: ", path_for_warning);
         }
+        progress_interrupt();
         perror("fchmod");
         return -1;
     }
@@ -201,6 +217,7 @@ int preserve_fd_metadata(int fd, const char *path_for_warning, const struct stat
         if (path_for_warning && *path_for_warning) {
             fprintf(stderr, "%s: ", path_for_warning);
         }
+        progress_interrupt();
         perror("futimens");
         return -1;
     }
@@ -211,6 +228,7 @@ int preserve_fd_metadata(int fd, const char *path_for_warning, const struct stat
 int preserve_path_metadata(const char *dst, const struct stat *src_st) {
     int fd = open(dst, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
+        progress_interrupt();
         perror(dst);
         return -1;
     }

@@ -190,3 +190,14 @@ void progress_stop(void) {
 
     pthread_join(g_monitor_thread, NULL);
 }
+
+void progress_interrupt(void) {
+    pthread_mutex_lock(&g_monitor_lock);
+    int active = !g_monitor_stop;
+    pthread_mutex_unlock(&g_monitor_lock);
+
+    if (active) {
+        printf("\033[2K\r");
+        fflush(stdout);
+    }
+}

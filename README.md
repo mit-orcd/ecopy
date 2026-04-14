@@ -12,6 +12,7 @@ same time.
 - Preserves important metadata from the source.
 - Uses a shared worker-slot scheduler so small and large file workloads can share the same concurrency budget.
 - Supports either direct I/O or buffered I/O, with runtime controls for both.
+- Applies bounded queue backpressure so traversal does not run arbitrarily far ahead of copy workers.
 
 The tool intentionally ignores non-regular payloads such as symlinks, devices, FIFOs, and sockets. It is tuned for
 dataset movement, not full filesystem replication.
@@ -66,6 +67,7 @@ Default behavior:
 - `DIRECT_COPY_CHUNK_MB = 1`
 - `DIRECT_COPY_LARGE_THRESHOLD_MB = 128`
 - `DIRECT_COPY_TRAVERSAL_WORKERS = 8`
+- `DIRECT_COPY_MAX_QUEUED_FILES = 262144`
 
 So by default:
 
@@ -74,6 +76,7 @@ So by default:
 - each active large file uses `4` readers and `2` writers by default
 - each active large file can keep up to `16` chunk buffers in flight by default
 - mixed workloads share the same slot pool instead of reserving idle capacity for one class of work
+- traversal is backpressured once queued file work reaches the configured cap
 
 ## Copy Strategy
 
@@ -135,6 +138,8 @@ This applies to:
 - copied regular files
 - skipped regular files
 - directories after a final metadata pass
+
+Newly created target directories stay owner-writable during the copy so child entries can still be created under source trees that contain read-only directories; the final directory pass restores the true source mode afterward.
 
 Not preserved yet:
 
@@ -238,6 +243,18 @@ Default:
 
 Higher values may reduce tree-discovery time on large namespace-heavy workloads, but can also increase metadata-server or filesystem contention. This knob is most relevant for trees with many small files and directories.
 
+### `DIRECT_COPY_MAX_QUEUED_FILES`
+
+Maximum number of queued regular-file tasks across the small-file and large-file queues before traversal blocks and waits for workers to drain backlog.
+
+Default:
+
+```text
+262144
+```
+
+This limits memory growth on very large trees while still allowing traversal to stay comfortably ahead of the copy workers.
+
 ### `DIRECT_COPY_DISABLE_COPY_FILE_RANGE`
 
 When unset or set to `0`, the tool may use `copy_file_range()` on buffered copy paths when the kernel and filesystem support it.
@@ -315,6 +332,7 @@ DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=256 DIRECT_COPY_MAX_WORKERS
 Things to watch while tuning:
 
 - completed copy throughput reported by `direct_copy`
+- `Traversal seen seconds`, `File work drained sec`, `Finalize dir seconds`, and `Shutdown tail seconds` to identify whether the remaining time is in tree discovery, copy completion, final directory metadata, or teardown
 - `Read opens` and `Write opens` counters to confirm actual direct-vs-buffered behavior
 - `Queue wait seconds`, `Read time seconds`, `Write time seconds`, and `cfr time seconds` to identify where workers are stalling
 - `Reader buf waits`, `Reader buf wait seconds`, `Writer data waits`, `Writer data wait seconds`, and `Ready queue peak/avg depth` to see whether the large-file pipeline is backpressured by reads, writes, or buffer availability
@@ -357,7 +375,7 @@ unsupported or unsuitable.
 ### Why A Final Directory Metadata Pass?
 
 Creating children changes parent directory metadata. Restoring directory ownership and timestamps only after the full
-tree is materialized gives correct final metadata.
+tree is materialized gives correct final metadata. The final pass is parallelized by directory depth so siblings can be finalized concurrently while still preserving child-before-parent ordering.
 
 ## Build
 

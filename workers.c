@@ -88,6 +88,7 @@ static int g_large_file_inflight = 0;
 static int g_max_active_large_files = 0;
 static off_t g_chunk_size = 0;
 static off_t g_large_threshold = 0;
+static int g_max_queued_files = 0;
 
 /* -------------------- scheduler state -------------------- */
 
@@ -108,6 +109,8 @@ static int g_workers_error = 0;
 static pthread_mutex_t g_workers_error_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_explicit_large_readers = 0;
 static int g_explicit_large_writers = 0;
+
+static uint64_t monotonic_ns(void);
 
 /* -------------------- runtime config -------------------- */
 
@@ -136,7 +139,7 @@ static int env_int_or_default(const char *name, int defval, int minval, int maxv
 
 static void init_runtime_config(void)
 {
-    if (g_worker_count > 0 && g_large_worker_count > 0 && g_large_file_inflight > 0 && g_chunk_size > 0 && g_large_threshold > 0) {
+    if (g_worker_count > 0 && g_large_worker_count > 0 && g_large_file_inflight > 0 && g_chunk_size > 0 && g_large_threshold > 0 && g_max_queued_files > 0) {
         return;
     }
 
@@ -190,6 +193,11 @@ static void init_runtime_config(void)
                                               1024 * 1024);
         g_large_threshold = (off_t)threshold_mb * 1024 * 1024;
     }
+
+    g_max_queued_files = env_int_or_default("DIRECT_COPY_MAX_QUEUED_FILES",
+                                            262144,
+                                            1,
+                                            10000000);
 
     g_max_active_large_files = g_worker_count / g_large_worker_count;
     if (g_max_active_large_files < 1) {
@@ -279,6 +287,11 @@ static int enqueue_task(file_task_t **head,
     t->next = NULL;
 
     pthread_mutex_lock(&g_queue_lock);
+    while ((int)(g_small_queue_depth + g_large_queue_depth) >= g_max_queued_files) {
+        uint64_t wait_start_ns = monotonic_ns();
+        pthread_cond_wait(&g_queue_cond, &g_queue_lock);
+        stats_record_queue_wait_ns(monotonic_ns() - wait_start_ns);
+    }
     if (*tail) {
         (*tail)->next = t;
     } else {
@@ -1406,6 +1419,7 @@ void workers_print_runtime_summary(void)
     printf("  large file inflight chunks  : %d\n", g_large_file_inflight);
     printf("  chunk size MiB              : %d\n", (int)(g_chunk_size / (1024 * 1024)));
     printf("  large file threshold MiB    : %d\n", (int)(g_large_threshold / (1024 * 1024)));
+    printf("  max queued files            : %d\n", g_max_queued_files);
 }
 
 void workers_print_startup_config(void)
@@ -1426,6 +1440,7 @@ void workers_print_startup_config(void)
     printf("  large file inflight chunks  : %d\n", g_large_file_inflight);
     printf("  chunk size MiB              : %d\n", (int)(g_chunk_size / (1024 * 1024)));
     printf("  large file threshold MiB    : %d\n", (int)(g_large_threshold / (1024 * 1024)));
+    printf("  max queued files            : %d\n", g_max_queued_files);
     printf("  read direct_io enabled      : %s\n", read_direct_io_enabled() ? "yes" : "no");
     printf("  write direct_io enabled     : %s\n", write_direct_io_enabled() ? "yes" : "no");
     printf("  copy_file_range enabled     : %s\n", copy_file_range_enabled() ? "yes" : "no");

@@ -2,4 +2,5 @@
 #define PROGRESS_H
 int progress_start(void);
 void progress_stop(void);
+void progress_interrupt(void);
 #endif
