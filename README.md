@@ -65,6 +65,7 @@ Default behavior:
 - `DIRECT_COPY_LARGE_FILE_INFLIGHT = 16`
 - `DIRECT_COPY_CHUNK_MB = 1`
 - `DIRECT_COPY_LARGE_THRESHOLD_MB = 128`
+- `DIRECT_COPY_TRAVERSAL_WORKERS = 8`
 
 So by default:
 
@@ -225,6 +226,18 @@ Default:
 
 Use this when you want to keep medium-sized files on the simpler small-file path while still experimenting with small chunk sizes for true large-file transfers.
 
+### `DIRECT_COPY_TRAVERSAL_WORKERS`
+
+Number of parallel directory-walker threads used to discover directories and files.
+
+Default:
+
+```text
+8
+```
+
+Higher values may reduce tree-discovery time on large namespace-heavy workloads, but can also increase metadata-server or filesystem contention. This knob is most relevant for trees with many small files and directories.
+
 ### `DIRECT_COPY_DISABLE_COPY_FILE_RANGE`
 
 When unset or set to `0`, the tool may use `copy_file_range()` on buffered copy paths when the kernel and filesystem support it.
@@ -280,7 +293,7 @@ For NFS/RDMA or other high-throughput flash-backed paths, the best settings are 
 The current built-in defaults are already tuned toward a high-concurrency large-file profile:
 
 ```bash
-DIRECT_COPY_DISABLE_READ_DIRECT_IO=0 DIRECT_COPY_DISABLE_WRITE_DIRECT_IO=0 DIRECT_COPY_MAX_WORKERS=256 DIRECT_COPY_LARGE_READERS=4 DIRECT_COPY_LARGE_WRITERS=2 DIRECT_COPY_LARGE_FILE_INFLIGHT=16 DIRECT_COPY_CHUNK_MB=1 DIRECT_COPY_LARGE_THRESHOLD_MB=128 /tmp/direct_copy /src /dst
+DIRECT_COPY_DISABLE_READ_DIRECT_IO=0 DIRECT_COPY_DISABLE_WRITE_DIRECT_IO=0 DIRECT_COPY_MAX_WORKERS=256 DIRECT_COPY_LARGE_READERS=4 DIRECT_COPY_LARGE_WRITERS=2 DIRECT_COPY_LARGE_FILE_INFLIGHT=16 DIRECT_COPY_CHUNK_MB=1 DIRECT_COPY_LARGE_THRESHOLD_MB=128 DIRECT_COPY_TRAVERSAL_WORKERS=8 /tmp/direct_copy /src /dst
 ```
 
 For small-file or metadata-heavy trees, try buffered I/O first. A practical starting point is:

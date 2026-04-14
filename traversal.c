@@ -1,6 +1,5 @@
 #define _GNU_SOURCE
 #include "traversal.h"
-#include "config.h"
 #include "stats.h"
 #include "fs_util.h"
 #include "workers.h"
@@ -19,10 +18,41 @@ typedef struct dir_node {
     struct dir_node *next;
 } dir_node_t;
 
-static pthread_t g_thread;
+static pthread_t *g_threads = NULL;
+static int g_traversal_workers = 0;
 static int g_status = 0;
 static char g_src_root[PATH_MAX];
 static char g_dst_root[PATH_MAX];
+
+static pthread_mutex_t g_dir_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_dir_cond = PTHREAD_COND_INITIALIZER;
+static dir_node_t *g_dir_head = NULL;
+static dir_node_t *g_dir_tail = NULL;
+static int g_dir_active = 0;
+static int g_dir_done = 0;
+
+static int env_int_or_default(const char *name, int defval, int minval, int maxval)
+{
+    const char *s = getenv(name);
+    if (!s || !*s) {
+        return defval;
+    }
+
+    errno = 0;
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+
+    if (errno != 0 || end == s || *end != '\0') {
+        return defval;
+    }
+    if (v < minval) {
+        return minval;
+    }
+    if (v > maxval) {
+        return maxval;
+    }
+    return (int)v;
+}
 
 static int path_is_same_or_child(const char *base, const char *path)
 {
@@ -40,6 +70,11 @@ static int copy_path_checked(char *dst, size_t dst_sz, const char *src, const ch
         return -1;
     }
     return 0;
+}
+
+static void mark_traversal_error(void)
+{
+    g_status = 1;
 }
 
 static int process_file(const char *src, const char *dst)
@@ -62,7 +97,7 @@ static int process_file(const char *src, const char *dst)
     return workers_enqueue_small_file(src, dst, &src_st);
 }
 
-static int push_dir(dir_node_t **head, dir_node_t **tail, const char *src, const char *dst)
+static int push_dir_locked(const char *src, const char *dst)
 {
     dir_node_t *n = calloc(1, sizeof(*n));
     if (!n) { perror("calloc"); return -1; }
@@ -73,9 +108,28 @@ static int push_dir(dir_node_t **head, dir_node_t **tail, const char *src, const
         return -1;
     }
 
-    if (*tail) (*tail)->next = n; else *head = n;
-    *tail = n;
+    if (g_dir_tail) {
+        g_dir_tail->next = n;
+    } else {
+        g_dir_head = n;
+    }
+    g_dir_tail = n;
+    pthread_cond_signal(&g_dir_cond);
     return 0;
+}
+
+static dir_node_t *pop_dir_locked(void)
+{
+    dir_node_t *node = g_dir_head;
+    if (!node) {
+        return NULL;
+    }
+    g_dir_head = node->next;
+    if (!g_dir_head) {
+        g_dir_tail = NULL;
+    }
+    node->next = NULL;
+    return node;
 }
 
 static int finalize_directory_tree(const char *src_dir, const char *dst_dir)
@@ -133,68 +187,164 @@ static int finalize_directory_tree(const char *src_dir, const char *dst_dir)
     return rc;
 }
 
-static void *traversal_main(void *arg)
+static void process_directory_node(dir_node_t *node)
 {
-    (void)arg;
-    dir_node_t *head = NULL, *tail = NULL;
-    if (push_dir(&head, &tail, g_src_root, g_dst_root) != 0) { g_status = 1; return NULL; }
-    while (head) {
-        dir_node_t *node = head; head = node->next; if (!head) tail = NULL;
-        struct stat st;
-        if (lstat(node->src, &st) != 0) { perror(node->src); free(node); g_status = 1; continue; }
-        stats_inc_dirs_seen();
-        if (ensure_dir_exists(node->dst, st.st_mode & 07777) != 0) { free(node); g_status = 1; continue; }
-        DIR *dir = opendir(node->src);
-        if (!dir) { perror(node->src); free(node); g_status = 1; continue; }
-        struct dirent *entry;
-        char src_path[PATH_MAX], dst_path[PATH_MAX];
-        while ((entry = readdir(dir)) != NULL) {
-            if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+    struct stat st;
+    DIR *dir;
+    struct dirent *entry;
+    char src_path[PATH_MAX], dst_path[PATH_MAX];
 
-            if (snprintf(src_path, sizeof(src_path), "%s/%s", node->src, entry->d_name) >= (int)sizeof(src_path)) {
-                fprintf(stderr, "Source path too long: %s/%s\n", node->src, entry->d_name);
-                g_status = 1;
-                continue;
-            }
-            if (snprintf(dst_path, sizeof(dst_path), "%s/%s", node->dst, entry->d_name) >= (int)sizeof(dst_path)) {
-                fprintf(stderr, "Target path too long: %s/%s\n", node->dst, entry->d_name);
-                g_status = 1;
-                continue;
-            }
+    if (lstat(node->src, &st) != 0) {
+        perror(node->src);
+        mark_traversal_error();
+        return;
+    }
 
-            if (path_is_same_or_child(g_dst_root, src_path)) {
-                continue;
-            }
+    stats_inc_dirs_seen();
+    if (ensure_dir_exists(node->dst, st.st_mode & 07777) != 0) {
+        mark_traversal_error();
+        return;
+    }
 
-            if (lstat(src_path, &st) != 0) { perror(src_path); g_status = 1; continue; }
-            if (S_ISDIR(st.st_mode)) {
-                if (push_dir(&head, &tail, src_path, dst_path) != 0) g_status = 1;
-            } else if (S_ISREG(st.st_mode)) {
-                if (process_file(src_path, dst_path) != 0) g_status = 1;
+    dir = opendir(node->src);
+    if (!dir) {
+        perror(node->src);
+        mark_traversal_error();
+        return;
+    }
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+
+        if (snprintf(src_path, sizeof(src_path), "%s/%s", node->src, entry->d_name) >= (int)sizeof(src_path)) {
+            fprintf(stderr, "Source path too long: %s/%s\n", node->src, entry->d_name);
+            mark_traversal_error();
+            continue;
+        }
+        if (snprintf(dst_path, sizeof(dst_path), "%s/%s", node->dst, entry->d_name) >= (int)sizeof(dst_path)) {
+            fprintf(stderr, "Target path too long: %s/%s\n", node->dst, entry->d_name);
+            mark_traversal_error();
+            continue;
+        }
+
+        if (path_is_same_or_child(g_dst_root, src_path)) {
+            continue;
+        }
+
+        if (lstat(src_path, &st) != 0) {
+            perror(src_path);
+            mark_traversal_error();
+            continue;
+        }
+
+        if (S_ISDIR(st.st_mode)) {
+            pthread_mutex_lock(&g_dir_lock);
+            if (push_dir_locked(src_path, dst_path) != 0) {
+                mark_traversal_error();
+            }
+            pthread_mutex_unlock(&g_dir_lock);
+        } else if (S_ISREG(st.st_mode)) {
+            if (process_file(src_path, dst_path) != 0) {
+                mark_traversal_error();
             }
         }
-        closedir(dir);
-        free(node);
     }
-    stats_set_traversal_done();
-    return NULL;
+
+    closedir(dir);
+}
+
+static void *traversal_worker_main(void *arg)
+{
+    (void)arg;
+
+    for (;;) {
+        dir_node_t *node;
+
+        pthread_mutex_lock(&g_dir_lock);
+        for (;;) {
+            node = pop_dir_locked();
+            if (node) {
+                g_dir_active++;
+                break;
+            }
+            if (g_dir_done) {
+                pthread_mutex_unlock(&g_dir_lock);
+                return NULL;
+            }
+            pthread_cond_wait(&g_dir_cond, &g_dir_lock);
+        }
+        pthread_mutex_unlock(&g_dir_lock);
+
+        process_directory_node(node);
+        free(node);
+
+        pthread_mutex_lock(&g_dir_lock);
+        g_dir_active--;
+        if (!g_dir_head && g_dir_active == 0) {
+            g_dir_done = 1;
+            pthread_cond_broadcast(&g_dir_cond);
+        }
+        pthread_mutex_unlock(&g_dir_lock);
+    }
 }
 
 int traversal_start(const char *src_dir, const char *dst_dir) {
+    int i;
+
     g_status = 0;
     if (copy_path_checked(g_src_root, sizeof(g_src_root), src_dir, "Source root") != 0 ||
         copy_path_checked(g_dst_root, sizeof(g_dst_root), dst_dir, "Target root") != 0) {
         return -1;
     }
 
-    if (pthread_create(&g_thread, NULL, traversal_main, NULL) != 0) {
-        perror("pthread_create");
+    g_traversal_workers = env_int_or_default("DIRECT_COPY_TRAVERSAL_WORKERS", 8, 1, 128);
+    g_threads = calloc((size_t)g_traversal_workers, sizeof(*g_threads));
+    if (!g_threads) {
+        perror("calloc");
         return -1;
+    }
+
+    pthread_mutex_lock(&g_dir_lock);
+    g_dir_head = NULL;
+    g_dir_tail = NULL;
+    g_dir_active = 0;
+    g_dir_done = 0;
+    if (push_dir_locked(g_src_root, g_dst_root) != 0) {
+        pthread_mutex_unlock(&g_dir_lock);
+        free(g_threads);
+        g_threads = NULL;
+        return -1;
+    }
+    pthread_mutex_unlock(&g_dir_lock);
+
+    for (i = 0; i < g_traversal_workers; i++) {
+        if (pthread_create(&g_threads[i], NULL, traversal_worker_main, NULL) != 0) {
+            perror("pthread_create");
+            pthread_mutex_lock(&g_dir_lock);
+            g_dir_done = 1;
+            pthread_cond_broadcast(&g_dir_cond);
+            pthread_mutex_unlock(&g_dir_lock);
+            while (--i >= 0) {
+                pthread_join(g_threads[i], NULL);
+            }
+            free(g_threads);
+            g_threads = NULL;
+            return -1;
+        }
     }
     return 0;
 }
 
-void traversal_wait(void) { pthread_join(g_thread, NULL); }
+void traversal_wait(void)
+{
+    int i;
+    for (i = 0; i < g_traversal_workers; i++) {
+        pthread_join(g_threads[i], NULL);
+    }
+    free(g_threads);
+    g_threads = NULL;
+    stats_set_traversal_done();
+}
 
 int traversal_finalize_metadata(void)
 {
