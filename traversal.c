@@ -352,6 +352,7 @@ int traversal_finalize_metadata(void)
         g_status = 1;
         return -1;
     }
+    stats_set_finalize_done();
     return 0;
 }
 
