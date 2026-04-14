@@ -234,6 +234,15 @@ Example:
 DIRECT_COPY_DISABLE_DIRECT_IO=1 /tmp/direct_copy /src /dst
 ```
 
+When to try buffered I/O instead of direct I/O:
+
+- small-file trees such as home directories, software installs, or source trees
+- workloads with many files that are smaller than the large-file threshold
+- cases where direct I/O causes frequent buffered tail fallbacks or extra reopen overhead
+- environments where page cache and `copy_file_range()` improve small-file throughput
+
+In practice, buffered I/O is often the better starting point for metadata-heavy trees, while direct I/O is usually more useful for large aligned streaming copies.
+
 ### `DIRECT_COPY_DISABLE_READ_DIRECT_IO`
 
 When set to any non-empty value other than `0`, the tool disables direct I/O for source reads while leaving the write side unchanged.
@@ -258,6 +267,14 @@ The current built-in defaults are already tuned toward a high-concurrency large-
 ```bash
 DIRECT_COPY_DISABLE_READ_DIRECT_IO=0 DIRECT_COPY_DISABLE_WRITE_DIRECT_IO=0 DIRECT_COPY_MAX_WORKERS=256 DIRECT_COPY_LARGE_READERS=4 DIRECT_COPY_LARGE_WRITERS=2 DIRECT_COPY_LARGE_FILE_INFLIGHT=16 DIRECT_COPY_CHUNK_MB=1 /tmp/direct_copy /src /dst
 ```
+
+For small-file or metadata-heavy trees, try buffered I/O first. A practical starting point is:
+
+```bash
+DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_MAX_WORKERS=16 /tmp/direct_copy /src /dst
+```
+
+That profile is often better for trees with many tiny files because it reduces direct-I/O alignment overhead and avoids overdriving metadata operations with too many workers.
 
 A useful benchmark matrix is:
 
