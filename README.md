@@ -388,7 +388,10 @@ unsupported or unsuitable.
 ### Why A Final Directory Metadata Pass?
 
 Creating children changes parent directory metadata. Restoring directory ownership and timestamps only after the full
-tree is materialized gives correct final metadata. The final pass is parallelized by directory depth so siblings can be finalized concurrently while still preserving child-before-parent ordering.
+tree is materialized gives correct final metadata.
+
+The final directory pass is parallelized by directory depth, so sibling directories can be finalized concurrently while
+still preserving child-before-parent ordering.
 
 ## Build
 
