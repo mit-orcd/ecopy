@@ -1,6 +1,6 @@
-# direct_copy
+# ecopy
 
-`direct_copy` is a parallel directory copy tool aimed at moving large regular-file datasets quickly and predictably.
+`ecopy` is a parallel directory copy tool aimed at moving large regular-file datasets quickly and predictably.
 It is designed for high-throughput storage paths where the goal is to keep source, network, and target busy at the
 same time.
 
@@ -19,14 +19,14 @@ same time.
 Use this tool at your own risk. It is intended for controlled bulk dataset movement, and you should test it on your
 storage stack and workload before relying on it for important data.
 
-It is good practice to verify the result of a `direct_copy` run with `rsync` or another trusted comparison tool before
+It is good practice to verify the result of an `ecopy` run with `rsync` or another trusted comparison tool before
 depending on the copied tree.
 
 Use an empty or otherwise trusted target tree when possible. Existing regular files may be skipped or overwritten based
-on the rules below, and existing target-side non-regular entries are not reconciled like they would be by a full
-synchronization tool.
+on the rules below. Existing target-side non-regular entries, including symlinks, devices, FIFOs, and sockets, are
+rejected rather than followed or reconciled like they would be by a full synchronization tool.
 
-So far, `direct_copy` has only been tested on NFS v4.2 exports and local filesystems. Other filesystems, network
+So far, `ecopy` has only been tested on NFS v4.2 exports and local filesystems. Other filesystems, network
 storage stacks, and mount options may have different behavior, especially around direct I/O, metadata preservation,
 and `copy_file_range()`.
 
@@ -37,35 +37,36 @@ capabilities.
 ## Usage
 
 ```bash
-/tmp/direct_copy [-v|--verbose] <source_dir> <target_dir>
+./ecopy [-v|--verbose] <source_dir> <target_dir>
 ```
 
 Use `-v` or `--verbose` to print the resolved startup configuration and the full diagnostic block in the final report.
 The final report always prints one suggested next-run tuning experiment based on the same workload; verbose mode adds the full diagnostic counters behind that suggestion.
 
-The source and target arguments must both name existing directories. `direct_copy` creates the matching tree beneath
-the target root, but it does not create the target root itself. The source and target directories must not overlap.
+The source argument must name an existing directory. The source and target directories must not overlap; `ecopy`
+validates that relationship before creating a missing target root. After validation, it creates the target root when it
+is missing, then creates the matching tree beneath it.
 
 Examples:
 
 ```bash
-/tmp/direct_copy /orcd/datasets/001/GLM51/ /scratch/GLM51/
+./ecopy /orcd/datasets/001/GLM51/ /scratch/GLM51/
 ```
 
 ```bash
-DIRECT_COPY_DISABLE_DIRECT_IO=1 /tmp/direct_copy /orcd/datasets/001/GLM51/ /scratch/GLM51/
+DIRECT_COPY_DISABLE_DIRECT_IO=1 ./ecopy /orcd/datasets/001/GLM51/ /scratch/GLM51/
 ```
 
 ```bash
-DIRECT_COPY_DISABLE_READ_DIRECT_IO=1 DIRECT_COPY_DISABLE_WRITE_DIRECT_IO=0 /tmp/direct_copy /src /dst
+DIRECT_COPY_DISABLE_READ_DIRECT_IO=1 DIRECT_COPY_DISABLE_WRITE_DIRECT_IO=0 ./ecopy /src /dst
 ```
 
 ```bash
-DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_READERS=3 DIRECT_COPY_LARGE_WRITERS=1 /tmp/direct_copy /src /dst
+DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_READERS=3 DIRECT_COPY_LARGE_WRITERS=1 ./ecopy /src /dst
 ```
 
 ```bash
-DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=128 DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_READERS=3 DIRECT_COPY_LARGE_WRITERS=1 DIRECT_COPY_LARGE_FILE_INFLIGHT=8 /tmp/direct_copy /src /dst
+DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=128 DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_READERS=3 DIRECT_COPY_LARGE_WRITERS=1 DIRECT_COPY_LARGE_FILE_INFLIGHT=8 ./ecopy /src /dst
 ```
 
 ## Scheduler Model
@@ -165,7 +166,8 @@ This applies to:
 - directories after a final metadata pass
 
 Newly created target directories stay owner-writable during the copy so child entries can still be created under source trees that contain read-only directories; the final directory pass restores the true source mode afterward.
-If `chown`/`fchown` is not permitted, `direct_copy` prints one warning and continues without preserving uid/gid ownership.
+Copied regular files are also kept owner-writable while data is being written, then restored to the source mode after the copy completes. If an existing destination regular file is read-only and the user can chmod it, `ecopy` temporarily adds owner write permission so reruns and overwrites can proceed.
+If `chown`/`fchown` is not permitted, `ecopy` prints one warning, counts each degraded uid/gid update in the final report, and continues without preserving uid/gid ownership for those entries. Fatal metadata update failures, such as mode or timestamp updates that cannot be applied, are counted as metadata errors before the run fails.
 
 Not preserved yet:
 
@@ -185,6 +187,8 @@ Default:
 ```text
 256
 ```
+
+If a large-file reader/writer configuration would cost more slots than this budget, `ecopy` clamps the per-file split and warns so at least one large file can still make progress.
 
 ### `DIRECT_COPY_SMALL_MAX_WORKERS`
 
@@ -303,7 +307,7 @@ When set to any non-empty value other than `0`, the tool skips `copy_file_range(
 Example:
 
 ```bash
-DIRECT_COPY_DISABLE_COPY_FILE_RANGE=1 DIRECT_COPY_DISABLE_DIRECT_IO=1 /tmp/direct_copy /src /dst
+DIRECT_COPY_DISABLE_COPY_FILE_RANGE=1 DIRECT_COPY_DISABLE_DIRECT_IO=1 ./ecopy /src /dst
 ```
 
 ### `DIRECT_COPY_DISABLE_DIRECT_IO`
@@ -315,7 +319,7 @@ When set to any non-empty value other than `0`, the tool disables direct I/O on 
 Example:
 
 ```bash
-DIRECT_COPY_DISABLE_DIRECT_IO=1 /tmp/direct_copy /src /dst
+DIRECT_COPY_DISABLE_DIRECT_IO=1 ./ecopy /src /dst
 ```
 
 When to try buffered I/O instead of direct I/O:
@@ -334,7 +338,7 @@ When set to any non-empty value other than `0`, the tool disables direct I/O for
 Example:
 
 ```bash
-DIRECT_COPY_DISABLE_READ_DIRECT_IO=1 DIRECT_COPY_DISABLE_WRITE_DIRECT_IO=0 /tmp/direct_copy /src /dst
+DIRECT_COPY_DISABLE_READ_DIRECT_IO=1 DIRECT_COPY_DISABLE_WRITE_DIRECT_IO=0 ./ecopy /src /dst
 ```
 
 ### `DIRECT_COPY_DISABLE_WRITE_DIRECT_IO`
@@ -349,13 +353,13 @@ For NFS/RDMA or other high-throughput flash-backed paths, the best settings are 
 The current built-in defaults are already tuned toward a high-concurrency large-file profile:
 
 ```bash
-DIRECT_COPY_DISABLE_READ_DIRECT_IO=0 DIRECT_COPY_DISABLE_WRITE_DIRECT_IO=0 DIRECT_COPY_MAX_WORKERS=256 DIRECT_COPY_SMALL_MAX_WORKERS=32 DIRECT_COPY_LARGE_READERS=4 DIRECT_COPY_LARGE_WRITERS=2 DIRECT_COPY_LARGE_FILE_INFLIGHT=16 DIRECT_COPY_CHUNK_MB=1 DIRECT_COPY_LARGE_THRESHOLD_MB=128 DIRECT_COPY_TRAVERSAL_WORKERS=8 /tmp/direct_copy /src /dst
+DIRECT_COPY_DISABLE_READ_DIRECT_IO=0 DIRECT_COPY_DISABLE_WRITE_DIRECT_IO=0 DIRECT_COPY_MAX_WORKERS=256 DIRECT_COPY_SMALL_MAX_WORKERS=32 DIRECT_COPY_LARGE_READERS=4 DIRECT_COPY_LARGE_WRITERS=2 DIRECT_COPY_LARGE_FILE_INFLIGHT=16 DIRECT_COPY_CHUNK_MB=1 DIRECT_COPY_LARGE_THRESHOLD_MB=128 DIRECT_COPY_TRAVERSAL_WORKERS=8 ./ecopy /src /dst
 ```
 
 For small-file or metadata-heavy trees, try buffered I/O first. A practical starting point is:
 
 ```bash
-DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_MAX_WORKERS=16 /tmp/direct_copy /src /dst
+DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_MAX_WORKERS=16 ./ecopy /src /dst
 ```
 
 That profile is often better for trees with many tiny files because it reduces direct-I/O alignment overhead and avoids overdriving metadata operations with too many workers.
@@ -363,14 +367,14 @@ That profile is often better for trees with many tiny files because it reduces d
 A useful benchmark matrix is:
 
 ```bash
-DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=64  DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_READERS=3 DIRECT_COPY_LARGE_WRITERS=1 DIRECT_COPY_LARGE_FILE_INFLIGHT=8 /tmp/direct_copy /src /dst
-DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=128 DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_READERS=3 DIRECT_COPY_LARGE_WRITERS=1 DIRECT_COPY_LARGE_FILE_INFLIGHT=8 /tmp/direct_copy /src /dst
-DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=256 DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_READERS=3 DIRECT_COPY_LARGE_WRITERS=1 DIRECT_COPY_LARGE_FILE_INFLIGHT=8 /tmp/direct_copy /src /dst
+DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=64  DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_READERS=3 DIRECT_COPY_LARGE_WRITERS=1 DIRECT_COPY_LARGE_FILE_INFLIGHT=8 ./ecopy /src /dst
+DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=128 DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_READERS=3 DIRECT_COPY_LARGE_WRITERS=1 DIRECT_COPY_LARGE_FILE_INFLIGHT=8 ./ecopy /src /dst
+DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=256 DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_READERS=3 DIRECT_COPY_LARGE_WRITERS=1 DIRECT_COPY_LARGE_FILE_INFLIGHT=8 ./ecopy /src /dst
 ```
 
 Things to watch while tuning:
 
-- completed copy throughput reported by `direct_copy`
+- completed copy throughput reported by `ecopy`
 - `Traversal seen seconds`, `File work drained sec`, `Finalize dir seconds`, and `Shutdown tail seconds` to identify whether the remaining time is in tree discovery, copy completion, final directory metadata, or teardown
 - `Read opens` and `Write opens` counters to confirm actual direct-vs-buffered behavior
 - `Queue wait seconds`, `Read time seconds`, `Write time seconds`, and `cfr time seconds` to identify where workers are stalling
@@ -425,11 +429,25 @@ still preserving child-before-parent ordering.
 make
 ```
 
+This builds the regular `ecopy` binary. If jemalloc is available, the same build also produces `ecopy-jemalloc`.
+The Makefile first checks `pkg-config --exists jemalloc`; if that is not available, it falls back to compiling and
+linking a small `<jemalloc/jemalloc.h>` test with `-ljemalloc`. Missing jemalloc support does not fail the normal
+`ecopy` build.
+
+The optional `ecopy-jemalloc` binary accepts the same command-line arguments and runtime environment variables as
+`ecopy`; it only differs by linking against jemalloc.
+
 Warning-clean verification build:
 
 ```bash
 make clean
 make CFLAGS='-O2 -g -Wall -Wextra -Wpedantic -pthread'
+```
+
+Run the portable smoke tests:
+
+```bash
+make test
 ```
 
 ## License

@@ -37,6 +37,7 @@ typedef struct dir_record {
 static pthread_t *g_threads = NULL;
 static int g_traversal_workers = 0;
 static int g_status = 0;
+static pthread_mutex_t g_status_lock = PTHREAD_MUTEX_INITIALIZER;
 static char g_src_root[PATH_MAX];
 static char g_dst_root[PATH_MAX];
 
@@ -95,7 +96,9 @@ static int copy_path_checked(char *dst, size_t dst_sz, const char *src, const ch
 
 static void mark_traversal_error(void)
 {
+    pthread_mutex_lock(&g_status_lock);
     g_status = 1;
+    pthread_mutex_unlock(&g_status_lock);
 }
 
 static int process_file(const char *src, const char *dst)
@@ -105,6 +108,10 @@ static int process_file(const char *src, const char *dst)
     if (!S_ISREG(src_st.st_mode)) return 0;
     stats_inc_files_seen();
     if (lstat(dst, &dst_st) == 0) {
+        if (!S_ISREG(dst_st.st_mode)) {
+            fprintf(stderr, "Target exists but is not a regular file: %s\n", dst);
+            return -1;
+        }
         if (S_ISREG(dst_st.st_mode) && same_size_and_mtime(&src_st, &dst_st)) {
             if (preserve_path_metadata(dst, &src_st) != 0) {
                 return -1;
@@ -112,6 +119,9 @@ static int process_file(const char *src, const char *dst)
             stats_inc_files_skipped();
             return 0;
         }
+    } else if (errno != ENOENT) {
+        perror(dst);
+        return -1;
     }
     stats_add_planned_copy_bytes((uint64_t)src_st.st_size);
     if (workers_file_is_large(src_st.st_size)) return workers_enqueue_large_file(src, dst, &src_st);
@@ -414,7 +424,9 @@ static void *traversal_worker_main(void *arg)
 int traversal_start(const char *src_dir, const char *dst_dir) {
     int i;
 
+    pthread_mutex_lock(&g_status_lock);
     g_status = 0;
+    pthread_mutex_unlock(&g_status_lock);
     pthread_mutex_lock(&g_finalize_lock);
     free(g_finalize_dirs);
     g_finalize_dirs = NULL;
@@ -478,7 +490,7 @@ void traversal_wait(void)
 int traversal_finalize_metadata(void)
 {
     if (finalize_directories_parallel() != 0) {
-        g_status = 1;
+        mark_traversal_error();
         return -1;
     }
     stats_set_finalize_done();
@@ -491,4 +503,12 @@ int traversal_finalize_metadata(void)
     return 0;
 }
 
-int traversal_status(void) { return g_status; }
+int traversal_status(void)
+{
+    int status;
+
+    pthread_mutex_lock(&g_status_lock);
+    status = g_status;
+    pthread_mutex_unlock(&g_status_lock);
+    return status;
+}

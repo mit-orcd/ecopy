@@ -93,6 +93,9 @@ static int g_worker_count = 0;
 static int g_large_worker_count = 0;
 static int g_large_file_inflight = 0;
 static int g_max_active_large_files = 0;
+static int g_large_reader_count = 0;
+static int g_large_writer_count = 0;
+static int g_large_config_clamped = 0;
 static off_t g_chunk_size = 0;
 static off_t g_large_threshold = 0;
 static int g_max_queued_files = 0;
@@ -121,6 +124,66 @@ static int g_explicit_large_writers = 0;
 static uint64_t monotonic_ns(void);
 
 /* -------------------- runtime config -------------------- */
+
+static void split_large_workers(int total, int *reader_count, int *writer_count)
+{
+    int readers = (total + 1) / 2;
+    int writers = total - readers;
+
+    if (writers < 1) {
+        writers = 1;
+        readers = total - 1;
+    }
+    if (readers < 1) {
+        readers = 1;
+    }
+
+    *reader_count = readers;
+    *writer_count = writers;
+}
+
+static void normalize_large_pipeline_config(int requested_readers, int requested_writers)
+{
+    int requested_total;
+    int slot_budget = g_worker_count > 0 ? g_worker_count : 1;
+
+    if (requested_readers < 1) {
+        requested_readers = 1;
+    }
+    if (requested_writers < 1) {
+        requested_writers = 1;
+    }
+
+    requested_total = requested_readers + requested_writers;
+    g_large_config_clamped = 0;
+
+    if (requested_total > slot_budget) {
+        g_large_config_clamped = 1;
+        if (slot_budget == 1) {
+            g_large_reader_count = 1;
+            g_large_writer_count = 1;
+            g_large_worker_count = 1;
+            return;
+        }
+
+        g_large_reader_count = (int)(((long long)requested_readers * slot_budget +
+                                     requested_total / 2) /
+                                    requested_total);
+        if (g_large_reader_count < 1) {
+            g_large_reader_count = 1;
+        }
+        if (g_large_reader_count > slot_budget - 1) {
+            g_large_reader_count = slot_budget - 1;
+        }
+        g_large_writer_count = slot_budget - g_large_reader_count;
+        g_large_worker_count = slot_budget;
+        return;
+    }
+
+    g_large_reader_count = requested_readers;
+    g_large_writer_count = requested_writers;
+    g_large_worker_count = requested_total;
+}
 
 static int env_int_or_default(const char *name, int defval, int minval, int maxval)
 {
@@ -177,12 +240,8 @@ static void init_runtime_config(void)
         g_explicit_large_writers = 2;
     }
 
-    if (g_explicit_large_readers > 0 && g_explicit_large_writers > 0) {
-        g_large_worker_count = g_explicit_large_readers + g_explicit_large_writers;
-    }
-
     g_large_file_inflight = env_int_or_default("DIRECT_COPY_LARGE_FILE_INFLIGHT",
-                                               g_large_worker_count,
+                                               LARGE_FILE_INFLIGHT,
                                                1,
                                                1024);
 
@@ -212,6 +271,16 @@ static void init_runtime_config(void)
                                              1,
                                              g_worker_count);
 
+    if (g_explicit_large_readers > 0 && g_explicit_large_writers > 0) {
+        normalize_large_pipeline_config(g_explicit_large_readers,
+                                        g_explicit_large_writers);
+    } else {
+        int readers = 0;
+        int writers = 0;
+        split_large_workers(g_large_worker_count, &readers, &writers);
+        normalize_large_pipeline_config(readers, writers);
+    }
+
     g_max_active_large_files = g_worker_count / g_large_worker_count;
     if (g_max_active_large_files < 1) {
         g_max_active_large_files = 1;
@@ -225,20 +294,8 @@ static void get_pipeline_thread_counts(int *reader_count, int *writer_count)
 
     init_runtime_config();
 
-    if (g_explicit_large_readers > 0 && g_explicit_large_writers > 0) {
-        readers = g_explicit_large_readers;
-        writers = g_explicit_large_writers;
-    } else {
-        readers = (g_large_worker_count + 1) / 2;
-        writers = g_large_worker_count - readers;
-        if (writers < 1) {
-            writers = 1;
-            readers = g_large_worker_count - 1;
-        }
-        if (readers < 1) {
-            readers = 1;
-        }
-    }
+    readers = g_large_reader_count;
+    writers = g_large_writer_count;
 
     if (reader_count) {
         *reader_count = readers;
@@ -255,6 +312,14 @@ static void validate_runtime_config(void)
 
     init_runtime_config();
     get_pipeline_thread_counts(&readers, &writers);
+
+    if (g_large_config_clamped) {
+        fprintf(stderr,
+                "Warning: requested large-file worker split exceeded DIRECT_COPY_MAX_WORKERS. Using %d readers + %d writers with a slot cost of %d so large files can make progress.\n",
+                readers,
+                writers,
+                g_large_worker_count);
+    }
 
     if (g_max_active_large_files < 2) {
         fprintf(stderr,
@@ -353,6 +418,13 @@ static large_buffer_t *dequeue_buffer(large_buffer_t **head, large_buffer_t **ta
     return buf;
 }
 
+static void mark_large_file_failed_locked(large_file_ctx_t *ctx)
+{
+    ctx->failed = 1;
+    pthread_cond_broadcast(&ctx->free_cond);
+    pthread_cond_broadcast(&ctx->ready_cond);
+}
+
 static void mark_worker_error(void)
 {
     pthread_mutex_lock(&g_workers_error_lock);
@@ -383,14 +455,6 @@ static uint64_t monotonic_ns(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-}
-
-static int direct_io_fallback_errno_local(int err)
-{
-    return err == EINVAL ||
-           err == EOPNOTSUPP ||
-           err == ENOTSUP ||
-           err == ENOSYS;
 }
 
 static int copy_file_range_unsupported_errno_local(int err)
@@ -477,40 +541,6 @@ static int copy_file_range_with_progress(int fd_in,
     }
 
     return 0;
-}
-
-static int open_write_existing_maybe_direct(const char *path, int *used_direct)
-{
-    int fd;
-
-    if (used_direct) {
-        *used_direct = 0;
-    }
-
-    if (write_direct_io_enabled()) {
-        fd = open(path, O_WRONLY | O_DIRECT);
-        if (fd >= 0) {
-            if (used_direct) {
-                *used_direct = 1;
-            }
-            stats_record_write_open(1);
-            return fd;
-        }
-
-        if (!direct_io_fallback_errno_local(errno)) {
-            perror(path);
-            return -1;
-        }
-    }
-
-    fd = open(path, O_WRONLY);
-    if (fd < 0) {
-        perror(path);
-        return -1;
-    }
-
-    stats_record_write_open(0);
-    return fd;
 }
 
 static int prepare_destination_file(const char *dst, const struct stat *src_st)
@@ -612,13 +642,11 @@ static int copy_tail_buffered(const char *src,
     }
     stats_record_read_open(0);
 
-    int fd_out = open(dst, O_WRONLY);
+    int fd_out = open_write_existing_buffered(dst);
     if (fd_out < 0) {
-        perror(dst);
         close(fd_in);
         return -1;
     }
-    stats_record_write_open(0);
 
     advise_source_streaming(fd_in);
     advise_dest_streaming(fd_out);
@@ -822,11 +850,9 @@ static void *large_reader_main(void *arg)
             if (r < 0) {
                 perror("pread");
                 pthread_mutex_lock(&ctx->lock);
-                ctx->failed = 1;
+                mark_large_file_failed_locked(ctx);
                 enqueue_buffer(&ctx->free_head, &ctx->free_tail, buf);
                 ctx->free_count++;
-                pthread_cond_broadcast(&ctx->ready_cond);
-                pthread_cond_broadcast(&ctx->free_cond);
                 ctx->active_readers--;
                 if (ctx->active_readers == 0) {
                     ctx->read_done = 1;
@@ -838,11 +864,9 @@ static void *large_reader_main(void *arg)
                 fprintf(stderr, "short pread at off %lld: expected %zu got %zd\n",
                         (long long)offset, len, r);
                 pthread_mutex_lock(&ctx->lock);
-                ctx->failed = 1;
+                mark_large_file_failed_locked(ctx);
                 enqueue_buffer(&ctx->free_head, &ctx->free_tail, buf);
                 ctx->free_count++;
-                pthread_cond_broadcast(&ctx->ready_cond);
-                pthread_cond_broadcast(&ctx->free_cond);
                 ctx->active_readers--;
                 if (ctx->active_readers == 0) {
                     ctx->read_done = 1;
@@ -932,16 +956,13 @@ static void *large_writer_main(void *arg)
 
             pthread_mutex_lock(&ctx->lock);
             if (failed) {
-                ctx->failed = 1;
+                mark_large_file_failed_locked(ctx);
             } else {
                 stats_add_bytes((uint64_t)buf->len);
             }
             enqueue_buffer(&ctx->free_head, &ctx->free_tail, buf);
             ctx->free_count++;
             pthread_cond_signal(&ctx->free_cond);
-            if (ctx->failed) {
-                pthread_cond_broadcast(&ctx->ready_cond);
-            }
             pthread_mutex_unlock(&ctx->lock);
 
             if (failed) {
@@ -1117,12 +1138,15 @@ static int start_large_file_copy(file_task_t *task)
 
 fail_started:
     pthread_mutex_lock(&ctx->lock);
-    ctx->failed = 1;
-    pthread_cond_broadcast(&ctx->free_cond);
-    pthread_cond_broadcast(&ctx->ready_cond);
+    mark_large_file_failed_locked(ctx);
     pthread_mutex_unlock(&ctx->lock);
     finish_large_file_ctx(ctx);
-    return -1;
+    /*
+     * finish_large_file_ctx() synchronously releases the large-file scheduler
+     * slot and records the worker error for this failed startup. Returning
+     * success here tells the caller there is no slot left for it to release.
+     */
+    return 0;
 
 fail:
     if (ctx->fd_in >= 0) {

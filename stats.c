@@ -23,7 +23,6 @@ static char g_current_file[PATH_MAX];
 static uint64_t g_current_file_done = 0;
 static uint64_t g_current_file_total = 0;
 static int g_current_file_parallel = 0;
-static parallel_ctx_t *g_active_parallel_ctx = NULL;
 
 static double ts_to_sec(const struct timespec *ts) {
     return (double)ts->tv_sec + (double)ts->tv_nsec / 1e9;
@@ -45,7 +44,6 @@ void stats_init(void) {
     g_current_file_done = 0;
     g_current_file_total = 0;
     g_current_file_parallel = 0;
-    g_active_parallel_ctx = NULL;
     g_speed_index = 0;
     clock_gettime(CLOCK_MONOTONIC, &g_stats.start_ts);
     pthread_mutex_unlock(&g_lock);
@@ -127,66 +125,14 @@ void stats_inc_dirs_created(void){ pthread_mutex_lock(&g_lock); g_stats.dirs_cre
 void stats_record_copy_file_range_call(uint64_t bytes) { pthread_mutex_lock(&g_lock); g_stats.copy_file_range_calls++; g_stats.copy_file_range_bytes += bytes; pthread_mutex_unlock(&g_lock); }
 void stats_record_copy_file_range_fallback(void) { pthread_mutex_lock(&g_lock); g_stats.copy_file_range_fallbacks++; pthread_mutex_unlock(&g_lock); }
 void stats_add_copy_file_range_usage(uint64_t calls, uint64_t bytes, uint64_t fallbacks) { pthread_mutex_lock(&g_lock); g_stats.copy_file_range_calls += calls; g_stats.copy_file_range_bytes += bytes; g_stats.copy_file_range_fallbacks += fallbacks; pthread_mutex_unlock(&g_lock); } 
-
-void stats_begin_current_file(const char *path, uint64_t total_bytes, int is_parallel) {
-    pthread_mutex_lock(&g_lock);
-    snprintf(g_current_file, sizeof(g_current_file), "%s", path ? path : "");
-    g_current_file_done = 0;
-    g_current_file_total = total_bytes;
-    g_current_file_parallel = is_parallel;
-    pthread_mutex_unlock(&g_lock);
-}
+void stats_inc_metadata_warning(void) { pthread_mutex_lock(&g_lock); g_stats.metadata_warnings++; pthread_mutex_unlock(&g_lock); }
+void stats_inc_metadata_error(void) { pthread_mutex_lock(&g_lock); g_stats.metadata_errors++; pthread_mutex_unlock(&g_lock); }
 
 void stats_advance_current_file(uint64_t bytes) {
     pthread_mutex_lock(&g_lock);
     g_current_file_done += bytes;
     g_stats.bytes_copied += bytes;
     pthread_mutex_unlock(&g_lock);
-}
-
-void stats_end_current_file(void) {
-    pthread_mutex_lock(&g_lock);
-    g_current_file[0] = '\0';
-    g_current_file_done = 0;
-    g_current_file_total = 0;
-    g_current_file_parallel = 0;
-    g_active_parallel_ctx = NULL;
-    pthread_mutex_unlock(&g_lock);
-}
-
-void stats_set_active_parallel_ctx(parallel_ctx_t *ctx)
-{
-    pthread_mutex_lock(&g_lock);
-    g_active_parallel_ctx = ctx;
-    pthread_mutex_unlock(&g_lock);
-}
-
-void stats_clear_active_parallel_ctx(void)
-{
-    pthread_mutex_lock(&g_lock);
-    g_active_parallel_ctx = NULL;
-    pthread_mutex_unlock(&g_lock);
-}
-
-int stats_copy_active_parallel_workers(chunk_worker_stat_t *out, int max_workers)
-{
-    int count = 0;
-
-    if (!out || max_workers <= 0) {
-        return 0;
-    }
-
-    pthread_mutex_lock(&g_lock);
-    if (g_active_parallel_ctx && g_active_parallel_ctx->workers && g_active_parallel_ctx->worker_count > 0) {
-        count = g_active_parallel_ctx->worker_count;
-        if (count > max_workers) {
-            count = max_workers;
-        }
-        memcpy(out, g_active_parallel_ctx->workers, (size_t)count * sizeof(*out));
-    }
-    pthread_mutex_unlock(&g_lock);
-
-    return count;
 }
 
 void stats_record_speed_sample(void) {
@@ -350,6 +296,12 @@ void stats_print_final(int verbose) {
     printf("GiB copied    : %.2f\n", gib);
     printf("Elapsed       : %.2f s\n", sec);
     printf("Avg speed     : %.2f GiB/s\n", avg);
+    if (s.metadata_warnings > 0) {
+        printf("Metadata warnings : %" PRIu64 "\n", s.metadata_warnings);
+    }
+    if (s.metadata_errors > 0) {
+        printf("Metadata errors   : %" PRIu64 "\n", s.metadata_errors);
+    }
 
     if (!verbose) {
         return;

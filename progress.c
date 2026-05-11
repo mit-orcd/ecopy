@@ -23,6 +23,7 @@
 
 static pthread_t g_monitor_thread;
 static int g_monitor_stop = 0;
+static int g_monitor_running = 0;
 static pthread_mutex_t g_monitor_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int get_terminal_width(void) {
@@ -67,34 +68,6 @@ static void format_duration(double sec, char *out, size_t out_sz)
 
     snprintf(out, out_sz, "%02" PRIu64 ":%02" PRIu64 ":%02" PRIu64,
              hours, minutes, seconds);
-}
-
-static void append_chunk_worker_stats(char *out, size_t out_sz, int *n_io) {
-    int n = *n_io;
-    chunk_worker_stat_t workers[128];
-    int worker_count = stats_copy_active_parallel_workers(workers, (int)(sizeof(workers) / sizeof(workers[0])));
-
-    if (worker_count <= 0) {
-        *n_io = n;
-        return;
-    }
-
-    for (int i = 0; i < worker_count; i++) {
-        chunk_worker_stat_t *ws = &workers[i];
-
-        if (n <= 0 || (size_t)n >= out_sz) {
-            break;
-        }
-
-        n += snprintf(out + n, out_sz - (size_t)n,
-            " | w%d:%c %.1fG %" PRIu64,
-            i,
-            ws->active ? 'A' : 'I',
-            stats_bytes_to_gib(ws->bytes_done),
-            ws->chunks_done);
-    }
-
-    *n_io = n;
 }
 
 static void build_progress_line(char *out, size_t out_sz) {
@@ -143,10 +116,6 @@ static void build_progress_line(char *out, size_t out_sz) {
             snap.current_file);
     }
 
-    if (snap.current_file_parallel && n > 0 && (size_t)n < out_sz) {
-        append_chunk_worker_stats(out, out_sz, &n);
-    }
-
     trim_to_width(out, get_terminal_width());
 }
 
@@ -181,10 +150,18 @@ static void *monitor_main(void *arg) {
 int progress_start(void) {
     pthread_mutex_lock(&g_monitor_lock);
     g_monitor_stop = 0;
+    g_monitor_running = isatty(STDOUT_FILENO);
     pthread_mutex_unlock(&g_monitor_lock);
+
+    if (!g_monitor_running) {
+        return 0;
+    }
 
     if (pthread_create(&g_monitor_thread, NULL, monitor_main, NULL) != 0) {
         perror("pthread_create");
+        pthread_mutex_lock(&g_monitor_lock);
+        g_monitor_running = 0;
+        pthread_mutex_unlock(&g_monitor_lock);
         return -1;
     }
 
@@ -192,16 +169,25 @@ int progress_start(void) {
 }
 
 void progress_stop(void) {
+    int running;
+
     pthread_mutex_lock(&g_monitor_lock);
     g_monitor_stop = 1;
+    running = g_monitor_running;
     pthread_mutex_unlock(&g_monitor_lock);
 
-    pthread_join(g_monitor_thread, NULL);
+    if (running) {
+        pthread_join(g_monitor_thread, NULL);
+    }
+
+    pthread_mutex_lock(&g_monitor_lock);
+    g_monitor_running = 0;
+    pthread_mutex_unlock(&g_monitor_lock);
 }
 
 void progress_interrupt(void) {
     pthread_mutex_lock(&g_monitor_lock);
-    int active = !g_monitor_stop;
+    int active = g_monitor_running && !g_monitor_stop;
     pthread_mutex_unlock(&g_monitor_lock);
 
     if (active) {

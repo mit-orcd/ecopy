@@ -73,8 +73,272 @@ static int to_canonical_dir_path(const char *in, char *out, size_t out_sz) {
     return 0;
 }
 
+static void remove_last_path_component(char *path)
+{
+    char *slash;
+
+    if (strcmp(path, "/") == 0) {
+        return;
+    }
+
+    slash = strrchr(path, '/');
+    if (!slash || slash == path) {
+        path[1] = '\0';
+    } else {
+        *slash = '\0';
+    }
+}
+
+static int append_path_component(char *path, size_t path_sz, const char *component)
+{
+    size_t len = strlen(path);
+    size_t component_len = strlen(component);
+    size_t extra_slash = (strcmp(path, "/") == 0) ? 0 : 1;
+
+    if (len + extra_slash + component_len >= path_sz) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    if (extra_slash) {
+        strcat(path, "/");
+    }
+    strcat(path, component);
+    return 0;
+}
+
+static int normalize_abs_path_lexically(const char *in, char *out, size_t out_sz)
+{
+    char tmp[PATH_MAX];
+    char *saveptr = NULL;
+    char *component;
+
+    if (!in || in[0] != '/' || !out || out_sz < 2) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (snprintf(tmp, sizeof(tmp), "%s", in) >= (int)sizeof(tmp)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    snprintf(out, out_sz, "/");
+    component = strtok_r(tmp, "/", &saveptr);
+    while (component) {
+        if (strcmp(component, ".") == 0) {
+            /* skip */
+        } else if (strcmp(component, "..") == 0) {
+            remove_last_path_component(out);
+        } else if (append_path_component(out, out_sz, component) != 0) {
+            return -1;
+        }
+        component = strtok_r(NULL, "/", &saveptr);
+    }
+
+    return 0;
+}
+
+static int prepend_suffix_component(char *suffix, size_t suffix_sz, const char *component)
+{
+    char tmp[PATH_MAX];
+
+    if (suffix[0] == '\0') {
+        if (snprintf(suffix, suffix_sz, "%s", component) >= (int)suffix_sz) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        return 0;
+    }
+
+    if (snprintf(tmp, sizeof(tmp), "%s/%s", component, suffix) >= (int)sizeof(tmp) ||
+        snprintf(suffix, suffix_sz, "%s", tmp) >= (int)suffix_sz) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
+static int join_parent_suffix(const char *parent, const char *suffix, char *out, size_t out_sz)
+{
+    if (!suffix || suffix[0] == '\0') {
+        if (snprintf(out, out_sz, "%s", parent) >= (int)out_sz) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        return 0;
+    }
+
+    if (strcmp(parent, "/") == 0) {
+        if (snprintf(out, out_sz, "/%s", suffix) >= (int)out_sz) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+    } else if (snprintf(out, out_sz, "%s/%s", parent, suffix) >= (int)out_sz) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    return 0;
+}
+
+static int to_canonical_requested_dir_path(const char *in, char *out, size_t out_sz)
+{
+    char abs_path[PATH_MAX];
+    char normalized[PATH_MAX];
+    char probe[PATH_MAX];
+    char suffix[PATH_MAX] = "";
+    struct stat st;
+
+    if (to_abs_path(in, abs_path, sizeof(abs_path)) != 0 ||
+        normalize_abs_path_lexically(abs_path, normalized, sizeof(normalized)) != 0) {
+        fprintf(stderr, "Target path too long: %s\n", in);
+        return -1;
+    }
+    if (snprintf(probe, sizeof(probe), "%s", normalized) >= (int)sizeof(probe)) {
+        fprintf(stderr, "Target path too long: %s\n", in);
+        return -1;
+    }
+
+    for (;;) {
+        if (stat(probe, &st) == 0) {
+            char parent_real[PATH_MAX];
+
+            if (!S_ISDIR(st.st_mode)) {
+                fprintf(stderr, "Target path component exists but is not a directory: %s\n", probe);
+                return -1;
+            }
+            if (!realpath(probe, parent_real)) {
+                perror(probe);
+                return -1;
+            }
+            if (join_parent_suffix(parent_real, suffix, out, out_sz) != 0) {
+                fprintf(stderr, "Target path too long: %s\n", in);
+                return -1;
+            }
+            return 0;
+        }
+
+        if (errno != ENOENT) {
+            perror(probe);
+            return -1;
+        }
+        if (lstat(probe, &st) == 0) {
+            fprintf(stderr, "Target path component exists but is not a directory: %s\n", probe);
+            return -1;
+        }
+        if (errno != ENOENT) {
+            perror(probe);
+            return -1;
+        }
+        if (strcmp(probe, "/") == 0) {
+            perror(probe);
+            return -1;
+        }
+
+        {
+            char *slash = strrchr(probe, '/');
+            const char *component;
+
+            if (!slash) {
+                fprintf(stderr, "Target path too long: %s\n", in);
+                return -1;
+            }
+            component = slash + 1;
+            if (*component == '\0' ||
+                prepend_suffix_component(suffix, sizeof(suffix), component) != 0) {
+                fprintf(stderr, "Target path too long: %s\n", in);
+                return -1;
+            }
+            if (slash == probe) {
+                probe[1] = '\0';
+            } else {
+                *slash = '\0';
+            }
+        }
+    }
+}
+
+static int ensure_existing_dir(const char *path, const char *label) {
+    struct stat st;
+
+    if (stat(path, &st) == 0) {
+        if (!S_ISDIR(st.st_mode)) {
+            fprintf(stderr, "%s exists but is not a directory: %s\n", label, path);
+            return -1;
+        }
+        return 0;
+    }
+
+    return -1;
+}
+
+static int mkdir_if_missing_dir(const char *path, mode_t mode, const char *label) {
+    if (ensure_existing_dir(path, label) == 0) {
+        return 0;
+    }
+    if (errno != ENOENT) {
+        perror(path);
+        return -1;
+    }
+
+    if (mkdir(path, mode) == 0) {
+        return 0;
+    }
+    if (errno == EEXIST) {
+        return ensure_existing_dir(path, label);
+    }
+
+    perror(path);
+    return -1;
+}
+
+static int mkdir_p_dir(const char *path, mode_t mode) {
+    char tmp[PATH_MAX];
+    char *p;
+
+    if (snprintf(tmp, sizeof(tmp), "%s", path) >= (int)sizeof(tmp)) {
+        errno = ENAMETOOLONG;
+        perror(path);
+        return -1;
+    }
+
+    if (tmp[0] == '\0') {
+        fprintf(stderr, "Target path is empty\n");
+        return -1;
+    }
+
+    for (p = tmp + 1; *p; p++) {
+        if (*p != '/') {
+            continue;
+        }
+
+        *p = '\0';
+        if (mkdir_if_missing_dir(tmp, mode, "Target path component") != 0) {
+            *p = '/';
+            return -1;
+        }
+        *p = '/';
+    }
+
+    return mkdir_if_missing_dir(tmp, mode, "Target");
+}
+
+static int ensure_destination_root(const char *dst_arg) {
+    char dst_path[PATH_MAX];
+
+    if (to_abs_path(dst_arg, dst_path, sizeof(dst_path)) != 0) {
+        fprintf(stderr, "Target path too long: %s\n", dst_arg);
+        return -1;
+    }
+
+    return mkdir_p_dir(dst_path, 0777);
+}
+
 static int is_same_or_child_path(const char *base, const char *path) {
     size_t n = strlen(base);
+    if (strcmp(base, "/") == 0) {
+        return path[0] == '/';
+    }
     if (strncmp(base, path, n) != 0) {
         return 0;
     }
@@ -105,12 +369,16 @@ int main(int argc, char **argv) {
     if (!S_ISDIR(st.st_mode)) { fprintf(stderr, "Source is not a directory: %s\n", src_arg); return 1; }
 
     if (to_canonical_dir_path(src_arg, src_abs, sizeof(src_abs)) != 0 ||
-        to_canonical_dir_path(dst_arg, dst_abs, sizeof(dst_abs)) != 0) {
+        to_canonical_requested_dir_path(dst_arg, dst_abs, sizeof(dst_abs)) != 0) {
         return 1;
     }
 
     if (is_same_or_child_path(src_abs, dst_abs) || is_same_or_child_path(dst_abs, src_abs)) {
         fprintf(stderr, "Source and target directories overlap: %s <-> %s\n", src_abs, dst_abs);
+        return 1;
+    }
+
+    if (ensure_destination_root(dst_abs) != 0) {
         return 1;
     }
 

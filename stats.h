@@ -36,14 +36,10 @@ void stats_inc_dirs_created(void);
 void stats_record_copy_file_range_call(uint64_t bytes);
 void stats_record_copy_file_range_fallback(void);
 void stats_add_copy_file_range_usage(uint64_t calls, uint64_t bytes, uint64_t fallbacks);
+void stats_inc_metadata_warning(void);
+void stats_inc_metadata_error(void);
 
-void stats_begin_current_file(const char *path, uint64_t total_bytes, int is_parallel);
 void stats_advance_current_file(uint64_t bytes);
-void stats_end_current_file(void);
-
-void stats_set_active_parallel_ctx(parallel_ctx_t *ctx);
-void stats_clear_active_parallel_ctx(void);
-int stats_copy_active_parallel_workers(chunk_worker_stat_t *out, int max_workers);
 
 void stats_record_speed_sample(void);
 double stats_elapsed_sec(void);
