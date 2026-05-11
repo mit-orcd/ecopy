@@ -1,3 +1,10 @@
+/*
+ * stats.h
+ *
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Michel Erb — see LICENSE.
+ */
+
 #ifndef STATS_H
 #define STATS_H
 

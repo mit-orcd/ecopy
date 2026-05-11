@@ -1,3 +1,10 @@
+/*
+ * traversal.c
+ *
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Michel Erb — see LICENSE.
+ */
+
 #define _GNU_SOURCE
 #include "traversal.h"
 #include "stats.h"

@@ -1,3 +1,10 @@
+/*
+ * config.h
+ *
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Michel Erb — see LICENSE.
+ */
+
 #ifndef CONFIG_H
 #define CONFIG_H
 

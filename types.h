@@ -1,3 +1,10 @@
+/*
+ * types.h
+ *
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Michel Erb — see LICENSE.
+ */
+
 #ifndef TYPES_H
 #define TYPES_H
 

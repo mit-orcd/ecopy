@@ -1,3 +1,10 @@
+/*
+ * workers.h
+ *
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Michel Erb — see LICENSE.
+ */
+
 #ifndef WORKERS_H
 #define WORKERS_H
 

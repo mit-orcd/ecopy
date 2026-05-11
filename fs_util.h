@@ -1,3 +1,10 @@
+/*
+ * fs_util.h
+ *
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Michel Erb — see LICENSE.
+ */
+
 #ifndef FS_UTIL_H
 #define FS_UTIL_H
 

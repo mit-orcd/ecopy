@@ -1,3 +1,10 @@
+/*
+ * traversal.h
+ *
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Michel Erb — see LICENSE.
+ */
+
 #ifndef TRAVERSAL_H
 #define TRAVERSAL_H
 int traversal_start(const char *src_dir, const char *dst_dir);
