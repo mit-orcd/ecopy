@@ -14,8 +14,25 @@ same time.
 - Supports either direct I/O or buffered I/O, with runtime controls for both.
 - Applies bounded queue backpressure so traversal does not run arbitrarily far ahead of copy workers.
 
-The tool intentionally ignores non-regular payloads such as symlinks, devices, FIFOs, and sockets. It is tuned for
-dataset movement, not full filesystem replication.
+## Safety And Limitations
+
+Use this tool at your own risk. It is intended for controlled bulk dataset movement, and you should test it on your
+storage stack and workload before relying on it for important data.
+
+It is good practice to verify the result of a `direct_copy` run with `rsync` or another trusted comparison tool before
+depending on the copied tree.
+
+Use an empty or otherwise trusted target tree when possible. Existing regular files may be skipped or overwritten based
+on the rules below, and existing target-side non-regular entries are not reconciled like they would be by a full
+synchronization tool.
+
+So far, `direct_copy` has only been tested on NFS v4.2 exports and local filesystems. Other filesystems, network
+storage stacks, and mount options may have different behavior, especially around direct I/O, metadata preservation,
+and `copy_file_range()`.
+
+This is not `rsync` and it is not a full filesystem replication tool. It intentionally ignores non-regular payloads
+such as symlinks, devices, FIFOs, and sockets. It currently does not preserve xattrs, ACLs, SELinux labels, or file
+capabilities.
 
 ## Usage
 
@@ -25,6 +42,9 @@ dataset movement, not full filesystem replication.
 
 Use `-v` or `--verbose` to print the resolved startup configuration and the full diagnostic block in the final report.
 The final report always prints one suggested next-run tuning experiment based on the same workload; verbose mode adds the full diagnostic counters behind that suggestion.
+
+The source and target arguments must both name existing directories. `direct_copy` creates the matching tree beneath
+the target root, but it does not create the target root itself. The source and target directories must not overlap.
 
 Examples:
 
@@ -41,11 +61,11 @@ DIRECT_COPY_DISABLE_READ_DIRECT_IO=1 DIRECT_COPY_DISABLE_WRITE_DIRECT_IO=0 /tmp/
 ```
 
 ```bash
-DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_WORKERS=4 /tmp/direct_copy /src /dst
+DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_READERS=3 DIRECT_COPY_LARGE_WRITERS=1 /tmp/direct_copy /src /dst
 ```
 
 ```bash
-DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=128 DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_WORKERS=4 DIRECT_COPY_LARGE_FILE_INFLIGHT=8 /tmp/direct_copy /src /dst
+DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=128 DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_READERS=3 DIRECT_COPY_LARGE_WRITERS=1 DIRECT_COPY_LARGE_FILE_INFLIGHT=8 /tmp/direct_copy /src /dst
 ```
 
 ## Scheduler Model
@@ -53,7 +73,8 @@ DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=128 DIRECT_COPY_MAX_WORKERS
 The current design uses a shared slot budget.
 
 - Small files consume `1` worker slot.
-- Large files are activated in parallel based on `DIRECT_COPY_MAX_WORKERS / (DIRECT_COPY_LARGE_READERS + DIRECT_COPY_LARGE_WRITERS)` when explicit reader/writer counts are in use.
+- Large files consume one active-file slot worth of reader/writer threads. By default that is `4` readers plus `2`
+  writers, so the active large-file limit is `DIRECT_COPY_MAX_WORKERS / 6`.
 - Each active large file gets a bounded large-file pipeline with preallocated aligned chunk buffers.
 - Readers fill buffers, writers drain a ready queue, and the per-file in-flight depth is capped by `DIRECT_COPY_LARGE_FILE_INFLIGHT`.
 - The total budget is capped by `DIRECT_COPY_MAX_WORKERS`.
@@ -131,8 +152,8 @@ behavior depends on the kernel, client, and server stack.
 
 The tool preserves the following source metadata:
 
-- `uid`
-- `gid`
+- `uid`, when permitted
+- `gid`, when permitted
 - permission bits
 - `atime`
 - `mtime`
@@ -144,6 +165,7 @@ This applies to:
 - directories after a final metadata pass
 
 Newly created target directories stay owner-writable during the copy so child entries can still be created under source trees that contain read-only directories; the final directory pass restores the true source mode afterward.
+If `chown`/`fchown` is not permitted, `direct_copy` prints one warning and continues without preserving uid/gid ownership.
 
 Not preserved yet:
 
@@ -178,7 +200,8 @@ Example: with the defaults, small-file work can use up to `32` slots while large
 
 ### `DIRECT_COPY_LARGE_WORKERS`
 
-Concurrency divisor used to determine how many large files may be active at once. The default active-large-file limit is roughly `DIRECT_COPY_MAX_WORKERS / DIRECT_COPY_LARGE_WORKERS`. 
+Fallback total thread count per active large file when both `DIRECT_COPY_LARGE_READERS` and `DIRECT_COPY_LARGE_WRITERS`
+are set to `0`. In the normal/default configuration, the reader/writer settings define the total directly.
 
 Default:
 
@@ -202,7 +225,7 @@ In the final runtime summary, `large file readers/file` and `large file writers/
 
 ### `DIRECT_COPY_LARGE_READERS`
 
-Optional explicit override for large-file reader threads per active large file.
+Large-file reader threads per active large file.
 
 Default:
 
@@ -212,7 +235,7 @@ Default:
 
 ### `DIRECT_COPY_LARGE_WRITERS`
 
-Optional explicit override for large-file writer threads per active large file.
+Large-file writer threads per active large file.
 
 Default:
 
@@ -220,8 +243,8 @@ Default:
 2
 ```
 
-Set these two together when you want a deterministic split such as `3 readers / 1 writer` or `6 readers / 2 writers`.
-When both are set, their sum becomes the effective per-file large-worker total and is used to compute the active-large-file limit.
+Their sum becomes the effective per-file large-worker total and is used to compute the active-large-file limit. For
+example, `DIRECT_COPY_LARGE_READERS=3 DIRECT_COPY_LARGE_WRITERS=1` uses `4` worker slots per active large file.
 
 ### `DIRECT_COPY_CHUNK_MB`
 
@@ -340,9 +363,9 @@ That profile is often better for trees with many tiny files because it reduces d
 A useful benchmark matrix is:
 
 ```bash
-DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=64  DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_WORKERS=4 DIRECT_COPY_LARGE_FILE_INFLIGHT=8 /tmp/direct_copy /src /dst
-DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=128 DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_WORKERS=4 DIRECT_COPY_LARGE_FILE_INFLIGHT=8 /tmp/direct_copy /src /dst
-DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=256 DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_WORKERS=4 DIRECT_COPY_LARGE_FILE_INFLIGHT=8 /tmp/direct_copy /src /dst
+DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=64  DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_READERS=3 DIRECT_COPY_LARGE_WRITERS=1 DIRECT_COPY_LARGE_FILE_INFLIGHT=8 /tmp/direct_copy /src /dst
+DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=128 DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_READERS=3 DIRECT_COPY_LARGE_WRITERS=1 DIRECT_COPY_LARGE_FILE_INFLIGHT=8 /tmp/direct_copy /src /dst
+DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=256 DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_READERS=3 DIRECT_COPY_LARGE_WRITERS=1 DIRECT_COPY_LARGE_FILE_INFLIGHT=8 /tmp/direct_copy /src /dst
 ```
 
 Things to watch while tuning:
@@ -408,3 +431,7 @@ Warning-clean verification build:
 make clean
 make CFLAGS='-O2 -g -Wall -Wextra -Wpedantic -pthread'
 ```
+
+## License
+
+This project is licensed under the **MIT License**. See **[LICENSE](LICENSE)**. Copyright is held by **Michel Erb** (2026).
