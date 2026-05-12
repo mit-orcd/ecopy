@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Clean warning build
+        run: |
+          make clean
+          make CFLAGS='-O2 -g -Wall -Wextra -Wpedantic -pthread'
+
+      - name: Smoke tests
+        run: make test
+
+      - name: Sanitizer build and tests
+        run: |
+          make clean
+          make CFLAGS='-O1 -g -Wall -Wextra -Wpedantic -fsanitize=address,undefined -fno-omit-frame-pointer -pthread' LDFLAGS='-fsanitize=address,undefined -pthread'
+          make test
+
+      - name: Shell syntax checks
+        run: |
+          for t in tests/*.sh; do
+            bash -n "$t"
+          done

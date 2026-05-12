@@ -55,9 +55,12 @@ typedef struct large_buffer {
 typedef struct large_file_ctx {
     char src[PATH_MAX];
     char dst[PATH_MAX];
+    char name[PATH_MAX];
+    char tmp_name[PATH_MAX];
     struct stat src_st;
     off_t bulk_end;
     off_t next_read_offset;
+    dir_handle_t *dir;
     int fd_in;
     int fd_out;
     int in_direct;
@@ -100,6 +103,8 @@ static off_t g_chunk_size = 0;
 static off_t g_large_threshold = 0;
 static int g_max_queued_files = 0;
 static int g_small_worker_limit = 0;
+
+#define MAX_LARGE_BUFFER_BUDGET_MB 8192
 
 /* -------------------- scheduler state -------------------- */
 
@@ -197,12 +202,29 @@ static int env_int_or_default(const char *name, int defval, int minval, int maxv
     long v = strtol(s, &end, 10);
 
     if (errno != 0 || end == s || *end != '\0') {
+        fprintf(stderr,
+                "Warning: %s=%s is invalid; using default %d.\n",
+                name,
+                s,
+                defval);
         return defval;
     }
     if (v < minval) {
+        fprintf(stderr,
+                "Warning: %s=%ld is below minimum %d; using %d.\n",
+                name,
+                v,
+                minval,
+                minval);
         return minval;
     }
     if (v > maxval) {
+        fprintf(stderr,
+                "Warning: %s=%ld exceeds maximum %d; using %d.\n",
+                name,
+                v,
+                maxval,
+                maxval);
         return maxval;
     }
     return (int)v;
@@ -216,7 +238,7 @@ static void init_runtime_config(void)
 
     g_worker_count = env_int_or_default("DIRECT_COPY_MAX_WORKERS",
                                         MAX_WORKER_SLOTS,
-                                        1,
+                                        2,
                                         512);
 
     g_large_worker_count = env_int_or_default("DIRECT_COPY_LARGE_WORKERS",
@@ -285,6 +307,26 @@ static void init_runtime_config(void)
     if (g_max_active_large_files < 1) {
         g_max_active_large_files = 1;
     }
+
+    {
+        long long chunk_mb = (long long)(g_chunk_size / (1024 * 1024));
+        long long budget_mb = chunk_mb *
+                              (long long)g_large_file_inflight *
+                              (long long)g_max_active_large_files;
+        if (budget_mb > MAX_LARGE_BUFFER_BUDGET_MB) {
+            int clamped_inflight = (int)(MAX_LARGE_BUFFER_BUDGET_MB /
+                                         (chunk_mb * (long long)g_max_active_large_files));
+            if (clamped_inflight < 1) {
+                clamped_inflight = 1;
+            }
+            fprintf(stderr,
+                    "Warning: large-file buffer budget would be %lld MiB; clamping DIRECT_COPY_LARGE_FILE_INFLIGHT from %d to %d.\n",
+                    budget_mb,
+                    g_large_file_inflight,
+                    clamped_inflight);
+            g_large_file_inflight = clamped_inflight;
+        }
+    }
 }
 
 static void get_pipeline_thread_counts(int *reader_count, int *writer_count)
@@ -349,6 +391,8 @@ static off_t runtime_large_threshold(void)
 static int enqueue_task(file_task_t **head,
                         file_task_t **tail,
                         uint64_t *depth,
+                        dir_handle_t *dir,
+                        const char *name,
                         const char *src,
                         const char *dst,
                         const struct stat *src_st)
@@ -359,6 +403,9 @@ static int enqueue_task(file_task_t **head,
         return -1;
     }
 
+    dir_handle_retain(dir);
+    t->dir = dir;
+    snprintf(t->name, sizeof(t->name), "%s", name);
     snprintf(t->src, sizeof(t->src), "%s", src);
     snprintf(t->dst, sizeof(t->dst), "%s", dst);
     t->src_st = *src_st;
@@ -381,6 +428,15 @@ static int enqueue_task(file_task_t **head,
     pthread_mutex_unlock(&g_queue_lock);
 
     return 0;
+}
+
+static void free_file_task(file_task_t *task)
+{
+    if (!task) {
+        return;
+    }
+    dir_handle_release(task->dir);
+    free(task);
 }
 
 static file_task_t *pop_file_task(file_task_t **head, file_task_t **tail)
@@ -543,24 +599,6 @@ static int copy_file_range_with_progress(int fd_in,
     return 0;
 }
 
-static int prepare_destination_file(const char *dst, const struct stat *src_st)
-{
-    int out_direct = 0;
-    int fd = open_write_maybe_direct(dst, src_st->st_mode & 07777, &out_direct);
-    if (fd < 0) {
-        return -1;
-    }
-
-    if (ftruncate(fd, src_st->st_size) != 0) {
-        perror("ftruncate");
-        close(fd);
-        return -1;
-    }
-
-    close(fd);
-    return 0;
-}
-
 static int copy_tail_buffered_fds(int fd_in,
                                  int fd_out,
                                  off_t start,
@@ -625,24 +663,27 @@ static int copy_tail_buffered_fds(int fd_in,
     return 0;
 }
 
-static int copy_tail_buffered(const char *src,
-                              const char *dst,
-                              off_t start,
-                              off_t end,
-                              int use_current_file_stats)
+static int copy_tail_buffered_at(int src_dir_fd,
+                                 int dst_dir_fd,
+                                 const char *name,
+                                 const char *tmp_name,
+                                 const char *src,
+                                 const char *dst,
+                                 const struct stat *src_st,
+                                 off_t start,
+                                 off_t end,
+                                 int use_current_file_stats)
 {
     if (start >= end) {
         return 0;
     }
 
-    int fd_in = open(src, O_RDONLY);
+    int fd_in = open_read_at_buffered(src_dir_fd, name, src, src_st);
     if (fd_in < 0) {
-        perror(src);
         return -1;
     }
-    stats_record_read_open(0);
 
-    int fd_out = open_write_existing_buffered(dst);
+    int fd_out = open_temp_write_existing_at_buffered(dst_dir_fd, tmp_name, dst);
     if (fd_out < 0) {
         close(fd_in);
         return -1;
@@ -658,7 +699,7 @@ static int copy_tail_buffered(const char *src,
     return rc;
 }
 
-static int copy_file_serial_small(const char *src, const char *dst, const struct stat *src_st)
+static int copy_file_serial_small(file_task_t *task)
 {
     int fd_in = -1;
     int fd_out = -1;
@@ -669,28 +710,39 @@ static int copy_file_serial_small(const char *src, const char *dst, const struct
     off_t size;
     off_t bulk_end;
     off_t pos = 0;
+    int rc = -1;
+    int temp_created = 0;
+    char tmp_name[PATH_MAX] = "";
 
     init_runtime_config();
     copy_range_available = copy_file_range_enabled();
-    size = src_st->st_size;
+    size = task->src_st.st_size;
     bulk_end = (size / ALIGNMENT) * ALIGNMENT;
+    stats_set_current_file(task->src, (uint64_t)size, 0);
 
-    fd_in = open_read_maybe_direct(src, &in_direct);
+    fd_in = open_read_at_maybe_direct(task->dir->src_fd,
+                                      task->name,
+                                      task->src,
+                                      &task->src_st,
+                                      &in_direct);
     if (fd_in < 0) {
-        return -1;
+        goto out;
     }
 
-    fd_out = open_write_maybe_direct(dst, src_st->st_mode & 07777, &out_direct);
+    fd_out = create_temp_write_at_maybe_direct(task->dir->dst_fd,
+                                               task->dst,
+                                               task->src_st.st_mode & 07777,
+                                               tmp_name,
+                                               sizeof(tmp_name),
+                                               &out_direct);
     if (fd_out < 0) {
-        close(fd_in);
-        return -1;
+        goto out;
     }
+    temp_created = 1;
 
     if (ftruncate(fd_out, size) != 0) {
         perror("ftruncate");
-        close(fd_in);
-        close(fd_out);
-        return -1;
+        goto out;
     }
 
     if (!in_direct) {
@@ -702,9 +754,7 @@ static int copy_file_serial_small(const char *src, const char *dst, const struct
 
     if (posix_memalign(&buf, ALIGNMENT, (size_t)g_chunk_size) != 0) {
         fprintf(stderr, "posix_memalign failed\n");
-        close(fd_in);
-        close(fd_out);
-        return -1;
+        goto out;
     }
 
     while (pos < bulk_end) {
@@ -715,16 +765,13 @@ static int copy_file_serial_small(const char *src, const char *dst, const struct
         if (!in_direct && !out_direct && copy_range_available) {
             off_t in_off = pos;
             off_t out_off = pos;
-            int cfr_rc = copy_file_range_with_progress(fd_in, fd_out, &in_off, &out_off, len, 0);
+            int cfr_rc = copy_file_range_with_progress(fd_in, fd_out, &in_off, &out_off, len, 1);
             if (cfr_rc == 0) {
                 pos += this_len_off;
                 continue;
             }
             if (cfr_rc < 0) {
-                free(buf);
-                close(fd_in);
-                close(fd_out);
-                return -1;
+                goto out;
             }
             stats_record_copy_file_range_fallback();
             copy_range_available = 0;
@@ -736,17 +783,11 @@ static int copy_file_serial_small(const char *src, const char *dst, const struct
             stats_record_read_io(monotonic_ns() - read_start_ns);
             if (r < 0) {
                 perror("read");
-                free(buf);
-                close(fd_in);
-                close(fd_out);
-                return -1;
+                goto out;
             }
             if ((size_t)r != len) {
-                fprintf(stderr, "short read on %s: expected %zu got %zd\n", src, len, r);
-                free(buf);
-                close(fd_in);
-                close(fd_out);
-                return -1;
+                fprintf(stderr, "short read on %s: expected %zu got %zd\n", task->src, len, r);
+                goto out;
             }
         }
 
@@ -758,10 +799,7 @@ static int copy_file_serial_small(const char *src, const char *dst, const struct
                 stats_record_write_io(monotonic_ns() - write_start_ns);
                 if (w < 0) {
                     perror("write");
-                    free(buf);
-                    close(fd_in);
-                    close(fd_out);
-                    return -1;
+                    goto out;
                 }
                 done += (size_t)w;
             }
@@ -769,37 +807,72 @@ static int copy_file_serial_small(const char *src, const char *dst, const struct
 
         advise_source_consumed(fd_in, pos, (off_t)len);
         pos += this_len_off;
-        stats_add_bytes((uint64_t)len);
+        record_progress_bytes((uint64_t)len, 1);
     }
 
     if (!in_direct && !out_direct) {
-        if (copy_tail_buffered_fds(fd_in, fd_out, bulk_end, size, 0) != 0) {
-            free(buf);
-            close(fd_in);
-            close(fd_out);
-            return -1;
+        if (copy_tail_buffered_fds(fd_in, fd_out, bulk_end, size, 1) != 0) {
+            goto out;
         }
-        if (finalize_copied_file_fd(fd_out, dst, src_st) != 0) {
-            free(buf);
-            close(fd_in);
-            close(fd_out);
-            return -1;
+        if (finalize_copied_file_fd(fd_out, task->dst, &task->src_st) != 0) {
+            goto out;
         }
-        free(buf);
-        close(fd_in);
-        close(fd_out);
-        return 0;
+        if (close(fd_out) != 0) {
+            fd_out = -1;
+            perror(task->dst);
+            goto out;
+        }
+        fd_out = -1;
+        if (rename_temp_to_final_at(task->dir->dst_fd, tmp_name, task->name, task->dst) != 0) {
+            goto out;
+        }
+        temp_created = 0;
+        rc = 0;
+        goto out;
     }
 
-    free(buf);
-    close(fd_in);
     close(fd_out);
+    fd_out = -1;
 
-    if (copy_tail_buffered(src, dst, bulk_end, size, 0) != 0) {
-        return -1;
+    if (copy_tail_buffered_at(task->dir->src_fd,
+                              task->dir->dst_fd,
+                              task->name,
+                              tmp_name,
+                              task->src,
+                              task->dst,
+                              &task->src_st,
+                              bulk_end,
+                              size,
+                              1) != 0) {
+        goto out;
     }
 
-    return finalize_copied_file(dst, src_st);
+    if (preserve_path_metadata_at(task->dir->dst_fd,
+                                  tmp_name,
+                                  task->dst,
+                                  &task->src_st,
+                                  S_IFREG) != 0) {
+        goto out;
+    }
+    if (rename_temp_to_final_at(task->dir->dst_fd, tmp_name, task->name, task->dst) != 0) {
+        goto out;
+    }
+    temp_created = 0;
+    rc = 0;
+
+out:
+    free(buf);
+    if (fd_in >= 0) {
+        close(fd_in);
+    }
+    if (fd_out >= 0) {
+        close(fd_out);
+    }
+    if (temp_created) {
+        unlink_temp_at(task->dir->dst_fd, tmp_name);
+    }
+    stats_clear_current_file(task->src);
+    return rc;
 }
 
 /* -------------------- large-file pipeline -------------------- */
@@ -997,11 +1070,31 @@ static void finish_large_file_ctx(large_file_ctx_t *ctx)
     }
 
     if (!ctx->failed) {
-        if (copy_tail_buffered(ctx->src, ctx->dst, ctx->bulk_end, ctx->src_st.st_size, 0) != 0) {
+        if (copy_tail_buffered_at(ctx->dir->src_fd,
+                                  ctx->dir->dst_fd,
+                                  ctx->name,
+                                  ctx->tmp_name,
+                                  ctx->src,
+                                  ctx->dst,
+                                  &ctx->src_st,
+                                  ctx->bulk_end,
+                                  ctx->src_st.st_size,
+                                  0) != 0) {
             rc = -1;
         } else if (finalize_copied_file_fd(ctx->fd_out, ctx->dst, &ctx->src_st) != 0) {
             rc = -1;
+        } else if (close(ctx->fd_out) != 0) {
+            ctx->fd_out = -1;
+            perror(ctx->dst);
+            rc = -1;
+        } else if (rename_temp_to_final_at(ctx->dir->dst_fd,
+                                           ctx->tmp_name,
+                                           ctx->name,
+                                           ctx->dst) != 0) {
+            ctx->fd_out = -1;
+            rc = -1;
         } else {
+            ctx->fd_out = -1;
             stats_inc_files_copied();
         }
     } else {
@@ -1018,6 +1111,10 @@ static void finish_large_file_ctx(large_file_ctx_t *ctx)
     if (ctx->fd_out >= 0) {
         close(ctx->fd_out);
     }
+    if (rc != 0) {
+        unlink_temp_at(ctx->dir->dst_fd, ctx->tmp_name);
+    }
+    dir_handle_release(ctx->dir);
     free_large_buffers(ctx->free_head);
     free_large_buffers(ctx->ready_head);
     free(ctx->reader_threads);
@@ -1057,9 +1154,12 @@ static int start_large_file_copy(file_task_t *task)
 
     snprintf(ctx->src, sizeof(ctx->src), "%s", task->src);
     snprintf(ctx->dst, sizeof(ctx->dst), "%s", task->dst);
+    snprintf(ctx->name, sizeof(ctx->name), "%s", task->name);
     ctx->src_st = task->src_st;
     ctx->bulk_end = (task->src_st.st_size / ALIGNMENT) * ALIGNMENT;
     ctx->next_read_offset = 0;
+    dir_handle_retain(task->dir);
+    ctx->dir = task->dir;
     ctx->fd_in = -1;
     ctx->fd_out = -1;
     pthread_mutex_init(&ctx->lock, NULL);
@@ -1074,6 +1174,30 @@ static int start_large_file_copy(file_task_t *task)
     ctx->writer_threads = calloc((size_t)ctx->writer_count, sizeof(*ctx->writer_threads));
     if (!ctx->reader_threads || !ctx->writer_threads) {
         perror("calloc");
+        goto fail;
+    }
+
+    ctx->fd_in = open_read_at_maybe_direct(ctx->dir->src_fd,
+                                           ctx->name,
+                                           ctx->src,
+                                           &ctx->src_st,
+                                           &ctx->in_direct);
+    if (ctx->fd_in < 0) {
+        goto fail;
+    }
+
+    ctx->fd_out = create_temp_write_at_maybe_direct(ctx->dir->dst_fd,
+                                                    ctx->dst,
+                                                    ctx->src_st.st_mode & 07777,
+                                                    ctx->tmp_name,
+                                                    sizeof(ctx->tmp_name),
+                                                    &ctx->out_direct);
+    if (ctx->fd_out < 0) {
+        goto fail;
+    }
+
+    if (ftruncate(ctx->fd_out, ctx->src_st.st_size) != 0) {
+        perror("ftruncate");
         goto fail;
     }
 
@@ -1092,20 +1216,6 @@ static int start_large_file_copy(file_task_t *task)
         enqueue_buffer(&ctx->free_head, &ctx->free_tail, buf);
         ctx->free_count++;
         stats_record_large_chunk_buffer_alloc();
-    }
-
-    if (prepare_destination_file(ctx->dst, &ctx->src_st) != 0) {
-        goto fail;
-    }
-
-    ctx->fd_in = open_read_maybe_direct(ctx->src, &ctx->in_direct);
-    if (ctx->fd_in < 0) {
-        goto fail;
-    }
-
-    ctx->fd_out = open_write_existing_maybe_direct(ctx->dst, &ctx->out_direct);
-    if (ctx->fd_out < 0) {
-        goto fail;
     }
 
     if (!ctx->in_direct) {
@@ -1155,6 +1265,8 @@ fail:
     if (ctx->fd_out >= 0) {
         close(ctx->fd_out);
     }
+    unlink_temp_at(ctx->dir ? ctx->dir->dst_fd : AT_FDCWD, ctx->tmp_name);
+    dir_handle_release(ctx->dir);
     free_large_buffers(ctx->free_head);
     free_large_buffers(ctx->ready_head);
     free(ctx->reader_threads);
@@ -1236,13 +1348,13 @@ static void *worker_main(void *arg)
         }
 
         if (claim.kind == WORK_SMALL_FILE) {
-            if (copy_file_serial_small(claim.file_task->src, claim.file_task->dst, &claim.file_task->src_st) == 0) {
+            if (copy_file_serial_small(claim.file_task) == 0) {
                 stats_inc_files_copied();
             } else {
                 mark_worker_error();
             }
 
-            free(claim.file_task);
+            free_file_task(claim.file_task);
 
             pthread_mutex_lock(&g_queue_lock);
             if (g_small_workers_active > 0) {
@@ -1264,7 +1376,7 @@ static void *worker_main(void *arg)
                 pthread_cond_broadcast(&g_large_done_cond);
                 pthread_mutex_unlock(&g_queue_lock);
             }
-            free(claim.file_task);
+            free_file_task(claim.file_task);
             continue;
         }
     }
@@ -1337,7 +1449,11 @@ void workers_stop(void)
     g_workers = NULL;
 }
 
-int workers_enqueue_small_file(const char *src, const char *dst, const struct stat *src_st)
+int workers_enqueue_small_file(dir_handle_t *dir,
+                               const char *name,
+                               const char *src,
+                               const char *dst,
+                               const struct stat *src_st)
 {
     init_runtime_config();
 
@@ -1345,6 +1461,8 @@ int workers_enqueue_small_file(const char *src, const char *dst, const struct st
         return enqueue_task(&g_large_queue_head,
                             &g_large_queue_tail,
                             &g_large_queue_depth,
+                            dir,
+                            name,
                             src,
                             dst,
                             src_st);
@@ -1353,16 +1471,24 @@ int workers_enqueue_small_file(const char *src, const char *dst, const struct st
     return enqueue_task(&g_small_queue_head,
                         &g_small_queue_tail,
                         &g_small_queue_depth,
+                        dir,
+                        name,
                         src,
                         dst,
                         src_st);
 }
 
-int workers_enqueue_large_file(const char *src, const char *dst, const struct stat *src_st)
+int workers_enqueue_large_file(dir_handle_t *dir,
+                               const char *name,
+                               const char *src,
+                               const char *dst,
+                               const struct stat *src_st)
 {
     return enqueue_task(&g_large_queue_head,
                         &g_large_queue_tail,
                         &g_large_queue_depth,
+                        dir,
+                        name,
                         src,
                         dst,
                         src_st);

@@ -19,6 +19,7 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 static void usage(const char *prog) {
     fprintf(stderr, "Usage: %s [-v|--verbose] <source_dir> <target_dir>\n", prog);
@@ -258,43 +259,10 @@ static int to_canonical_requested_dir_path(const char *in, char *out, size_t out
     }
 }
 
-static int ensure_existing_dir(const char *path, const char *label) {
-    struct stat st;
-
-    if (stat(path, &st) == 0) {
-        if (!S_ISDIR(st.st_mode)) {
-            fprintf(stderr, "%s exists but is not a directory: %s\n", label, path);
-            return -1;
-        }
-        return 0;
-    }
-
-    return -1;
-}
-
-static int mkdir_if_missing_dir(const char *path, mode_t mode, const char *label) {
-    if (ensure_existing_dir(path, label) == 0) {
-        return 0;
-    }
-    if (errno != ENOENT) {
-        perror(path);
-        return -1;
-    }
-
-    if (mkdir(path, mode) == 0) {
-        return 0;
-    }
-    if (errno == EEXIST) {
-        return ensure_existing_dir(path, label);
-    }
-
-    perror(path);
-    return -1;
-}
-
 static int mkdir_p_dir(const char *path, mode_t mode) {
     char tmp[PATH_MAX];
     char *p;
+    int dir_fd;
 
     if (snprintf(tmp, sizeof(tmp), "%s", path) >= (int)sizeof(tmp)) {
         errno = ENAMETOOLONG;
@@ -307,20 +275,84 @@ static int mkdir_p_dir(const char *path, mode_t mode) {
         return -1;
     }
 
-    for (p = tmp + 1; *p; p++) {
-        if (*p != '/') {
-            continue;
-        }
-
-        *p = '\0';
-        if (mkdir_if_missing_dir(tmp, mode, "Target path component") != 0) {
-            *p = '/';
-            return -1;
-        }
-        *p = '/';
+    if (tmp[0] != '/') {
+        errno = EINVAL;
+        perror(path);
+        return -1;
     }
 
-    return mkdir_if_missing_dir(tmp, mode, "Target");
+    dir_fd = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir_fd < 0) {
+        perror("/");
+        return -1;
+    }
+
+    p = tmp + 1;
+    while (*p) {
+        char *slash = strchr(p, '/');
+        char saved = '\0';
+        struct stat st;
+        int child_fd;
+
+        if (slash) {
+            saved = *slash;
+            *slash = '\0';
+        }
+
+        if (*p != '\0') {
+            if (fstatat(dir_fd, p, &st, AT_SYMLINK_NOFOLLOW) == 0) {
+                if (!S_ISDIR(st.st_mode)) {
+                    fprintf(stderr, "Target path component exists but is not a directory: %s\n", path);
+                    close(dir_fd);
+                    if (slash) {
+                        *slash = saved;
+                    }
+                    return -1;
+                }
+            } else if (errno == ENOENT) {
+                if (mkdirat(dir_fd, p, mode) != 0 && errno != EEXIST) {
+                    perror(path);
+                    close(dir_fd);
+                    if (slash) {
+                        *slash = saved;
+                    }
+                    return -1;
+                }
+            } else {
+                perror(path);
+                close(dir_fd);
+                if (slash) {
+                    *slash = saved;
+                }
+                return -1;
+            }
+
+            child_fd = openat(dir_fd, p, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+            if (child_fd < 0) {
+                perror(path);
+                close(dir_fd);
+                if (slash) {
+                    *slash = saved;
+                }
+                return -1;
+            }
+            close(dir_fd);
+            dir_fd = child_fd;
+        }
+
+        if (!slash) {
+            break;
+        }
+        *slash = saved;
+        p = slash + 1;
+    }
+
+    if (close(dir_fd) != 0) {
+        perror(path);
+        return -1;
+    }
+
+    return 0;
 }
 
 static int ensure_destination_root(const char *dst_arg) {

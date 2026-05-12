@@ -25,13 +25,14 @@ static pthread_t g_monitor_thread;
 static int g_monitor_stop = 0;
 static int g_monitor_running = 0;
 static pthread_mutex_t g_monitor_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_output_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int get_terminal_width(void) {
     struct winsize ws;
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 20) {
-        return ws.ws_col;
+        return ws.ws_col - 1;
     }
-    return 200;
+    return 120;
 }
 
 static void trim_to_width(char *s, int width) {
@@ -70,6 +71,67 @@ static void format_duration(double sec, char *out, size_t out_sz)
              hours, minutes, seconds);
 }
 
+static void format_bytes_adaptive(uint64_t bytes, char *out, size_t out_sz)
+{
+    double value = (double)bytes;
+    const char *unit = "B";
+
+    if (value >= 1024.0) {
+        value /= 1024.0;
+        unit = "KiB";
+    }
+    if (value >= 1024.0) {
+        value /= 1024.0;
+        unit = "MiB";
+    }
+    if (value >= 1024.0) {
+        value /= 1024.0;
+        unit = "GiB";
+    }
+
+    if (strcmp(unit, "B") == 0) {
+        snprintf(out, out_sz, "%.0f %s", value, unit);
+    } else {
+        snprintf(out, out_sz, "%.2f %s", value, unit);
+    }
+}
+
+static void format_rate_adaptive(double bytes_per_sec, char *out, size_t out_sz)
+{
+    double value = bytes_per_sec;
+    const char *unit = "B/s";
+
+    if (value >= 1024.0) {
+        value /= 1024.0;
+        unit = "KiB/s";
+    }
+    if (value >= 1024.0) {
+        value /= 1024.0;
+        unit = "MiB/s";
+    }
+    if (value >= 1024.0) {
+        value /= 1024.0;
+        unit = "GiB/s";
+    }
+
+    if (strcmp(unit, "B/s") == 0) {
+        snprintf(out, out_sz, "%.0f %s", value, unit);
+    } else {
+        snprintf(out, out_sz, "%.2f %s", value, unit);
+    }
+}
+
+static void format_file_rate(double files_per_sec, char *out, size_t out_sz)
+{
+    if (files_per_sec >= 100.0) {
+        snprintf(out, out_sz, "%.0f files/s", files_per_sec);
+    } else if (files_per_sec >= 10.0) {
+        snprintf(out, out_sz, "%.1f files/s", files_per_sec);
+    } else {
+        snprintf(out, out_sz, "%.2f files/s", files_per_sec);
+    }
+}
+
 static void build_progress_line(char *out, size_t out_sz) {
     progress_snapshot_t snap;
     uint64_t sq = workers_small_queue_depth();
@@ -78,14 +140,25 @@ static void build_progress_line(char *out, size_t out_sz) {
     uint64_t la = workers_large_active_count();
     char elapsed_buf[32];
     char remaining_buf[32];
+    char copied_buf[32];
+    char rate_buf[32];
+    char file_rate_buf[32];
+    char current_done_buf[32];
+    char current_total_buf[32];
+    double bytes_per_sec;
 
     stats_get_progress_snapshot(&snap);
     format_duration(snap.elapsed_sec, elapsed_buf, sizeof(elapsed_buf));
+    format_bytes_adaptive(snap.bytes_completed, copied_buf, sizeof(copied_buf));
+    bytes_per_sec = snap.rolling_completed_gibs * 1024.0 * 1024.0 * 1024.0;
+    format_rate_adaptive(bytes_per_sec, rate_buf, sizeof(rate_buf));
+    format_file_rate(snap.rolling_files_per_sec, file_rate_buf, sizeof(file_rate_buf));
 
     int n = snprintf(out, out_sz,
-        "%.2f GiB, %.2f GiB/s, %" PRIu64 "/%" PRIu64 " files, %" PRIu64 " dirs | sq:%" PRIu64 " sa:%" PRIu64 " lq:%" PRIu64 " la:%" PRIu64 " | el:%s",
-        stats_bytes_to_gib(snap.bytes_copied),
-        snap.rolling_gibs,
+        "%s payload, %s, %s, %" PRIu64 "/%" PRIu64 " files, %" PRIu64 " dirs | sq:%" PRIu64 " sa:%" PRIu64 " lq:%" PRIu64 " la:%" PRIu64 " | el:%s",
+        copied_buf,
+        rate_buf,
+        file_rate_buf,
         snap.files_copied + snap.files_skipped,
         snap.files_seen,
         snap.dirs_seen,
@@ -108,11 +181,13 @@ static void build_progress_line(char *out, size_t out_sz) {
 
     if (snap.current_file_total > 0 && n > 0 && (size_t)n < out_sz) {
         double pct = 100.0 * (double)snap.current_file_done / (double)snap.current_file_total;
+        format_bytes_adaptive(snap.current_file_done, current_done_buf, sizeof(current_done_buf));
+        format_bytes_adaptive(snap.current_file_total, current_total_buf, sizeof(current_total_buf));
         n += snprintf(out + n, out_sz - (size_t)n,
-            " | %.1f%% (%.2f/%.2f GiB): %s",
+            " | %.1f%% (%s/%s): %s",
             pct,
-            stats_bytes_to_gib(snap.current_file_done),
-            stats_bytes_to_gib(snap.current_file_total),
+            current_done_buf,
+            current_total_buf,
             snap.current_file);
     }
 
@@ -122,8 +197,10 @@ static void build_progress_line(char *out, size_t out_sz) {
 static void print_progress(void) {
     char line[16384];
     build_progress_line(line, sizeof(line));
-    printf("\033[2K\r%s", line);
+    pthread_mutex_lock(&g_output_lock);
+    printf("\r\033[2K%s", line);
     fflush(stdout);
+    pthread_mutex_unlock(&g_output_lock);
 }
 
 static void *monitor_main(void *arg) {
@@ -191,7 +268,9 @@ void progress_interrupt(void) {
     pthread_mutex_unlock(&g_monitor_lock);
 
     if (active) {
-        printf("\033[2K\r");
+        pthread_mutex_lock(&g_output_lock);
+        printf("\r\033[2K");
         fflush(stdout);
+        pthread_mutex_unlock(&g_output_lock);
     }
 }

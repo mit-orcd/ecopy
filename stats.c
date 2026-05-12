@@ -55,6 +55,12 @@ void stats_add_bytes(uint64_t bytes) {
     pthread_mutex_unlock(&g_lock);
 }
 
+void stats_add_skipped_bytes(uint64_t bytes) {
+    pthread_mutex_lock(&g_lock);
+    g_stats.bytes_skipped += bytes;
+    pthread_mutex_unlock(&g_lock);
+}
+
 void stats_add_planned_copy_bytes(uint64_t bytes) {
     pthread_mutex_lock(&g_lock);
     g_stats.planned_copy_bytes += bytes;
@@ -128,6 +134,15 @@ void stats_add_copy_file_range_usage(uint64_t calls, uint64_t bytes, uint64_t fa
 void stats_inc_metadata_warning(void) { pthread_mutex_lock(&g_lock); g_stats.metadata_warnings++; pthread_mutex_unlock(&g_lock); }
 void stats_inc_metadata_error(void) { pthread_mutex_lock(&g_lock); g_stats.metadata_errors++; pthread_mutex_unlock(&g_lock); }
 
+void stats_set_current_file(const char *path, uint64_t total, int parallel) {
+    pthread_mutex_lock(&g_lock);
+    snprintf(g_current_file, sizeof(g_current_file), "%s", path ? path : "");
+    g_current_file_done = 0;
+    g_current_file_total = total;
+    g_current_file_parallel = parallel;
+    pthread_mutex_unlock(&g_lock);
+}
+
 void stats_advance_current_file(uint64_t bytes) {
     pthread_mutex_lock(&g_lock);
     g_current_file_done += bytes;
@@ -135,10 +150,23 @@ void stats_advance_current_file(uint64_t bytes) {
     pthread_mutex_unlock(&g_lock);
 }
 
+void stats_clear_current_file(const char *path) {
+    pthread_mutex_lock(&g_lock);
+    if (!path || strcmp(g_current_file, path) == 0) {
+        memset(g_current_file, 0, sizeof(g_current_file));
+        g_current_file_done = 0;
+        g_current_file_total = 0;
+        g_current_file_parallel = 0;
+    }
+    pthread_mutex_unlock(&g_lock);
+}
+
 void stats_record_speed_sample(void) {
     pthread_mutex_lock(&g_lock);
     clock_gettime(CLOCK_MONOTONIC, &g_speed_ring[g_speed_index].ts);
     g_speed_ring[g_speed_index].bytes_copied = g_stats.bytes_copied;
+    g_speed_ring[g_speed_index].bytes_completed = g_stats.bytes_copied + g_stats.bytes_skipped;
+    g_speed_ring[g_speed_index].files_completed = g_stats.files_copied + g_stats.files_skipped;
     g_speed_ring[g_speed_index].valid = 1;
     g_speed_index = (g_speed_index + 1) % SPEED_SLOTS;
     pthread_mutex_unlock(&g_lock);
@@ -250,10 +278,59 @@ double stats_rolling_gibs(void) {
     return stats_bytes_to_gib(cur_bytes - old_bytes) / dt;
 }
 
+static double stats_rolling_completed_gibs(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    pthread_mutex_lock(&g_lock);
+    int found = 0;
+    double best_age = 0.0;
+    uint64_t old_bytes = 0;
+    struct timespec old_ts = now;
+    for (int i = 0; i < SPEED_SLOTS; i++) {
+        if (!g_speed_ring[i].valid) continue;
+        double age = diff_sec(&now, &g_speed_ring[i].ts);
+        if (age < 0.0 || age > SPEED_WINDOW_SEC) continue;
+        if (!found || age > best_age) {
+            found = 1; best_age = age; old_bytes = g_speed_ring[i].bytes_completed; old_ts = g_speed_ring[i].ts;
+        }
+    }
+    uint64_t cur_bytes = g_stats.bytes_copied + g_stats.bytes_skipped;
+    pthread_mutex_unlock(&g_lock);
+    if (!found) return 0.0;
+    double dt = diff_sec(&now, &old_ts);
+    if (dt <= 0.0) return 0.0;
+    return stats_bytes_to_gib(cur_bytes - old_bytes) / dt;
+}
+
+static double stats_rolling_files_per_sec(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    pthread_mutex_lock(&g_lock);
+    int found = 0;
+    double best_age = 0.0;
+    uint64_t old_files = 0;
+    struct timespec old_ts = now;
+    for (int i = 0; i < SPEED_SLOTS; i++) {
+        if (!g_speed_ring[i].valid) continue;
+        double age = diff_sec(&now, &g_speed_ring[i].ts);
+        if (age < 0.0 || age > SPEED_WINDOW_SEC) continue;
+        if (!found || age > best_age) {
+            found = 1; best_age = age; old_files = g_speed_ring[i].files_completed; old_ts = g_speed_ring[i].ts;
+        }
+    }
+    uint64_t cur_files = g_stats.files_copied + g_stats.files_skipped;
+    pthread_mutex_unlock(&g_lock);
+    if (!found) return 0.0;
+    double dt = diff_sec(&now, &old_ts);
+    if (dt <= 0.0) return 0.0;
+    return (double)(cur_files - old_files) / dt;
+}
+
 void stats_get_progress_snapshot(progress_snapshot_t *snap) {
     if (!snap) return;
     pthread_mutex_lock(&g_lock);
     snap->bytes_copied = g_stats.bytes_copied;
+    snap->bytes_completed = g_stats.bytes_copied + g_stats.bytes_skipped;
     snap->files_seen = g_stats.files_seen;
     snap->files_copied = g_stats.files_copied;
     snap->files_skipped = g_stats.files_skipped;
@@ -267,6 +344,8 @@ void stats_get_progress_snapshot(progress_snapshot_t *snap) {
     snprintf(snap->current_file, sizeof(snap->current_file), "%s", g_current_file);
     pthread_mutex_unlock(&g_lock);
     snap->rolling_gibs = stats_rolling_gibs();
+    snap->rolling_completed_gibs = stats_rolling_completed_gibs();
+    snap->rolling_files_per_sec = stats_rolling_files_per_sec();
     snap->elapsed_sec = stats_elapsed_sec();
 }
 
@@ -294,6 +373,9 @@ void stats_print_final(int verbose) {
     printf("Dirs seen     : %" PRIu64 "\n", s.dirs_seen);
     printf("Dirs created  : %" PRIu64 "\n", s.dirs_created);
     printf("GiB copied    : %.2f\n", gib);
+    if (s.bytes_skipped > 0) {
+        printf("GiB skipped   : %.2f\n", stats_bytes_to_gib(s.bytes_skipped));
+    }
     printf("Elapsed       : %.2f s\n", sec);
     printf("Avg speed     : %.2f GiB/s\n", avg);
     if (s.metadata_warnings > 0) {
@@ -308,6 +390,7 @@ void stats_print_final(int verbose) {
     }
 
     printf("Bytes copied  : %" PRIu64 "\n", s.bytes_copied);
+    printf("Bytes skipped : %" PRIu64 "\n", s.bytes_skipped);
     printf("copy_file_range calls     : %" PRIu64 "\n", s.copy_file_range_calls);
     printf("copy_file_range bytes     : %" PRIu64 "\n", s.copy_file_range_bytes);
     printf("copy_file_range fallbacks : %" PRIu64 "\n", s.copy_file_range_fallbacks);

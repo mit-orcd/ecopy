@@ -13,6 +13,8 @@ same time.
 - Uses a shared worker-slot scheduler so small and large file workloads can share the same concurrency budget.
 - Supports either direct I/O or buffered I/O, with runtime controls for both.
 - Applies bounded queue backpressure so traversal does not run arbitrarily far ahead of copy workers.
+- Opens source and target entries relative to already-opened directory handles so symlink swaps are rejected during traversal and copy.
+- Copies through same-directory temporary files and renames them into place only after data and metadata are complete.
 
 ## Safety And Limitations
 
@@ -22,9 +24,10 @@ storage stack and workload before relying on it for important data.
 It is good practice to verify the result of an `ecopy` run with `rsync` or another trusted comparison tool before
 depending on the copied tree.
 
-Use an empty or otherwise trusted target tree when possible. Existing regular files may be skipped or overwritten based
-on the rules below. Existing target-side non-regular entries, including symlinks, devices, FIFOs, and sockets, are
-rejected rather than followed or reconciled like they would be by a full synchronization tool.
+Use an empty or otherwise trusted target tree when possible. Existing regular files may be skipped or atomically replaced
+based on the rules below. Existing target-side non-regular entries, including symlinks, devices, FIFOs, and sockets, are
+rejected rather than followed or reconciled like they would be by a full synchronization tool. Missing target directories
+are created with symlink-following disabled for each new path component.
 
 So far, `ecopy` has only been tested on NFS v4.2 exports and local filesystems. Other filesystems, network
 storage stacks, and mount options may have different behavior, especially around direct I/O, metadata preservation,
@@ -42,6 +45,7 @@ capabilities.
 
 Use `-v` or `--verbose` to print the resolved startup configuration and the full diagnostic block in the final report.
 The final report always prints one suggested next-run tuning experiment based on the same workload; verbose mode adds the full diagnostic counters behind that suggestion.
+The live progress line reports payload bytes, payload throughput, and rolling files-per-second. Metadata-heavy or zero-byte-file workloads can show high files-per-second while payload bytes remain low.
 
 The source argument must name an existing directory. The source and target directories must not overlap; `ecopy`
 validates that relationship before creating a missing target root. After validation, it creates the target root when it
@@ -87,6 +91,7 @@ Default behavior:
 
 - `DIRECT_COPY_MAX_WORKERS = 256`
 - `DIRECT_COPY_SMALL_MAX_WORKERS = 32`
+- `DIRECT_COPY_LARGE_WORKERS = 6` when both reader/writer split knobs are set to `0`
 - `DIRECT_COPY_LARGE_READERS = 4`
 - `DIRECT_COPY_LARGE_WRITERS = 2`
 - `DIRECT_COPY_LARGE_FILE_INFLIGHT = 16`
@@ -94,6 +99,11 @@ Default behavior:
 - `DIRECT_COPY_LARGE_THRESHOLD_MB = 128`
 - `DIRECT_COPY_TRAVERSAL_WORKERS = 8`
 - `DIRECT_COPY_MAX_QUEUED_FILES = 262144`
+- `DIRECT_COPY_DISABLE_DIRECT_IO = 0`
+- `DIRECT_COPY_DISABLE_READ_DIRECT_IO = 0`
+- `DIRECT_COPY_DISABLE_WRITE_DIRECT_IO = 0`
+- `DIRECT_COPY_DISABLE_COPY_FILE_RANGE = 0`
+- effective large-file chunk-buffer budget capped at `8192 MiB`
 
 So by default:
 
@@ -103,6 +113,7 @@ So by default:
 - each active large file can keep up to `16` chunk buffers in flight by default
 - mixed workloads use a shared total slot pool, but small-file work is capped separately so it cannot consume the entire machine by default
 - traversal is backpressured once queued file work reaches the configured cap
+- numeric environment values outside their accepted range are clamped with a warning; invalid values fall back to the documented default
 
 ## Copy Strategy
 
@@ -124,14 +135,15 @@ This keeps large-file classification stable even when `DIRECT_COPY_CHUNK_MB` is 
 
 Large-file copy works like this:
 
-1. The target file is created and pre-sized.
-2. The large file is activated into its own bounded pipeline.
-3. A pool of aligned chunk buffers is preallocated up front.
-4. Reader threads use `pread()` to fill free buffers and push them into a ready-to-write queue.
-5. Writer threads drain that ready queue with `pwrite()`.
-6. `DIRECT_COPY_LARGE_FILE_INFLIGHT` limits how many chunk buffers each active large file may keep in flight at once.
-7. Any remaining unaligned tail bytes are copied in a buffered tail pass.
-8. Final metadata is restored after data copy completes.
+1. The source file is opened relative to its source directory and verified against traversal metadata.
+2. A hidden temporary target is created in the destination directory and pre-sized.
+3. The large file is activated into its own bounded pipeline.
+4. A pool of aligned chunk buffers is preallocated up front.
+5. Reader threads use `pread()` to fill free buffers and push them into a ready-to-write queue.
+6. Writer threads drain that ready queue with `pwrite()`.
+7. `DIRECT_COPY_LARGE_FILE_INFLIGHT` limits how many chunk buffers each active large file may keep in flight at once.
+8. Any remaining unaligned tail bytes are copied in a buffered tail pass.
+9. Final metadata is restored on the temporary file before it is renamed into place.
 
 This gives a real read-buffer-write pipeline for large files, with bounded queue depth and instrumentation that tells us whether readers are waiting for buffers or writers are waiting for data.
 
@@ -166,7 +178,7 @@ This applies to:
 - directories after a final metadata pass
 
 Newly created target directories stay owner-writable during the copy so child entries can still be created under source trees that contain read-only directories; the final directory pass restores the true source mode afterward.
-Copied regular files are also kept owner-writable while data is being written, then restored to the source mode after the copy completes. If an existing destination regular file is read-only and the user can chmod it, `ecopy` temporarily adds owner write permission so reruns and overwrites can proceed.
+Copied regular files are written to hidden temporary files that stay owner-writable while data is being written, then restored to the source mode before the final rename. Existing read-only destination regular files do not need to be chmodded for overwrite; the containing directory must allow the final rename.
 If `chown`/`fchown` is not permitted, `ecopy` prints one warning, counts each degraded uid/gid update in the final report, and continues without preserving uid/gid ownership for those entries. Fatal metadata update failures, such as mode or timestamp updates that cannot be applied, are counted as metadata errors before the run fails.
 
 Not preserved yet:
@@ -189,6 +201,8 @@ Default:
 ```
 
 If a large-file reader/writer configuration would cost more slots than this budget, `ecopy` clamps the per-file split and warns so at least one large file can still make progress.
+Values below `2` are clamped to `2` because a large-file pipeline needs at least one reader and one writer thread.
+Values above `512` are clamped to `512`.
 
 ### `DIRECT_COPY_SMALL_MAX_WORKERS`
 
@@ -201,6 +215,7 @@ Default:
 ```
 
 Example: with the defaults, small-file work can use up to `32` slots while large-file work can still fan out over the remaining capacity.
+Values below `1` are clamped to `1`; values above `DIRECT_COPY_MAX_WORKERS` are clamped to the resolved max-worker value.
 
 ### `DIRECT_COPY_LARGE_WORKERS`
 
@@ -213,6 +228,8 @@ Default:
 6
 ```
 
+Values below `2` are clamped to `2`; values above `DIRECT_COPY_MAX_WORKERS` are clamped to the resolved max-worker value.
+
 ### `DIRECT_COPY_LARGE_FILE_INFLIGHT`
 
 Maximum number of chunk tasks that each active large file may keep queued or in flight at once.
@@ -224,6 +241,8 @@ Default:
 ```
 
 This is the closest runtime knob to per-file queue depth for large-file NFS/RDMA tuning. Higher values can create more in-flight I/O, but can also increase contention.
+Values below `1` are clamped to `1`; values above `1024` are clamped to `1024`.
+`ecopy` also clamps the effective in-flight depth when active large files, chunk size, and in-flight buffers would exceed the built-in `8192 MiB` large-buffer budget.
 
 In the final runtime summary, `large file readers/file` and `large file writers/file` show the actual split used for each active large-file pipeline.
 
@@ -237,6 +256,8 @@ Default:
 4
 ```
 
+Values below `0` are clamped to `0`; values above `DIRECT_COPY_MAX_WORKERS` are clamped to the resolved max-worker value.
+
 ### `DIRECT_COPY_LARGE_WRITERS`
 
 Large-file writer threads per active large file.
@@ -246,6 +267,8 @@ Default:
 ```text
 2
 ```
+
+Values below `0` are clamped to `0`; values above `DIRECT_COPY_MAX_WORKERS` are clamped to the resolved max-worker value.
 
 Their sum becomes the effective per-file large-worker total and is used to compute the active-large-file limit. For
 example, `DIRECT_COPY_LARGE_READERS=3 DIRECT_COPY_LARGE_WRITERS=1` uses `4` worker slots per active large file.
@@ -261,6 +284,7 @@ Default:
 ```
 
 Larger values may help high-bandwidth sequential workloads, but the best setting is environment-dependent.
+Values below `1` are clamped to `1`; values above `4096` are clamped to `4096`.
 
 ### `DIRECT_COPY_LARGE_THRESHOLD_MB`
 
@@ -273,6 +297,7 @@ Default:
 ```
 
 Use this when you want to keep medium-sized files on the simpler small-file path while still experimenting with small chunk sizes for true large-file transfers.
+Values below `1` are clamped to `1`; values above `1048576` are clamped to `1048576`.
 
 ### `DIRECT_COPY_TRAVERSAL_WORKERS`
 
@@ -285,6 +310,7 @@ Default:
 ```
 
 Higher values may reduce tree-discovery time on large namespace-heavy workloads, but can also increase metadata-server or filesystem contention. This knob is most relevant for trees with many small files and directories.
+Values below `1` are clamped to `1`; values above `128` are clamped to `128`.
 
 ### `DIRECT_COPY_MAX_QUEUED_FILES`
 
@@ -297,6 +323,7 @@ Default:
 ```
 
 This limits memory growth on very large trees while still allowing traversal to stay comfortably ahead of the copy workers.
+Values below `1` are clamped to `1`; values above `10000000` are clamped to `10000000`.
 
 ### `DIRECT_COPY_DISABLE_COPY_FILE_RANGE`
 
@@ -353,7 +380,7 @@ For NFS/RDMA or other high-throughput flash-backed paths, the best settings are 
 The current built-in defaults are already tuned toward a high-concurrency large-file profile:
 
 ```bash
-DIRECT_COPY_DISABLE_READ_DIRECT_IO=0 DIRECT_COPY_DISABLE_WRITE_DIRECT_IO=0 DIRECT_COPY_MAX_WORKERS=256 DIRECT_COPY_SMALL_MAX_WORKERS=32 DIRECT_COPY_LARGE_READERS=4 DIRECT_COPY_LARGE_WRITERS=2 DIRECT_COPY_LARGE_FILE_INFLIGHT=16 DIRECT_COPY_CHUNK_MB=1 DIRECT_COPY_LARGE_THRESHOLD_MB=128 DIRECT_COPY_TRAVERSAL_WORKERS=8 ./ecopy /src /dst
+DIRECT_COPY_DISABLE_DIRECT_IO=0 DIRECT_COPY_DISABLE_READ_DIRECT_IO=0 DIRECT_COPY_DISABLE_WRITE_DIRECT_IO=0 DIRECT_COPY_DISABLE_COPY_FILE_RANGE=0 DIRECT_COPY_MAX_WORKERS=256 DIRECT_COPY_SMALL_MAX_WORKERS=32 DIRECT_COPY_LARGE_WORKERS=6 DIRECT_COPY_LARGE_READERS=4 DIRECT_COPY_LARGE_WRITERS=2 DIRECT_COPY_LARGE_FILE_INFLIGHT=16 DIRECT_COPY_CHUNK_MB=1 DIRECT_COPY_LARGE_THRESHOLD_MB=128 DIRECT_COPY_TRAVERSAL_WORKERS=8 DIRECT_COPY_MAX_QUEUED_FILES=262144 ./ecopy /src /dst
 ```
 
 For small-file or metadata-heavy trees, try buffered I/O first. A practical starting point is:
@@ -368,13 +395,13 @@ A useful benchmark matrix is:
 
 ```bash
 DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=64  DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_READERS=3 DIRECT_COPY_LARGE_WRITERS=1 DIRECT_COPY_LARGE_FILE_INFLIGHT=8 ./ecopy /src /dst
-DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=128 DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_READERS=3 DIRECT_COPY_LARGE_WRITERS=1 DIRECT_COPY_LARGE_FILE_INFLIGHT=8 ./ecopy /src /dst
-DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=256 DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_READERS=3 DIRECT_COPY_LARGE_WRITERS=1 DIRECT_COPY_LARGE_FILE_INFLIGHT=8 ./ecopy /src /dst
+DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=128 DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_READERS=3 DIRECT_COPY_LARGE_WRITERS=1 DIRECT_COPY_LARGE_FILE_INFLIGHT=4 ./ecopy /src /dst
+DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_CHUNK_MB=256 DIRECT_COPY_MAX_WORKERS=64 DIRECT_COPY_LARGE_READERS=3 DIRECT_COPY_LARGE_WRITERS=1 DIRECT_COPY_LARGE_FILE_INFLIGHT=2 ./ecopy /src /dst
 ```
 
 Things to watch while tuning:
 
-- completed copy throughput reported by `ecopy`
+- live payload throughput, rolling files-per-second, and final copied/skipped byte totals reported by `ecopy`
 - `Traversal seen seconds`, `File work drained sec`, `Finalize dir seconds`, and `Shutdown tail seconds` to identify whether the remaining time is in tree discovery, copy completion, final directory metadata, or teardown
 - `Read opens` and `Write opens` counters to confirm actual direct-vs-buffered behavior
 - `Queue wait seconds`, `Read time seconds`, `Write time seconds`, and `cfr time seconds` to identify where workers are stalling

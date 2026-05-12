@@ -1,0 +1,5 @@
+*.d
+*.o
+/direct_copy
+/ecopy
+/ecopy-jemalloc

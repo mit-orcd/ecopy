@@ -19,10 +19,10 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 typedef struct dir_node {
-    char src[PATH_MAX];
-    char dst[PATH_MAX];
+    dir_handle_t *dir;
     int depth;
     struct dir_node *next;
 } dir_node_t;
@@ -30,6 +30,7 @@ typedef struct dir_node {
 typedef struct dir_record {
     char src[PATH_MAX];
     char dst[PATH_MAX];
+    dir_handle_t *dir;
     struct stat src_st;
     int depth;
 } dir_record_t;
@@ -53,6 +54,16 @@ static dir_record_t *g_finalize_dirs = NULL;
 static size_t g_finalize_dir_count = 0;
 static size_t g_finalize_dir_cap = 0;
 
+static void close_finalize_dir_records(void)
+{
+    size_t i;
+
+    for (i = 0; i < g_finalize_dir_count; i++) {
+        dir_handle_release(g_finalize_dirs[i].dir);
+        g_finalize_dirs[i].dir = NULL;
+    }
+}
+
 static int env_int_or_default(const char *name, int defval, int minval, int maxval)
 {
     const char *s = getenv(name);
@@ -65,12 +76,29 @@ static int env_int_or_default(const char *name, int defval, int minval, int maxv
     long v = strtol(s, &end, 10);
 
     if (errno != 0 || end == s || *end != '\0') {
+        fprintf(stderr,
+                "Warning: %s=%s is invalid; using default %d.\n",
+                name,
+                s,
+                defval);
         return defval;
     }
     if (v < minval) {
+        fprintf(stderr,
+                "Warning: %s=%ld is below minimum %d; using %d.\n",
+                name,
+                v,
+                minval,
+                minval);
         return minval;
     }
     if (v > maxval) {
+        fprintf(stderr,
+                "Warning: %s=%ld exceeds maximum %d; using %d.\n",
+                name,
+                v,
+                maxval,
+                maxval);
         return maxval;
     }
     return (int)v;
@@ -101,21 +129,102 @@ static void mark_traversal_error(void)
     pthread_mutex_unlock(&g_status_lock);
 }
 
-static int process_file(const char *src, const char *dst)
+static int same_source_entry(const struct stat *a, const struct stat *b)
+{
+    return a->st_dev == b->st_dev &&
+           a->st_ino == b->st_ino &&
+           (a->st_mode & S_IFMT) == (b->st_mode & S_IFMT);
+}
+
+static int open_verified_source_dir(int parent_fd,
+                                    const char *name,
+                                    const char *display_path,
+                                    const struct stat *expected_st)
+{
+    struct stat opened_st;
+    int fd = openat(parent_fd, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) {
+        perror(display_path);
+        return -1;
+    }
+    if (fstat(fd, &opened_st) != 0) {
+        int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        perror(display_path);
+        return -1;
+    }
+    if (!S_ISDIR(opened_st.st_mode) || !same_source_entry(expected_st, &opened_st)) {
+        close(fd);
+        fprintf(stderr, "Source directory changed during traversal: %s\n", display_path);
+        errno = ESTALE;
+        return -1;
+    }
+    return fd;
+}
+
+static int open_or_create_target_dir(int parent_fd,
+                                     const char *name,
+                                     const char *display_path,
+                                     mode_t mode)
+{
+    struct stat st;
+    mode_t create_mode = (mode & 07777) | S_IRUSR | S_IWUSR | S_IXUSR;
+    int fd;
+
+    if (fstatat(parent_fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0) {
+        if (!S_ISDIR(st.st_mode)) {
+            fprintf(stderr, "Target exists but is not a directory: %s\n", display_path);
+            errno = EEXIST;
+            return -1;
+        }
+    } else if (errno == ENOENT) {
+        if (mkdirat(parent_fd, name, create_mode) != 0 && errno != EEXIST) {
+            perror(display_path);
+            return -1;
+        }
+        if (fstatat(parent_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+            perror(display_path);
+            return -1;
+        }
+        if (!S_ISDIR(st.st_mode)) {
+            fprintf(stderr, "Target exists but is not a directory: %s\n", display_path);
+            errno = EEXIST;
+            return -1;
+        }
+        stats_inc_dirs_created();
+    } else {
+        perror(display_path);
+        return -1;
+    }
+
+    fd = openat(parent_fd, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) {
+        perror(display_path);
+        return -1;
+    }
+    return fd;
+}
+
+static int process_file(dir_handle_t *dir,
+                        const char *name,
+                        const char *src,
+                        const char *dst)
 {
     struct stat src_st, dst_st;
-    if (lstat(src, &src_st) != 0) { perror(src); return -1; }
+    if (fstatat(dir->src_fd, name, &src_st, AT_SYMLINK_NOFOLLOW) != 0) { perror(src); return -1; }
     if (!S_ISREG(src_st.st_mode)) return 0;
     stats_inc_files_seen();
-    if (lstat(dst, &dst_st) == 0) {
+    if (fstatat(dir->dst_fd, name, &dst_st, AT_SYMLINK_NOFOLLOW) == 0) {
         if (!S_ISREG(dst_st.st_mode)) {
             fprintf(stderr, "Target exists but is not a regular file: %s\n", dst);
             return -1;
         }
         if (S_ISREG(dst_st.st_mode) && same_size_and_mtime(&src_st, &dst_st)) {
-            if (preserve_path_metadata(dst, &src_st) != 0) {
+            if (preserve_path_metadata_at(dir->dst_fd, name, dst, &src_st, S_IFREG) != 0) {
                 return -1;
             }
+            stats_add_skipped_bytes((uint64_t)src_st.st_size);
             stats_inc_files_skipped();
             return 0;
         }
@@ -124,20 +233,18 @@ static int process_file(const char *src, const char *dst)
         return -1;
     }
     stats_add_planned_copy_bytes((uint64_t)src_st.st_size);
-    if (workers_file_is_large(src_st.st_size)) return workers_enqueue_large_file(src, dst, &src_st);
-    return workers_enqueue_small_file(src, dst, &src_st);
+    if (workers_file_is_large(src_st.st_size)) {
+        return workers_enqueue_large_file(dir, name, src, dst, &src_st);
+    }
+    return workers_enqueue_small_file(dir, name, src, dst, &src_st);
 }
 
-static int push_dir_locked(const char *src, const char *dst, int depth)
+static int push_dir_locked(dir_handle_t *dir, int depth)
 {
     dir_node_t *n = calloc(1, sizeof(*n));
     if (!n) { perror("calloc"); return -1; }
 
-    if (copy_path_checked(n->src, sizeof(n->src), src, "Source") != 0 ||
-        copy_path_checked(n->dst, sizeof(n->dst), dst, "Target") != 0) {
-        free(n);
-        return -1;
-    }
+    n->dir = dir;
     n->depth = depth;
 
     if (g_dir_tail) {
@@ -152,6 +259,7 @@ static int push_dir_locked(const char *src, const char *dst, int depth)
 
 static int record_directory_for_finalize(const char *src,
                                          const char *dst,
+                                         dir_handle_t *dir,
                                          const struct stat *src_st,
                                          int depth)
 {
@@ -173,6 +281,8 @@ static int record_directory_for_finalize(const char *src,
     new_dirs = g_finalize_dirs;
     snprintf(new_dirs[g_finalize_dir_count].src, sizeof(new_dirs[g_finalize_dir_count].src), "%s", src);
     snprintf(new_dirs[g_finalize_dir_count].dst, sizeof(new_dirs[g_finalize_dir_count].dst), "%s", dst);
+    dir_handle_retain(dir);
+    new_dirs[g_finalize_dir_count].dir = dir;
     new_dirs[g_finalize_dir_count].src_st = *src_st;
     new_dirs[g_finalize_dir_count].depth = depth;
     g_finalize_dir_count++;
@@ -214,8 +324,9 @@ static void *finalize_batch_worker(void *arg)
         idx_local = ctx->next++;
         pthread_mutex_unlock(&ctx->lock);
 
-        if (preserve_path_metadata(g_finalize_dirs[idx_local].dst,
-                                   &g_finalize_dirs[idx_local].src_st) != 0) {
+        if (preserve_fd_metadata(g_finalize_dirs[idx_local].dir->dst_fd,
+                                 g_finalize_dirs[idx_local].dst,
+                                 &g_finalize_dirs[idx_local].src_st) != 0) {
             pthread_mutex_lock(&ctx->lock);
             ctx->failed = 1;
             pthread_mutex_unlock(&ctx->lock);
@@ -322,26 +433,35 @@ static void process_directory_node(dir_node_t *node)
     DIR *dir;
     struct dirent *entry;
     char src_path[PATH_MAX], dst_path[PATH_MAX];
+    int dir_stream_fd;
 
-    if (lstat(node->src, &st) != 0) {
-        perror(node->src);
+    if (fstat(node->dir->src_fd, &st) != 0) {
+        perror(node->dir->src);
+        mark_traversal_error();
+        return;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "Source is not a directory: %s\n", node->dir->src);
         mark_traversal_error();
         return;
     }
 
     stats_inc_dirs_seen();
-    if (ensure_dir_exists(node->dst, st.st_mode & 07777) != 0) {
-        mark_traversal_error();
-        return;
-    }
-    if (record_directory_for_finalize(node->src, node->dst, &st, node->depth) != 0) {
+    if (record_directory_for_finalize(node->dir->src, node->dir->dst, node->dir, &st, node->depth) != 0) {
         mark_traversal_error();
         return;
     }
 
-    dir = opendir(node->src);
+    dir_stream_fd = dup(node->dir->src_fd);
+    if (dir_stream_fd < 0) {
+        perror(node->dir->src);
+        mark_traversal_error();
+        return;
+    }
+    dir = fdopendir(dir_stream_fd);
     if (!dir) {
-        perror(node->src);
+        close(dir_stream_fd);
+        perror(node->dir->src);
         mark_traversal_error();
         return;
     }
@@ -349,13 +469,13 @@ static void process_directory_node(dir_node_t *node)
     while ((entry = readdir(dir)) != NULL) {
         if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
 
-        if (snprintf(src_path, sizeof(src_path), "%s/%s", node->src, entry->d_name) >= (int)sizeof(src_path)) {
-            fprintf(stderr, "Source path too long: %s/%s\n", node->src, entry->d_name);
+        if (snprintf(src_path, sizeof(src_path), "%s/%s", node->dir->src, entry->d_name) >= (int)sizeof(src_path)) {
+            fprintf(stderr, "Source path too long: %s/%s\n", node->dir->src, entry->d_name);
             mark_traversal_error();
             continue;
         }
-        if (snprintf(dst_path, sizeof(dst_path), "%s/%s", node->dst, entry->d_name) >= (int)sizeof(dst_path)) {
-            fprintf(stderr, "Target path too long: %s/%s\n", node->dst, entry->d_name);
+        if (snprintf(dst_path, sizeof(dst_path), "%s/%s", node->dir->dst, entry->d_name) >= (int)sizeof(dst_path)) {
+            fprintf(stderr, "Target path too long: %s/%s\n", node->dir->dst, entry->d_name);
             mark_traversal_error();
             continue;
         }
@@ -364,20 +484,45 @@ static void process_directory_node(dir_node_t *node)
             continue;
         }
 
-        if (lstat(src_path, &st) != 0) {
+        if (fstatat(node->dir->src_fd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
             perror(src_path);
             mark_traversal_error();
             continue;
         }
 
         if (S_ISDIR(st.st_mode)) {
+            int child_src_fd = open_verified_source_dir(node->dir->src_fd, entry->d_name, src_path, &st);
+            int child_dst_fd;
+            dir_handle_t *child_dir;
+
+            if (child_src_fd < 0) {
+                mark_traversal_error();
+                continue;
+            }
+            child_dst_fd = open_or_create_target_dir(node->dir->dst_fd,
+                                                     entry->d_name,
+                                                     dst_path,
+                                                     st.st_mode & 07777);
+            if (child_dst_fd < 0) {
+                close(child_src_fd);
+                mark_traversal_error();
+                continue;
+            }
+            child_dir = dir_handle_create(src_path, dst_path, child_src_fd, child_dst_fd);
+            if (!child_dir) {
+                close(child_src_fd);
+                close(child_dst_fd);
+                mark_traversal_error();
+                continue;
+            }
             pthread_mutex_lock(&g_dir_lock);
-            if (push_dir_locked(src_path, dst_path, node->depth + 1) != 0) {
+            if (push_dir_locked(child_dir, node->depth + 1) != 0) {
+                dir_handle_release(child_dir);
                 mark_traversal_error();
             }
             pthread_mutex_unlock(&g_dir_lock);
         } else if (S_ISREG(st.st_mode)) {
-            if (process_file(src_path, dst_path) != 0) {
+            if (process_file(node->dir, entry->d_name, src_path, dst_path) != 0) {
                 mark_traversal_error();
             }
         }
@@ -409,6 +554,7 @@ static void *traversal_worker_main(void *arg)
         pthread_mutex_unlock(&g_dir_lock);
 
         process_directory_node(node);
+        dir_handle_release(node->dir);
         free(node);
 
         pthread_mutex_lock(&g_dir_lock);
@@ -423,11 +569,15 @@ static void *traversal_worker_main(void *arg)
 
 int traversal_start(const char *src_dir, const char *dst_dir) {
     int i;
+    int src_root_fd = -1;
+    int dst_root_fd = -1;
+    dir_handle_t *root_dir = NULL;
 
     pthread_mutex_lock(&g_status_lock);
     g_status = 0;
     pthread_mutex_unlock(&g_status_lock);
     pthread_mutex_lock(&g_finalize_lock);
+    close_finalize_dir_records();
     free(g_finalize_dirs);
     g_finalize_dirs = NULL;
     g_finalize_dir_count = 0;
@@ -438,10 +588,29 @@ int traversal_start(const char *src_dir, const char *dst_dir) {
         return -1;
     }
 
+    src_root_fd = open(g_src_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (src_root_fd < 0) {
+        perror(g_src_root);
+        return -1;
+    }
+    dst_root_fd = open(g_dst_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (dst_root_fd < 0) {
+        perror(g_dst_root);
+        close(src_root_fd);
+        return -1;
+    }
+    root_dir = dir_handle_create(g_src_root, g_dst_root, src_root_fd, dst_root_fd);
+    if (!root_dir) {
+        close(src_root_fd);
+        close(dst_root_fd);
+        return -1;
+    }
+
     g_traversal_workers = env_int_or_default("DIRECT_COPY_TRAVERSAL_WORKERS", 8, 1, 128);
     g_threads = calloc((size_t)g_traversal_workers, sizeof(*g_threads));
     if (!g_threads) {
         perror("calloc");
+        dir_handle_release(root_dir);
         return -1;
     }
 
@@ -450,8 +619,9 @@ int traversal_start(const char *src_dir, const char *dst_dir) {
     g_dir_tail = NULL;
     g_dir_active = 0;
     g_dir_done = 0;
-    if (push_dir_locked(g_src_root, g_dst_root, 0) != 0) {
+    if (push_dir_locked(root_dir, 0) != 0) {
         pthread_mutex_unlock(&g_dir_lock);
+        dir_handle_release(root_dir);
         free(g_threads);
         g_threads = NULL;
         return -1;
@@ -489,18 +659,21 @@ void traversal_wait(void)
 
 int traversal_finalize_metadata(void)
 {
-    if (finalize_directories_parallel() != 0) {
+    int rc = finalize_directories_parallel();
+
+    if (rc != 0) {
         mark_traversal_error();
-        return -1;
+    } else {
+        stats_set_finalize_done();
     }
-    stats_set_finalize_done();
     pthread_mutex_lock(&g_finalize_lock);
+    close_finalize_dir_records();
     free(g_finalize_dirs);
     g_finalize_dirs = NULL;
     g_finalize_dir_count = 0;
     g_finalize_dir_cap = 0;
     pthread_mutex_unlock(&g_finalize_lock);
-    return 0;
+    return rc == 0 ? 0 : -1;
 }
 
 int traversal_status(void)

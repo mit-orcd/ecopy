@@ -1,6 +1,8 @@
-CC      = gcc
-CFLAGS  = -O3 -Wall -Wextra -pthread
-LDFLAGS = -pthread
+CC       ?= gcc
+CPPFLAGS ?=
+CFLAGS   ?= -O3 -Wall -Wextra -pthread
+LDFLAGS  ?= -pthread
+DEPFLAGS  = -MMD -MP
 PKG_CONFIG ?= pkg-config
 
 TARGET = ecopy
@@ -22,7 +24,7 @@ HAVE_JEMALLOC := yes
 JEMALLOC_CFLAGS := $(shell $(PKG_CONFIG) --cflags jemalloc)
 JEMALLOC_LIBS := $(shell $(PKG_CONFIG) --libs jemalloc)
 else
-JEMALLOC_CHECK := $(shell tmp=/tmp/ecopy-jemalloc-check.$$$$; printf '\043include <jemalloc/jemalloc.h>\nint main\050void\051 { return 0; }\n' | $(CC) $(CFLAGS) -x c - -o "$$tmp" -ljemalloc >/dev/null 2>&1; status=$$?; rm -f "$$tmp"; [ $$status -eq 0 ] && echo yes)
+JEMALLOC_CHECK := $(shell tmp=$$(mktemp "$${TMPDIR:-/tmp}/ecopy-jemalloc-check.XXXXXX" 2>/dev/null) || exit 0; printf '\043include <jemalloc/jemalloc.h>\nint main\050void\051 { return 0; }\n' | $(CC) $(CPPFLAGS) $(CFLAGS) -x c - -o "$$tmp" -ljemalloc >/dev/null 2>&1; status=$$?; rm -f "$$tmp"; [ $$status -eq 0 ] && echo yes)
 ifeq ($(JEMALLOC_CHECK),yes)
 HAVE_JEMALLOC := yes
 JEMALLOC_CFLAGS :=
@@ -43,6 +45,9 @@ all: $(TARGET) $(OPTIONAL_TARGETS)
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS)
 
+%.o: %.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
+
 ifeq ($(HAVE_JEMALLOC),yes)
 $(JEMALLOC_TARGET): $(OBJS)
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ $(OBJS) $(LDFLAGS) $(JEMALLOC_LIBS)
@@ -53,7 +58,7 @@ $(JEMALLOC_TARGET):
 endif
 
 clean:
-	rm -f *.o $(TARGET) $(JEMALLOC_TARGET) direct_copy
+	rm -f *.o *.d $(TARGET) $(JEMALLOC_TARGET) direct_copy
 
 test: $(TARGET)
 	@set -e; \
@@ -61,3 +66,5 @@ test: $(TARGET)
 		echo "==> $$t"; \
 		bash "$$t"; \
 	done
+
+-include $(OBJS:.o=.d)

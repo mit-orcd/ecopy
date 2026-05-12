@@ -13,6 +13,7 @@
 
 void stats_init(void);
 void stats_add_bytes(uint64_t bytes);
+void stats_add_skipped_bytes(uint64_t bytes);
 void stats_add_planned_copy_bytes(uint64_t bytes);
 void stats_set_traversal_done(void);
 void stats_set_file_work_drained(void);
@@ -39,7 +40,9 @@ void stats_add_copy_file_range_usage(uint64_t calls, uint64_t bytes, uint64_t fa
 void stats_inc_metadata_warning(void);
 void stats_inc_metadata_error(void);
 
+void stats_set_current_file(const char *path, uint64_t total, int parallel);
 void stats_advance_current_file(uint64_t bytes);
+void stats_clear_current_file(const char *path);
 
 void stats_record_speed_sample(void);
 double stats_elapsed_sec(void);

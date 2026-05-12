@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include "types.h"
 
 int workers_start(void);
 int workers_max_workers(void);
@@ -27,8 +28,16 @@ void workers_print_runtime_summary(void);
 void workers_print_startup_config(void);
 void workers_stop(void);
 int workers_status(void);
-int workers_enqueue_small_file(const char *src, const char *dst, const struct stat *src_st);
-int workers_enqueue_large_file(const char *src, const char *dst, const struct stat *src_st);
+int workers_enqueue_small_file(dir_handle_t *dir,
+                               const char *name,
+                               const char *src,
+                               const char *dst,
+                               const struct stat *src_st);
+int workers_enqueue_large_file(dir_handle_t *dir,
+                               const char *name,
+                               const char *src,
+                               const char *dst,
+                               const struct stat *src_st);
 uint64_t workers_small_queue_depth(void);
 uint64_t workers_small_active_count(void);
 uint64_t workers_large_queue_depth(void);
