@@ -30,7 +30,6 @@ typedef struct dir_node {
 typedef struct dir_record {
     char src[PATH_MAX];
     char dst[PATH_MAX];
-    dir_handle_t *dir;
     struct stat src_st;
     int depth;
 } dir_record_t;
@@ -44,8 +43,11 @@ static char g_dst_root[PATH_MAX];
 
 static pthread_mutex_t g_dir_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_dir_cond = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t g_dir_space_cond = PTHREAD_COND_INITIALIZER;
 static dir_node_t *g_dir_head = NULL;
 static dir_node_t *g_dir_tail = NULL;
+static size_t g_dir_queue_depth = 0;
+static int g_max_queued_dirs = 0;
 static int g_dir_active = 0;
 static int g_dir_done = 0;
 
@@ -53,16 +55,6 @@ static pthread_mutex_t g_finalize_lock = PTHREAD_MUTEX_INITIALIZER;
 static dir_record_t *g_finalize_dirs = NULL;
 static size_t g_finalize_dir_count = 0;
 static size_t g_finalize_dir_cap = 0;
-
-static void close_finalize_dir_records(void)
-{
-    size_t i;
-
-    for (i = 0; i < g_finalize_dir_count; i++) {
-        dir_handle_release(g_finalize_dirs[i].dir);
-        g_finalize_dirs[i].dir = NULL;
-    }
-}
 
 static int env_int_or_default(const char *name, int defval, int minval, int maxval)
 {
@@ -241,8 +233,20 @@ static int process_file(dir_handle_t *dir,
 
 static int push_dir_locked(dir_handle_t *dir, int depth)
 {
-    dir_node_t *n = calloc(1, sizeof(*n));
-    if (!n) { perror("calloc"); return -1; }
+    dir_node_t *n;
+
+    while (g_dir_queue_depth >= (size_t)g_max_queued_dirs && !g_dir_done) {
+        pthread_cond_wait(&g_dir_space_cond, &g_dir_lock);
+    }
+    if (g_dir_done) {
+        return -1;
+    }
+
+    n = calloc(1, sizeof(*n));
+    if (!n) {
+        perror("calloc");
+        return -1;
+    }
 
     n->dir = dir;
     n->depth = depth;
@@ -253,13 +257,13 @@ static int push_dir_locked(dir_handle_t *dir, int depth)
         g_dir_head = n;
     }
     g_dir_tail = n;
+    g_dir_queue_depth++;
     pthread_cond_signal(&g_dir_cond);
     return 0;
 }
 
 static int record_directory_for_finalize(const char *src,
                                          const char *dst,
-                                         dir_handle_t *dir,
                                          const struct stat *src_st,
                                          int depth)
 {
@@ -281,8 +285,6 @@ static int record_directory_for_finalize(const char *src,
     new_dirs = g_finalize_dirs;
     snprintf(new_dirs[g_finalize_dir_count].src, sizeof(new_dirs[g_finalize_dir_count].src), "%s", src);
     snprintf(new_dirs[g_finalize_dir_count].dst, sizeof(new_dirs[g_finalize_dir_count].dst), "%s", dst);
-    dir_handle_retain(dir);
-    new_dirs[g_finalize_dir_count].dir = dir;
     new_dirs[g_finalize_dir_count].src_st = *src_st;
     new_dirs[g_finalize_dir_count].depth = depth;
     g_finalize_dir_count++;
@@ -324,9 +326,8 @@ static void *finalize_batch_worker(void *arg)
         idx_local = ctx->next++;
         pthread_mutex_unlock(&ctx->lock);
 
-        if (preserve_fd_metadata(g_finalize_dirs[idx_local].dir->dst_fd,
-                                 g_finalize_dirs[idx_local].dst,
-                                 &g_finalize_dirs[idx_local].src_st) != 0) {
+        if (preserve_path_metadata(g_finalize_dirs[idx_local].dst,
+                                   &g_finalize_dirs[idx_local].src_st) != 0) {
             pthread_mutex_lock(&ctx->lock);
             ctx->failed = 1;
             pthread_mutex_unlock(&ctx->lock);
@@ -424,6 +425,10 @@ static dir_node_t *pop_dir_locked(void)
         g_dir_tail = NULL;
     }
     node->next = NULL;
+    if (g_dir_queue_depth > 0) {
+        g_dir_queue_depth--;
+    }
+    pthread_cond_broadcast(&g_dir_space_cond);
     return node;
 }
 
@@ -447,7 +452,7 @@ static void process_directory_node(dir_node_t *node)
     }
 
     stats_inc_dirs_seen();
-    if (record_directory_for_finalize(node->dir->src, node->dir->dst, node->dir, &st, node->depth) != 0) {
+    if (record_directory_for_finalize(node->dir->src, node->dir->dst, &st, node->depth) != 0) {
         mark_traversal_error();
         return;
     }
@@ -562,6 +567,7 @@ static void *traversal_worker_main(void *arg)
         if (!g_dir_head && g_dir_active == 0) {
             g_dir_done = 1;
             pthread_cond_broadcast(&g_dir_cond);
+            pthread_cond_broadcast(&g_dir_space_cond);
         }
         pthread_mutex_unlock(&g_dir_lock);
     }
@@ -577,7 +583,6 @@ int traversal_start(const char *src_dir, const char *dst_dir) {
     g_status = 0;
     pthread_mutex_unlock(&g_status_lock);
     pthread_mutex_lock(&g_finalize_lock);
-    close_finalize_dir_records();
     free(g_finalize_dirs);
     g_finalize_dirs = NULL;
     g_finalize_dir_count = 0;
@@ -607,6 +612,7 @@ int traversal_start(const char *src_dir, const char *dst_dir) {
     }
 
     g_traversal_workers = env_int_or_default("DIRECT_COPY_TRAVERSAL_WORKERS", 8, 1, 128);
+    g_max_queued_dirs = env_int_or_default("DIRECT_COPY_MAX_QUEUED_DIRS", 65536, 64, 16777216);
     g_threads = calloc((size_t)g_traversal_workers, sizeof(*g_threads));
     if (!g_threads) {
         perror("calloc");
@@ -617,6 +623,7 @@ int traversal_start(const char *src_dir, const char *dst_dir) {
     pthread_mutex_lock(&g_dir_lock);
     g_dir_head = NULL;
     g_dir_tail = NULL;
+    g_dir_queue_depth = 0;
     g_dir_active = 0;
     g_dir_done = 0;
     if (push_dir_locked(root_dir, 0) != 0) {
@@ -634,6 +641,7 @@ int traversal_start(const char *src_dir, const char *dst_dir) {
             pthread_mutex_lock(&g_dir_lock);
             g_dir_done = 1;
             pthread_cond_broadcast(&g_dir_cond);
+            pthread_cond_broadcast(&g_dir_space_cond);
             pthread_mutex_unlock(&g_dir_lock);
             while (--i >= 0) {
                 pthread_join(g_threads[i], NULL);
@@ -667,7 +675,6 @@ int traversal_finalize_metadata(void)
         stats_set_finalize_done();
     }
     pthread_mutex_lock(&g_finalize_lock);
-    close_finalize_dir_records();
     free(g_finalize_dirs);
     g_finalize_dirs = NULL;
     g_finalize_dir_count = 0;
