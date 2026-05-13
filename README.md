@@ -51,14 +51,14 @@ The source argument must name an existing directory. The source and target direc
 validates that relationship before creating a missing target root. After validation, it creates the target root when it
 is missing, then creates the matching tree beneath it.
 
-Examples:
+Examples (paths are placeholders; use your own source and target directories):
 
 ```bash
-./ecopy /orcd/datasets/001/GLM51/ /scratch/GLM51/
+./ecopy /path/to/source_tree /path/to/destination_tree
 ```
 
 ```bash
-DIRECT_COPY_DISABLE_DIRECT_IO=1 ./ecopy /orcd/datasets/001/GLM51/ /scratch/GLM51/
+DIRECT_COPY_DISABLE_DIRECT_IO=1 ./ecopy /path/to/source_tree /path/to/destination_tree
 ```
 
 ```bash
