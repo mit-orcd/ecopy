@@ -2,7 +2,6 @@ CC       ?= gcc
 CPPFLAGS ?=
 CFLAGS   ?= -O3 -Wall -Wextra -pthread
 LDFLAGS  ?= -pthread
-DEPFLAGS  = -MMD -MP
 PKG_CONFIG ?= pkg-config
 
 TARGET = ecopy
@@ -46,7 +45,7 @@ $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS)
 
 %.o: %.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
 
 ifeq ($(HAVE_JEMALLOC),yes)
 $(JEMALLOC_TARGET): $(OBJS)
@@ -58,7 +57,7 @@ $(JEMALLOC_TARGET):
 endif
 
 clean:
-	rm -f *.o *.d $(TARGET) $(JEMALLOC_TARGET) direct_copy
+	rm -f *.o $(TARGET) $(JEMALLOC_TARGET) direct_copy
 
 test: $(TARGET)
 	@set -e; \
@@ -66,5 +65,3 @@ test: $(TARGET)
 		echo "==> $$t"; \
 		bash "$$t"; \
 	done
-
--include $(OBJS:.o=.d)
