@@ -45,6 +45,11 @@ int create_temp_write_at_maybe_direct(int dir_fd,
                                       char *tmp_name,
                                       size_t tmp_name_sz,
                                       int *used_direct);
+int create_final_write_at_maybe_direct(int dir_fd,
+                                       const char *name,
+                                       const char *display_path,
+                                       mode_t mode,
+                                       int *used_direct);
 int open_temp_write_existing_at_maybe_direct(int dir_fd,
                                              const char *tmp_name,
                                              const char *display_path,

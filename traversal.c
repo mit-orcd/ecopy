@@ -22,7 +22,9 @@
 #include <fcntl.h>
 
 typedef struct dir_node {
-    dir_handle_t *dir;
+    char src[PATH_MAX];
+    char dst[PATH_MAX];
+    struct stat src_st;
     int depth;
     struct dir_node *next;
 } dir_node_t;
@@ -43,11 +45,8 @@ static char g_dst_root[PATH_MAX];
 
 static pthread_mutex_t g_dir_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_dir_cond = PTHREAD_COND_INITIALIZER;
-static pthread_cond_t g_dir_space_cond = PTHREAD_COND_INITIALIZER;
 static dir_node_t *g_dir_head = NULL;
 static dir_node_t *g_dir_tail = NULL;
-static size_t g_dir_queue_depth = 0;
-static int g_max_queued_dirs = 0;
 static int g_dir_active = 0;
 static int g_dir_done = 0;
 
@@ -128,71 +127,73 @@ static int same_source_entry(const struct stat *a, const struct stat *b)
            (a->st_mode & S_IFMT) == (b->st_mode & S_IFMT);
 }
 
-static int open_verified_source_dir(int parent_fd,
-                                    const char *name,
-                                    const char *display_path,
-                                    const struct stat *expected_st)
+/*
+ * Directory file descriptors are opened lazily, when a worker pops a directory
+ * record off the queue, rather than at discovery time. This keeps the number of
+ * open directory descriptors bounded by the number of traversal workers instead
+ * of by the (potentially enormous) queue depth, which is what previously led to
+ * "Too many open files" on directories with millions of children.
+ */
+static int open_verified_source_dir_path(const char *path,
+                                         const struct stat *expected_st)
 {
     struct stat opened_st;
-    int fd = openat(parent_fd, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) {
-        perror(display_path);
+        perror(path);
         return -1;
     }
     if (fstat(fd, &opened_st) != 0) {
         int saved_errno = errno;
         close(fd);
         errno = saved_errno;
-        perror(display_path);
+        perror(path);
         return -1;
     }
     if (!S_ISDIR(opened_st.st_mode) || !same_source_entry(expected_st, &opened_st)) {
         close(fd);
-        fprintf(stderr, "Source directory changed during traversal: %s\n", display_path);
+        fprintf(stderr, "Source directory changed during traversal: %s\n", path);
         errno = ESTALE;
         return -1;
     }
     return fd;
 }
 
-static int open_or_create_target_dir(int parent_fd,
-                                     const char *name,
-                                     const char *display_path,
-                                     mode_t mode)
+static int open_or_create_target_dir_path(const char *path, mode_t mode)
 {
     struct stat st;
     mode_t create_mode = (mode & 07777) | S_IRUSR | S_IWUSR | S_IXUSR;
     int fd;
 
-    if (fstatat(parent_fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0) {
+    if (lstat(path, &st) == 0) {
         if (!S_ISDIR(st.st_mode)) {
-            fprintf(stderr, "Target exists but is not a directory: %s\n", display_path);
+            fprintf(stderr, "Target exists but is not a directory: %s\n", path);
             errno = EEXIST;
             return -1;
         }
     } else if (errno == ENOENT) {
-        if (mkdirat(parent_fd, name, create_mode) != 0 && errno != EEXIST) {
-            perror(display_path);
+        if (mkdir(path, create_mode) != 0 && errno != EEXIST) {
+            perror(path);
             return -1;
         }
-        if (fstatat(parent_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
-            perror(display_path);
+        if (lstat(path, &st) != 0) {
+            perror(path);
             return -1;
         }
         if (!S_ISDIR(st.st_mode)) {
-            fprintf(stderr, "Target exists but is not a directory: %s\n", display_path);
+            fprintf(stderr, "Target exists but is not a directory: %s\n", path);
             errno = EEXIST;
             return -1;
         }
         stats_inc_dirs_created();
     } else {
-        perror(display_path);
+        perror(path);
         return -1;
     }
 
-    fd = openat(parent_fd, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) {
-        perror(display_path);
+        perror(path);
         return -1;
     }
     return fd;
@@ -231,24 +232,20 @@ static int process_file(dir_handle_t *dir,
     return workers_enqueue_small_file(dir, name, src, dst, &src_st);
 }
 
-static int push_dir_locked(dir_handle_t *dir, int depth)
+static int push_dir_locked(const char *src,
+                           const char *dst,
+                           const struct stat *src_st,
+                           int depth)
 {
-    dir_node_t *n;
-
-    while (g_dir_queue_depth >= (size_t)g_max_queued_dirs && !g_dir_done) {
-        pthread_cond_wait(&g_dir_space_cond, &g_dir_lock);
-    }
-    if (g_dir_done) {
-        return -1;
-    }
-
-    n = calloc(1, sizeof(*n));
+    dir_node_t *n = calloc(1, sizeof(*n));
     if (!n) {
         perror("calloc");
         return -1;
     }
 
-    n->dir = dir;
+    snprintf(n->src, sizeof(n->src), "%s", src);
+    snprintf(n->dst, sizeof(n->dst), "%s", dst);
+    n->src_st = *src_st;
     n->depth = depth;
 
     if (g_dir_tail) {
@@ -257,7 +254,6 @@ static int push_dir_locked(dir_handle_t *dir, int depth)
         g_dir_head = n;
     }
     g_dir_tail = n;
-    g_dir_queue_depth++;
     pthread_cond_signal(&g_dir_cond);
     return 0;
 }
@@ -425,10 +421,6 @@ static dir_node_t *pop_dir_locked(void)
         g_dir_tail = NULL;
     }
     node->next = NULL;
-    if (g_dir_queue_depth > 0) {
-        g_dir_queue_depth--;
-    }
-    pthread_cond_broadcast(&g_dir_space_cond);
     return node;
 }
 
@@ -438,35 +430,61 @@ static void process_directory_node(dir_node_t *node)
     DIR *dir;
     struct dirent *entry;
     char src_path[PATH_MAX], dst_path[PATH_MAX];
+    dir_handle_t *handle;
+    int src_fd;
+    int dst_fd;
     int dir_stream_fd;
 
-    if (fstat(node->dir->src_fd, &st) != 0) {
-        perror(node->dir->src);
+    /*
+     * Open the source and destination directory descriptors now, only while
+     * this directory is actually being processed. The queue itself holds no
+     * open descriptors, so a single parent with millions of subdirectories no
+     * longer keeps millions of descriptors open at once.
+     */
+    src_fd = open_verified_source_dir_path(node->src, &node->src_st);
+    if (src_fd < 0) {
         mark_traversal_error();
         return;
     }
-    if (!S_ISDIR(st.st_mode)) {
-        fprintf(stderr, "Source is not a directory: %s\n", node->dir->src);
+    if (fstat(src_fd, &st) != 0) {
+        perror(node->src);
+        close(src_fd);
+        mark_traversal_error();
+        return;
+    }
+    dst_fd = open_or_create_target_dir_path(node->dst, node->src_st.st_mode & 07777);
+    if (dst_fd < 0) {
+        close(src_fd);
+        mark_traversal_error();
+        return;
+    }
+    handle = dir_handle_create(node->src, node->dst, src_fd, dst_fd);
+    if (!handle) {
+        close(src_fd);
+        close(dst_fd);
         mark_traversal_error();
         return;
     }
 
     stats_inc_dirs_seen();
-    if (record_directory_for_finalize(node->dir->src, node->dir->dst, &st, node->depth) != 0) {
+    if (record_directory_for_finalize(node->src, node->dst, &st, node->depth) != 0) {
+        dir_handle_release(handle);
         mark_traversal_error();
         return;
     }
 
-    dir_stream_fd = dup(node->dir->src_fd);
+    dir_stream_fd = dup(handle->src_fd);
     if (dir_stream_fd < 0) {
-        perror(node->dir->src);
+        perror(node->src);
+        dir_handle_release(handle);
         mark_traversal_error();
         return;
     }
     dir = fdopendir(dir_stream_fd);
     if (!dir) {
         close(dir_stream_fd);
-        perror(node->dir->src);
+        perror(node->src);
+        dir_handle_release(handle);
         mark_traversal_error();
         return;
     }
@@ -474,13 +492,13 @@ static void process_directory_node(dir_node_t *node)
     while ((entry = readdir(dir)) != NULL) {
         if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
 
-        if (snprintf(src_path, sizeof(src_path), "%s/%s", node->dir->src, entry->d_name) >= (int)sizeof(src_path)) {
-            fprintf(stderr, "Source path too long: %s/%s\n", node->dir->src, entry->d_name);
+        if (snprintf(src_path, sizeof(src_path), "%s/%s", node->src, entry->d_name) >= (int)sizeof(src_path)) {
+            fprintf(stderr, "Source path too long: %s/%s\n", node->src, entry->d_name);
             mark_traversal_error();
             continue;
         }
-        if (snprintf(dst_path, sizeof(dst_path), "%s/%s", node->dir->dst, entry->d_name) >= (int)sizeof(dst_path)) {
-            fprintf(stderr, "Target path too long: %s/%s\n", node->dir->dst, entry->d_name);
+        if (snprintf(dst_path, sizeof(dst_path), "%s/%s", node->dst, entry->d_name) >= (int)sizeof(dst_path)) {
+            fprintf(stderr, "Target path too long: %s/%s\n", node->dst, entry->d_name);
             mark_traversal_error();
             continue;
         }
@@ -489,51 +507,27 @@ static void process_directory_node(dir_node_t *node)
             continue;
         }
 
-        if (fstatat(node->dir->src_fd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+        if (fstatat(handle->src_fd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
             perror(src_path);
             mark_traversal_error();
             continue;
         }
 
         if (S_ISDIR(st.st_mode)) {
-            int child_src_fd = open_verified_source_dir(node->dir->src_fd, entry->d_name, src_path, &st);
-            int child_dst_fd;
-            dir_handle_t *child_dir;
-
-            if (child_src_fd < 0) {
-                mark_traversal_error();
-                continue;
-            }
-            child_dst_fd = open_or_create_target_dir(node->dir->dst_fd,
-                                                     entry->d_name,
-                                                     dst_path,
-                                                     st.st_mode & 07777);
-            if (child_dst_fd < 0) {
-                close(child_src_fd);
-                mark_traversal_error();
-                continue;
-            }
-            child_dir = dir_handle_create(src_path, dst_path, child_src_fd, child_dst_fd);
-            if (!child_dir) {
-                close(child_src_fd);
-                close(child_dst_fd);
-                mark_traversal_error();
-                continue;
-            }
             pthread_mutex_lock(&g_dir_lock);
-            if (push_dir_locked(child_dir, node->depth + 1) != 0) {
-                dir_handle_release(child_dir);
+            if (push_dir_locked(src_path, dst_path, &st, node->depth + 1) != 0) {
                 mark_traversal_error();
             }
             pthread_mutex_unlock(&g_dir_lock);
         } else if (S_ISREG(st.st_mode)) {
-            if (process_file(node->dir, entry->d_name, src_path, dst_path) != 0) {
+            if (process_file(handle, entry->d_name, src_path, dst_path) != 0) {
                 mark_traversal_error();
             }
         }
     }
 
     closedir(dir);
+    dir_handle_release(handle);
 }
 
 static void *traversal_worker_main(void *arg)
@@ -559,7 +553,6 @@ static void *traversal_worker_main(void *arg)
         pthread_mutex_unlock(&g_dir_lock);
 
         process_directory_node(node);
-        dir_handle_release(node->dir);
         free(node);
 
         pthread_mutex_lock(&g_dir_lock);
@@ -567,7 +560,6 @@ static void *traversal_worker_main(void *arg)
         if (!g_dir_head && g_dir_active == 0) {
             g_dir_done = 1;
             pthread_cond_broadcast(&g_dir_cond);
-            pthread_cond_broadcast(&g_dir_space_cond);
         }
         pthread_mutex_unlock(&g_dir_lock);
     }
@@ -575,9 +567,7 @@ static void *traversal_worker_main(void *arg)
 
 int traversal_start(const char *src_dir, const char *dst_dir) {
     int i;
-    int src_root_fd = -1;
-    int dst_root_fd = -1;
-    dir_handle_t *root_dir = NULL;
+    struct stat root_st;
 
     pthread_mutex_lock(&g_status_lock);
     g_status = 0;
@@ -593,42 +583,29 @@ int traversal_start(const char *src_dir, const char *dst_dir) {
         return -1;
     }
 
-    src_root_fd = open(g_src_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (src_root_fd < 0) {
+    if (lstat(g_src_root, &root_st) != 0) {
         perror(g_src_root);
         return -1;
     }
-    dst_root_fd = open(g_dst_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (dst_root_fd < 0) {
-        perror(g_dst_root);
-        close(src_root_fd);
-        return -1;
-    }
-    root_dir = dir_handle_create(g_src_root, g_dst_root, src_root_fd, dst_root_fd);
-    if (!root_dir) {
-        close(src_root_fd);
-        close(dst_root_fd);
+    if (!S_ISDIR(root_st.st_mode)) {
+        fprintf(stderr, "Source is not a directory: %s\n", g_src_root);
         return -1;
     }
 
     g_traversal_workers = env_int_or_default("DIRECT_COPY_TRAVERSAL_WORKERS", 8, 1, 128);
-    g_max_queued_dirs = env_int_or_default("DIRECT_COPY_MAX_QUEUED_DIRS", 65536, 64, 16777216);
     g_threads = calloc((size_t)g_traversal_workers, sizeof(*g_threads));
     if (!g_threads) {
         perror("calloc");
-        dir_handle_release(root_dir);
         return -1;
     }
 
     pthread_mutex_lock(&g_dir_lock);
     g_dir_head = NULL;
     g_dir_tail = NULL;
-    g_dir_queue_depth = 0;
     g_dir_active = 0;
     g_dir_done = 0;
-    if (push_dir_locked(root_dir, 0) != 0) {
+    if (push_dir_locked(g_src_root, g_dst_root, &root_st, 0) != 0) {
         pthread_mutex_unlock(&g_dir_lock);
-        dir_handle_release(root_dir);
         free(g_threads);
         g_threads = NULL;
         return -1;
@@ -641,7 +618,6 @@ int traversal_start(const char *src_dir, const char *dst_dir) {
             pthread_mutex_lock(&g_dir_lock);
             g_dir_done = 1;
             pthread_cond_broadcast(&g_dir_cond);
-            pthread_cond_broadcast(&g_dir_space_cond);
             pthread_mutex_unlock(&g_dir_lock);
             while (--i >= 0) {
                 pthread_join(g_threads[i], NULL);

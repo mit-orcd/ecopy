@@ -18,11 +18,49 @@
 #include <limits.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #include <fcntl.h>
 
 static void usage(const char *prog) {
     fprintf(stderr, "Usage: %s [-v|--verbose] <source_dir> <target_dir>\n", prog);
+}
+
+/*
+ * Raise the open-file soft limit to the hard limit so that highly concurrent
+ * copies do not fail with "Too many open files". This is best effort: if the
+ * limit cannot be queried or raised we continue with whatever is in effect.
+ */
+static void raise_open_file_limit(int verbose) {
+    struct rlimit rl;
+
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0) {
+        if (verbose) {
+            perror("getrlimit(RLIMIT_NOFILE)");
+        }
+        return;
+    }
+
+    if (rl.rlim_max != RLIM_INFINITY && rl.rlim_cur >= rl.rlim_max) {
+        /* Already at the hard limit; nothing to raise. */
+    } else if (rl.rlim_cur != RLIM_INFINITY) {
+        struct rlimit want = rl;
+        want.rlim_cur = rl.rlim_max;
+        if (setrlimit(RLIMIT_NOFILE, &want) == 0) {
+            rl = want;
+        } else if (verbose) {
+            perror("setrlimit(RLIMIT_NOFILE)");
+        }
+    }
+
+    if (verbose) {
+        if (rl.rlim_cur == RLIM_INFINITY) {
+            printf("Open file limit (RLIMIT_NOFILE): unlimited\n");
+        } else {
+            printf("Open file limit (RLIMIT_NOFILE): %llu\n",
+                   (unsigned long long)rl.rlim_cur);
+        }
+    }
 }
 
 static int to_abs_path(const char *in, char *out, size_t out_sz) {
@@ -413,6 +451,8 @@ int main(int argc, char **argv) {
     if (ensure_destination_root(dst_abs) != 0) {
         return 1;
     }
+
+    raise_open_file_limit(verbose);
 
     stats_init();
     if (workers_start() != 0) return 1;

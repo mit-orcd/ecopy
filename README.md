@@ -99,7 +99,7 @@ Default behavior:
 - `DIRECT_COPY_LARGE_THRESHOLD_MB = 128`
 - `DIRECT_COPY_TRAVERSAL_WORKERS = 8`
 - `DIRECT_COPY_MAX_QUEUED_FILES = 262144`
-- `DIRECT_COPY_MAX_QUEUED_DIRS = 65536`
+- `DIRECT_COPY_SMALL_INPLACE = 0`
 - `DIRECT_COPY_DISABLE_DIRECT_IO = 0`
 - `DIRECT_COPY_DISABLE_READ_DIRECT_IO = 0`
 - `DIRECT_COPY_DISABLE_WRITE_DIRECT_IO = 0`
@@ -114,7 +114,8 @@ So by default:
 - each active large file can keep up to `16` chunk buffers in flight by default
 - mixed workloads use a shared total slot pool, but small-file work is capped separately so it cannot consume the entire machine by default
 - traversal is backpressured once queued file work reaches the configured cap
-- traversal is backpressured once queued directory work reaches the configured cap so a single directory with a huge number of immediate children cannot exhaust the process file-descriptor table
+- directory descriptors are opened lazily, only while a directory is actively being walked, so the number of open directory file descriptors is bounded by `DIRECT_COPY_TRAVERSAL_WORKERS` rather than by the number of pending directories; a single parent with millions of immediate children no longer exhausts the process file-descriptor table
+- at startup the tool raises its open-file soft limit (`RLIMIT_NOFILE`) to the hard limit; run with `-v` to print the effective limit
 - numeric environment values outside their accepted range are clamped with a warning; invalid values fall back to the documented default
 
 ## Copy Strategy
@@ -219,6 +220,28 @@ Default:
 Example: with the defaults, small-file work can use up to `32` slots while large-file work can still fan out over the remaining capacity.
 Values below `1` are clamped to `1`; values above `DIRECT_COPY_MAX_WORKERS` are clamped to the resolved max-worker value.
 
+### `DIRECT_COPY_SMALL_INPLACE`
+
+When unset or `0` (the default), small files are copied to a hidden temporary file that is renamed into place once the copy and metadata are complete. This makes each small-file copy crash-atomic: a reader never sees a partial file, and an interrupted run never leaves a truncated destination.
+
+When set to any non-empty value other than `0`, small files are written **directly to the final destination name** instead. This removes the per-file `rename()` (and its directory-rename lock), roughly halving the directory inode-lock operations per file.
+
+Use this when copying a very large number of small files into one (or few) destination directories, where the directory inode lock and rename serialization dominate — exactly the contention shown by `perf` as `lock_rename` / `rwsem`/`osq_lock` time. On a quota-enabled or network filesystem the win can be significant; on a fast local filesystem it is modest.
+
+Trade-offs when enabled:
+
+- Not crash-atomic: an interrupted or failed copy can leave a partially written or truncated destination file. On a clean per-file error `ecopy` removes the partial file, but a hard crash or kill can leave one behind.
+- An existing read-only destination is made owner-writable to be truncated, then restored to the source mode at the end; if the run is interrupted the mode may not be restored.
+- Symlink, FIFO, and other non-regular destinations are still rejected (the final open uses `O_NOFOLLOW` and destinations are type-checked first), so this flag does not weaken those protections.
+
+Example:
+
+```bash
+DIRECT_COPY_SMALL_INPLACE=1 ./ecopy /src /dst
+```
+
+This only affects the small-file path; large files always use the temporary-file-plus-rename pipeline.
+
 ### `DIRECT_COPY_LARGE_WORKERS`
 
 Fallback total thread count per active large file when both `DIRECT_COPY_LARGE_READERS` and `DIRECT_COPY_LARGE_WRITERS`
@@ -314,20 +337,6 @@ Default:
 Higher values may reduce tree-discovery time on large namespace-heavy workloads, but can also increase metadata-server or filesystem contention. This knob is most relevant for trees with many small files and directories.
 Values below `1` are clamped to `1`; values above `128` are clamped to `128`.
 
-### `DIRECT_COPY_MAX_QUEUED_DIRS`
-
-Maximum number of directory traversal tasks waiting in the directory queue before a worker that discovers new subdirectories blocks until other workers drain the backlog.
-
-Default:
-
-```text
-65536
-```
-
-Each queued directory task holds open source and destination directory file descriptors until it is processed, so this cap is the primary guardrail against `EMFILE` (“Too many open files”) on directories with an extremely large number of immediate subdirectories. The final directory metadata pass no longer keeps every visited directory open for the whole run; it opens each destination path only while applying metadata.
-
-Values below `64` are clamped to `64`; values above `16777216` are clamped to `16777216`.
-
 ### `DIRECT_COPY_MAX_QUEUED_FILES`
 
 Maximum number of queued regular-file tasks across the small-file and large-file queues before traversal blocks and waits for workers to drain backlog.
@@ -396,7 +405,7 @@ For NFS/RDMA or other high-throughput flash-backed paths, the best settings are 
 The current built-in defaults are already tuned toward a high-concurrency large-file profile:
 
 ```bash
-DIRECT_COPY_DISABLE_DIRECT_IO=0 DIRECT_COPY_DISABLE_READ_DIRECT_IO=0 DIRECT_COPY_DISABLE_WRITE_DIRECT_IO=0 DIRECT_COPY_DISABLE_COPY_FILE_RANGE=0 DIRECT_COPY_MAX_WORKERS=256 DIRECT_COPY_SMALL_MAX_WORKERS=32 DIRECT_COPY_LARGE_WORKERS=6 DIRECT_COPY_LARGE_READERS=4 DIRECT_COPY_LARGE_WRITERS=2 DIRECT_COPY_LARGE_FILE_INFLIGHT=16 DIRECT_COPY_CHUNK_MB=1 DIRECT_COPY_LARGE_THRESHOLD_MB=128 DIRECT_COPY_TRAVERSAL_WORKERS=8 DIRECT_COPY_MAX_QUEUED_FILES=262144 DIRECT_COPY_MAX_QUEUED_DIRS=65536 ./ecopy /src /dst
+DIRECT_COPY_DISABLE_DIRECT_IO=0 DIRECT_COPY_DISABLE_READ_DIRECT_IO=0 DIRECT_COPY_DISABLE_WRITE_DIRECT_IO=0 DIRECT_COPY_DISABLE_COPY_FILE_RANGE=0 DIRECT_COPY_MAX_WORKERS=256 DIRECT_COPY_SMALL_MAX_WORKERS=32 DIRECT_COPY_LARGE_WORKERS=6 DIRECT_COPY_LARGE_READERS=4 DIRECT_COPY_LARGE_WRITERS=2 DIRECT_COPY_LARGE_FILE_INFLIGHT=16 DIRECT_COPY_CHUNK_MB=1 DIRECT_COPY_LARGE_THRESHOLD_MB=128 DIRECT_COPY_TRAVERSAL_WORKERS=8 DIRECT_COPY_MAX_QUEUED_FILES=262144 ./ecopy /src /dst
 ```
 
 For small-file or metadata-heavy trees, try buffered I/O first. A practical starting point is:

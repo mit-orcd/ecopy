@@ -690,6 +690,95 @@ int create_temp_write_at_maybe_direct(int dir_fd,
     return -1;
 }
 
+static int open_final_created_once(int dir_fd,
+                                   const char *name,
+                                   const char *display_path,
+                                   mode_t open_mode,
+                                   int direct,
+                                   int *used_direct)
+{
+    int flags = O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK;
+    int fd;
+
+    if (direct) {
+        flags |= O_DIRECT;
+    }
+
+    fd = openat(dir_fd, name, flags, open_mode);
+    if (fd < 0 && errno == EACCES) {
+        /*
+         * An existing destination that is not owner-writable cannot be opened
+         * for truncation. Add owner write (the final mode is restored later by
+         * the metadata pass) and retry once.
+         */
+        if (fchmodat(dir_fd, name, open_mode, 0) == 0) {
+            fd = openat(dir_fd, name, flags, open_mode);
+        }
+    }
+    if (fd < 0) {
+        return -1;
+    }
+    if (validate_opened_temp_regular(fd, display_path) != 0) {
+        close(fd);
+        return -1;
+    }
+    if (fchmod(fd, open_mode) != 0) {
+        int saved_errno = errno;
+        stats_inc_metadata_error();
+        close(fd);
+        errno = saved_errno;
+        progress_interrupt();
+        perror("fchmod");
+        return -1;
+    }
+    if (used_direct) {
+        *used_direct = direct ? 1 : 0;
+    }
+    stats_record_write_open(direct ? 1 : 0);
+    return fd;
+}
+
+/*
+ * In-place variant of create_temp_write_at_maybe_direct(): opens (creating or
+ * truncating) the final destination name directly instead of a temporary file.
+ * This avoids the rename step and therefore halves the per-file directory
+ * inode-lock operations, at the cost of crash atomicity (an interrupted copy
+ * can leave a partially written destination).
+ */
+int create_final_write_at_maybe_direct(int dir_fd,
+                                       const char *name,
+                                       const char *display_path,
+                                       mode_t mode,
+                                       int *used_direct)
+{
+    mode_t open_mode = copy_data_mode(mode);
+    int fd;
+
+    if (used_direct) {
+        *used_direct = 0;
+    }
+
+    if (write_direct_io_enabled()) {
+        fd = open_final_created_once(dir_fd, name, display_path, open_mode, 1, used_direct);
+        if (fd >= 0) {
+            return fd;
+        }
+        if (!direct_io_fallback_errno(errno)) {
+            progress_interrupt();
+            perror(display_path);
+            return -1;
+        }
+    }
+
+    fd = open_final_created_once(dir_fd, name, display_path, open_mode, 0, used_direct);
+    if (fd < 0) {
+        progress_interrupt();
+        perror(display_path);
+        return -1;
+    }
+    return fd;
+}
+
 int open_temp_write_existing_at_maybe_direct(int dir_fd,
                                              const char *tmp_name,
                                              const char *display_path,

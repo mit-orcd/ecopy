@@ -103,13 +103,23 @@ static off_t g_chunk_size = 0;
 static off_t g_large_threshold = 0;
 static int g_max_queued_files = 0;
 static int g_small_worker_limit = 0;
+static int g_small_inplace = 0;
 
 #define MAX_LARGE_BUFFER_BUDGET_MB 8192
 
 /* -------------------- scheduler state -------------------- */
 
 static pthread_mutex_t g_queue_lock = PTHREAD_MUTEX_INITIALIZER;
+/*
+ * g_queue_cond wakes worker threads waiting to claim work. g_space_cond wakes
+ * producer (traversal) threads waiting for room in the bounded queue. Keeping
+ * the two predicates on separate condition variables lets us wake exactly one
+ * waiter of the right kind with pthread_cond_signal instead of broadcasting to
+ * every parked thread, which otherwise caused severe lock contention on
+ * small-file workloads (hundreds of threads waking per enqueue).
+ */
 static pthread_cond_t  g_queue_cond = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t  g_space_cond = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t  g_large_done_cond = PTHREAD_COND_INITIALIZER;
 static file_task_t    *g_small_queue_head = NULL;
 static file_task_t    *g_small_queue_tail = NULL;
@@ -293,6 +303,11 @@ static void init_runtime_config(void)
                                              1,
                                              g_worker_count);
 
+    {
+        const char *s = getenv("DIRECT_COPY_SMALL_INPLACE");
+        g_small_inplace = (s && *s && strcmp(s, "0") != 0) ? 1 : 0;
+    }
+
     if (g_explicit_large_readers > 0 && g_explicit_large_writers > 0) {
         normalize_large_pipeline_config(g_explicit_large_readers,
                                         g_explicit_large_writers);
@@ -386,6 +401,12 @@ static off_t runtime_large_threshold(void)
     return g_large_threshold;
 }
 
+static int runtime_small_inplace(void)
+{
+    init_runtime_config();
+    return g_small_inplace;
+}
+
 /* -------------------- queue helpers -------------------- */
 
 static int enqueue_task(file_task_t **head,
@@ -414,7 +435,7 @@ static int enqueue_task(file_task_t **head,
     pthread_mutex_lock(&g_queue_lock);
     while ((int)(g_small_queue_depth + g_large_queue_depth) >= g_max_queued_files) {
         uint64_t wait_start_ns = monotonic_ns();
-        pthread_cond_wait(&g_queue_cond, &g_queue_lock);
+        pthread_cond_wait(&g_space_cond, &g_queue_lock);
         stats_record_queue_wait_ns(monotonic_ns() - wait_start_ns);
     }
     if (*tail) {
@@ -424,7 +445,7 @@ static int enqueue_task(file_task_t **head,
     }
     *tail = t;
     (*depth)++;
-    pthread_cond_broadcast(&g_queue_cond);
+    pthread_cond_signal(&g_queue_cond);
     pthread_mutex_unlock(&g_queue_lock);
 
     return 0;
@@ -711,7 +732,9 @@ static int copy_file_serial_small(file_task_t *task)
     off_t bulk_end;
     off_t pos = 0;
     int rc = -1;
-    int temp_created = 0;
+    int target_created = 0;
+    int inplace = runtime_small_inplace();
+    const char *write_name;
     char tmp_name[PATH_MAX] = "";
 
     init_runtime_config();
@@ -729,16 +752,26 @@ static int copy_file_serial_small(file_task_t *task)
         goto out;
     }
 
-    fd_out = create_temp_write_at_maybe_direct(task->dir->dst_fd,
-                                               task->dst,
-                                               task->src_st.st_mode & 07777,
-                                               tmp_name,
-                                               sizeof(tmp_name),
-                                               &out_direct);
+    if (inplace) {
+        fd_out = create_final_write_at_maybe_direct(task->dir->dst_fd,
+                                                    task->name,
+                                                    task->dst,
+                                                    task->src_st.st_mode & 07777,
+                                                    &out_direct);
+        write_name = task->name;
+    } else {
+        fd_out = create_temp_write_at_maybe_direct(task->dir->dst_fd,
+                                                   task->dst,
+                                                   task->src_st.st_mode & 07777,
+                                                   tmp_name,
+                                                   sizeof(tmp_name),
+                                                   &out_direct);
+        write_name = tmp_name;
+    }
     if (fd_out < 0) {
         goto out;
     }
-    temp_created = 1;
+    target_created = 1;
 
     if (ftruncate(fd_out, size) != 0) {
         perror("ftruncate");
@@ -823,10 +856,11 @@ static int copy_file_serial_small(file_task_t *task)
             goto out;
         }
         fd_out = -1;
-        if (rename_temp_to_final_at(task->dir->dst_fd, tmp_name, task->name, task->dst) != 0) {
+        if (!inplace &&
+            rename_temp_to_final_at(task->dir->dst_fd, tmp_name, task->name, task->dst) != 0) {
             goto out;
         }
-        temp_created = 0;
+        target_created = 0;
         rc = 0;
         goto out;
     }
@@ -837,7 +871,7 @@ static int copy_file_serial_small(file_task_t *task)
     if (copy_tail_buffered_at(task->dir->src_fd,
                               task->dir->dst_fd,
                               task->name,
-                              tmp_name,
+                              write_name,
                               task->src,
                               task->dst,
                               &task->src_st,
@@ -848,16 +882,17 @@ static int copy_file_serial_small(file_task_t *task)
     }
 
     if (preserve_path_metadata_at(task->dir->dst_fd,
-                                  tmp_name,
+                                  write_name,
                                   task->dst,
                                   &task->src_st,
                                   S_IFREG) != 0) {
         goto out;
     }
-    if (rename_temp_to_final_at(task->dir->dst_fd, tmp_name, task->name, task->dst) != 0) {
+    if (!inplace &&
+        rename_temp_to_final_at(task->dir->dst_fd, tmp_name, task->name, task->dst) != 0) {
         goto out;
     }
-    temp_created = 0;
+    target_created = 0;
     rc = 0;
 
 out:
@@ -868,8 +903,13 @@ out:
     if (fd_out >= 0) {
         close(fd_out);
     }
-    if (temp_created) {
-        unlink_temp_at(task->dir->dst_fd, tmp_name);
+    if (target_created) {
+        /*
+         * Clean up the unfinished destination. For temp+rename that is the temp
+         * file; for in-place writes the final name has already been truncated,
+         * so removing the partial copy avoids leaving corrupt data behind.
+         */
+        unlink_temp_at(task->dir->dst_fd, inplace ? task->name : tmp_name);
     }
     stats_clear_current_file(task->src);
     return rc;
@@ -1304,6 +1344,7 @@ static work_claim_t dequeue_work(void)
                 g_large_queue_depth--;
             }
             g_large_workers_active++;
+            pthread_cond_signal(&g_space_cond);
             break;
         }
 
@@ -1316,6 +1357,7 @@ static work_claim_t dequeue_work(void)
                 g_small_queue_depth--;
             }
             g_small_workers_active++;
+            pthread_cond_signal(&g_space_cond);
             break;
         }
 
@@ -1360,7 +1402,19 @@ static void *worker_main(void *arg)
             if (g_small_workers_active > 0) {
                 g_small_workers_active--;
             }
-            pthread_cond_broadcast(&g_queue_cond);
+            /*
+             * A single freed slot normally only needs to wake one waiter. But
+             * once shutdown has been requested and this was the last
+             * outstanding work, every parked worker must be released so it can
+             * observe the termination condition and exit; a lone signal would
+             * leave the others blocked forever and hang workers_stop().
+             */
+            if (g_queue_done && !g_small_queue_head && !g_large_queue_head &&
+                g_small_workers_active == 0 && g_large_workers_active == 0) {
+                pthread_cond_broadcast(&g_queue_cond);
+            } else {
+                pthread_cond_signal(&g_queue_cond);
+            }
             pthread_mutex_unlock(&g_queue_lock);
             continue;
         }
@@ -1639,6 +1693,7 @@ void workers_print_startup_config(void)
     printf("  chunk size MiB              : %d\n", (int)(g_chunk_size / (1024 * 1024)));
     printf("  large file threshold MiB    : %d\n", (int)(g_large_threshold / (1024 * 1024)));
     printf("  max queued files            : %d\n", g_max_queued_files);
+    printf("  small in-place writes       : %s\n", g_small_inplace ? "yes" : "no");
     printf("  read direct_io enabled      : %s\n", read_direct_io_enabled() ? "yes" : "no");
     printf("  write direct_io enabled     : %s\n", write_direct_io_enabled() ? "yes" : "no");
     printf("  copy_file_range enabled     : %s\n", copy_file_range_enabled() ? "yes" : "no");
