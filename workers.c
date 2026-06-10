@@ -1236,9 +1236,27 @@ static int start_large_file_copy(file_task_t *task)
         goto fail;
     }
 
-    if (ftruncate(ctx->fd_out, ctx->src_st.st_size) != 0) {
-        perror("ftruncate");
-        goto fail;
+    /*
+     * Preallocate the whole file up front. ftruncate() only sets i_size and
+     * leaves a hole, so every O_DIRECT pwrite into that hole has to allocate
+     * blocks on the fly (xfs_bmapi_write -> free-space btree walk). As the
+     * filesystem fills and fragments, that per-write allocation dominates and
+     * throughput collapses late in a run. fallocate() does one large allocation
+     * (unwritten extents); subsequent writes just convert unwritten -> written,
+     * skipping the allocator. Fall back to ftruncate() if the filesystem does
+     * not support fallocate.
+     */
+    if (ctx->src_st.st_size > 0) {
+        if (fallocate(ctx->fd_out, 0, 0, ctx->src_st.st_size) != 0) {
+            if (errno != EOPNOTSUPP && errno != ENOSYS) {
+                perror("fallocate");
+                goto fail;
+            }
+            if (ftruncate(ctx->fd_out, ctx->src_st.st_size) != 0) {
+                perror("ftruncate");
+                goto fail;
+            }
+        }
     }
 
     for (i = 0; i < g_large_file_inflight; i++) {
