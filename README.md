@@ -139,7 +139,7 @@ This keeps large-file classification stable even when `DIRECT_COPY_CHUNK_MB` is 
 Large-file copy works like this:
 
 1. The source file is opened relative to its source directory and verified against traversal metadata.
-2. A hidden temporary target is created in the destination directory and pre-sized.
+2. A hidden temporary target is created in the destination directory and its blocks are preallocated up front with `fallocate()`, falling back to `ftruncate()` sizing on filesystems that do not support it.
 3. The large file is activated into its own bounded pipeline.
 4. A pool of aligned chunk buffers is preallocated up front.
 5. Reader threads use `pread()` to fill free buffers and push them into a ready-to-write queue.
@@ -149,6 +149,8 @@ Large-file copy works like this:
 9. Final metadata is restored on the temporary file before it is renamed into place.
 
 This gives a real read-buffer-write pipeline for large files, with bounded queue depth and instrumentation that tells us whether readers are waiting for buffers or writers are waiting for data.
+
+Preallocating the whole file with `fallocate()` keeps block allocation off the write path: each `pwrite()` then only converts an already-reserved extent instead of allocating blocks on the fly. On a filling, fragmenting filesystem this avoids the late-run throughput collapse that occurs when every direct write has to walk the free-space allocator.
 
 ## Buffered I/O Streaming Optimizations
 
