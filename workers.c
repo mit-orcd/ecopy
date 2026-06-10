@@ -21,8 +21,16 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/syscall.h>
 #include <limits.h>
 #include <time.h>
+
+#ifndef SEEK_DATA
+#define SEEK_DATA 3
+#endif
+#ifndef SEEK_HOLE
+#define SEEK_HOLE 4
+#endif
 
 /*
  * Runtime overrides:
@@ -125,6 +133,13 @@ static file_task_t    *g_small_queue_head = NULL;
 static file_task_t    *g_small_queue_tail = NULL;
 static file_task_t    *g_large_queue_head = NULL;
 static file_task_t    *g_large_queue_tail = NULL;
+/*
+ * Recycled file_task_t nodes. Each task carries three PATH_MAX buffers (~12 KiB)
+ * so allocating and zeroing one per file dominated small-file CPU under perf.
+ * Freed tasks are pushed here (under g_queue_lock) and reused by enqueue_task
+ * instead of going back to malloc/calloc. Drained in workers_stop().
+ */
+static file_task_t    *g_task_freelist = NULL;
 static int             g_queue_done = 0;
 static uint64_t        g_small_queue_depth = 0;
 static uint64_t        g_large_queue_depth = 0;
@@ -135,8 +150,11 @@ static int g_workers_error = 0;
 static pthread_mutex_t g_workers_error_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_explicit_large_readers = 0;
 static int g_explicit_large_writers = 0;
+/* When 0, the blocking-wait timers are skipped entirely (no clock_gettime). */
+static int g_collect_wait_timing = 0;
 
 static uint64_t monotonic_ns(void);
+static void copy_path_field(char *dst, size_t dstsz, const char *src);
 
 /* -------------------- runtime config -------------------- */
 
@@ -407,6 +425,26 @@ static int runtime_small_inplace(void)
     return g_small_inplace;
 }
 
+/*
+ * A regular file is treated as sparse when the storage actually allocated to
+ * it (st_blocks, in 512-byte units) is meaningfully smaller than its logical
+ * size. Such files are copied through the hole-skipping path so that a file
+ * which "looks" enormous (for example a multi-petabyte sparse image) only
+ * moves and allocates its real data, instead of reading and writing terabytes
+ * of zeros. A one-block slack avoids misclassifying files whose tail block is
+ * partially filled.
+ */
+int workers_file_is_sparse(const struct stat *st)
+{
+    off_t allocated;
+
+    if (!st || !S_ISREG(st->st_mode) || st->st_size <= 0) {
+        return 0;
+    }
+    allocated = (off_t)st->st_blocks * 512;
+    return allocated + (off_t)ALIGNMENT < st->st_size;
+}
+
 /* -------------------- queue helpers -------------------- */
 
 static int enqueue_task(file_task_t **head,
@@ -418,25 +456,38 @@ static int enqueue_task(file_task_t **head,
                         const char *dst,
                         const struct stat *src_st)
 {
-    file_task_t *t = (file_task_t *)calloc(1, sizeof(*t));
+    file_task_t *t;
+
+    pthread_mutex_lock(&g_queue_lock);
+    t = g_task_freelist;
+    if (t) {
+        g_task_freelist = t->next;
+    }
+    pthread_mutex_unlock(&g_queue_lock);
+
     if (!t) {
-        perror("calloc");
-        return -1;
+        t = (file_task_t *)malloc(sizeof(*t));
+        if (!t) {
+            perror("malloc");
+            return -1;
+        }
     }
 
     dir_handle_retain(dir);
     t->dir = dir;
-    snprintf(t->name, sizeof(t->name), "%s", name);
-    snprintf(t->src, sizeof(t->src), "%s", src);
-    snprintf(t->dst, sizeof(t->dst), "%s", dst);
+    copy_path_field(t->name, sizeof(t->name), name);
+    copy_path_field(t->src, sizeof(t->src), src);
+    copy_path_field(t->dst, sizeof(t->dst), dst);
     t->src_st = *src_st;
     t->next = NULL;
 
     pthread_mutex_lock(&g_queue_lock);
     while ((int)(g_small_queue_depth + g_large_queue_depth) >= g_max_queued_files) {
-        uint64_t wait_start_ns = monotonic_ns();
+        uint64_t wait_start_ns = g_collect_wait_timing ? monotonic_ns() : 0;
         pthread_cond_wait(&g_space_cond, &g_queue_lock);
-        stats_record_queue_wait_ns(monotonic_ns() - wait_start_ns);
+        if (g_collect_wait_timing) {
+            stats_record_queue_wait_ns(monotonic_ns() - wait_start_ns);
+        }
     }
     if (*tail) {
         (*tail)->next = t;
@@ -457,7 +508,11 @@ static void free_file_task(file_task_t *task)
         return;
     }
     dir_handle_release(task->dir);
-    free(task);
+    /* Recycle the node instead of freeing it; drained in workers_stop(). */
+    pthread_mutex_lock(&g_queue_lock);
+    task->next = g_task_freelist;
+    g_task_freelist = task;
+    pthread_mutex_unlock(&g_queue_lock);
 }
 
 static file_task_t *pop_file_task(file_task_t **head, file_task_t **tail)
@@ -534,6 +589,34 @@ static uint64_t monotonic_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
+/*
+ * Non-cancellable I/O wrappers. glibc's pread/pwrite/read/write are deferred
+ * cancellation points, so in a multi-threaded process they bracket every
+ * syscall with __pthread_enable_asynccancel/__pthread_disable_asynccancel. Our
+ * worker threads are never cancelled (only joined), so we issue the syscalls
+ * directly to avoid that per-syscall bookkeeping. errno is still set by the
+ * syscall() wrapper on error.
+ */
+static inline ssize_t pread_nocancel(int fd, void *buf, size_t count, off_t offset)
+{
+    return syscall(SYS_pread64, fd, buf, count, offset);
+}
+
+static inline ssize_t pwrite_nocancel(int fd, const void *buf, size_t count, off_t offset)
+{
+    return syscall(SYS_pwrite64, fd, buf, count, offset);
+}
+
+static inline ssize_t read_nocancel(int fd, void *buf, size_t count)
+{
+    return syscall(SYS_read, fd, buf, count);
+}
+
+static inline ssize_t write_nocancel(int fd, const void *buf, size_t count)
+{
+    return syscall(SYS_write, fd, buf, count);
+}
+
 static int copy_file_range_unsupported_errno_local(int err)
 {
     return err == ENOSYS ||
@@ -572,12 +655,161 @@ static void advise_source_consumed(int fd, off_t start, off_t len)
     (void)posix_fadvise(fd, start, len, POSIX_FADV_DONTNEED);
 }
 
+/*
+ * POSIX_FADV_DONTNEED on the already-copied source was issued once per chunk,
+ * which is a lot of syscalls on big files. This coalesces contiguous consumed
+ * ranges and only drops them once a sizeable span has accumulated. It is only
+ * meaningful for buffered reads; with O_DIRECT the source never enters the page
+ * cache, so callers skip it entirely.
+ */
+#define FADV_BATCH_BYTES (32 * 1024 * 1024)
+
+typedef struct {
+    int   fd;
+    off_t start;
+    off_t len;
+} fadvise_batch_t;
+
+static void fadvise_batch_init(fadvise_batch_t *b)
+{
+    b->fd = -1;
+    b->start = 0;
+    b->len = 0;
+}
+
+static void fadvise_batch_flush(fadvise_batch_t *b)
+{
+    if (b->fd >= 0 && b->len > 0) {
+        (void)posix_fadvise(b->fd, b->start, b->len, POSIX_FADV_DONTNEED);
+    }
+    b->fd = -1;
+    b->start = 0;
+    b->len = 0;
+}
+
+static void fadvise_batch_add(fadvise_batch_t *b, int fd, off_t start, off_t len)
+{
+    if (fd < 0 || len <= 0) {
+        return;
+    }
+    if (b->fd == fd && b->start + b->len == start) {
+        b->len += len;
+    } else {
+        fadvise_batch_flush(b);
+        b->fd = fd;
+        b->start = start;
+        b->len = len;
+    }
+    if (b->len >= FADV_BATCH_BYTES) {
+        fadvise_batch_flush(b);
+    }
+}
+
+/*
+ * The reader/writer/serial copy loops run the hottest per-chunk code. Timing
+ * every single read/write with clock_gettime() (and recording the ready-queue
+ * depth on every chunk) showed up as a meaningful slice of user CPU under perf.
+ * Instead we sample 1 in IO_SAMPLE_PERIOD iterations: syscall counts stay
+ * exact, while the timing and queue-depth values become unbiased estimates
+ * extrapolated by the sample period. The counter is per-thread so each worker
+ * samples independently without sharing state.
+ */
+#define IO_SAMPLE_PERIOD 16u
+
+static inline int io_should_sample(void)
+{
+    static __thread uint32_t io_sample_counter = 0;
+    return (io_sample_counter++ % IO_SAMPLE_PERIOD) == 0u;
+}
+
+/*
+ * Bounded string copy for per-file path fields. These are plain copies of
+ * NUL-terminated paths; using snprintf("%s") for them dragged in the whole
+ * vfprintf machinery, which was a visible cost on small-file trees.
+ */
+static void copy_path_field(char *dst, size_t dstsz, const char *src)
+{
+    size_t n = src ? strlen(src) : 0;
+    if (n >= dstsz) {
+        n = dstsz - 1;
+    }
+    if (n > 0) {
+        memcpy(dst, src, n);
+    }
+    dst[n] = '\0';
+}
+
+/*
+ * Reusable per-worker I/O buffer. The serial small-file path used to do an
+ * aligned posix_memalign()/free() (plus first-touch page faults) for every
+ * file; instead each worker keeps one buffer, grown on demand and reused across
+ * files. Aligned to ALIGNMENT so it is valid for the O_DIRECT bulk path too.
+ * Released per worker thread via thread_io_buffer_release().
+ */
+static __thread void  *g_tls_io_buf = NULL;
+static __thread size_t g_tls_io_cap = 0;
+
+static void *thread_io_buffer(size_t want)
+{
+    void *p = NULL;
+    if (g_tls_io_buf && g_tls_io_cap >= want) {
+        return g_tls_io_buf;
+    }
+    free(g_tls_io_buf);
+    g_tls_io_buf = NULL;
+    g_tls_io_cap = 0;
+    if (want == 0) {
+        want = ALIGNMENT;
+    }
+    if (posix_memalign(&p, ALIGNMENT, want) != 0) {
+        return NULL;
+    }
+    g_tls_io_buf = p;
+    g_tls_io_cap = want;
+    return p;
+}
+
+static void thread_io_buffer_release(void)
+{
+    free(g_tls_io_buf);
+    g_tls_io_buf = NULL;
+    g_tls_io_cap = 0;
+}
+
 static void record_progress_bytes(uint64_t bytes, int use_current_file_stats)
 {
     if (use_current_file_stats) {
         stats_advance_current_file(bytes);
     } else {
         stats_add_bytes(bytes);
+    }
+}
+
+/*
+ * The large writers all bump the same global byte counter once per chunk. Once
+ * the stats mutex was gone, that shared atomic became a cacheline that ping-pongs
+ * between every writer thread. Each writer instead accumulates locally and only
+ * folds the total into the global counter every BYTES_FLUSH_THRESHOLD (and at
+ * thread exit), trading slightly coarser live progress for far less contention.
+ */
+#define BYTES_FLUSH_THRESHOLD (16ULL * 1024 * 1024)
+
+static __thread uint64_t g_tls_pending_bytes = 0;
+
+static void progress_add_bytes_batched(uint64_t bytes)
+{
+    g_tls_pending_bytes += bytes;
+    if (g_tls_pending_bytes >= BYTES_FLUSH_THRESHOLD) {
+        stats_add_bytes(g_tls_pending_bytes);
+        g_tls_pending_bytes = 0;
+    }
+}
+
+static void progress_flush_bytes(void)
+{
+    if (g_tls_pending_bytes > 0) {
+        stats_add_bytes(g_tls_pending_bytes);
+        g_tls_pending_bytes = 0;
     }
 }
 
@@ -720,6 +952,220 @@ static int copy_tail_buffered_at(int src_dir_fd,
     return rc;
 }
 
+/*
+ * Copy a contiguous byte range [start, end) from fd_in to fd_out using
+ * positional (buffered) I/O. pread/pwrite are used so the caller can keep
+ * using lseek(SEEK_DATA/SEEK_HOLE) on fd_in without the file offset fighting
+ * the data movement.
+ */
+static int copy_byte_range_buffered(int fd_in,
+                                    int fd_out,
+                                    off_t start,
+                                    off_t end,
+                                    void *buf,
+                                    size_t bufcap)
+{
+    off_t pos = start;
+    fadvise_batch_t fadv;
+
+    fadvise_batch_init(&fadv);
+
+    while (pos < end) {
+        off_t remain = end - pos;
+        size_t len = (remain < (off_t)bufcap) ? (size_t)remain : bufcap;
+        ssize_t r;
+        size_t done = 0;
+
+        int r_timed = io_should_sample();
+        uint64_t read_start_ns = r_timed ? monotonic_ns() : 0;
+        r = pread_nocancel(fd_in, buf, len, pos);
+        stats_record_read_op();
+        if (r_timed) {
+            stats_record_read_time((monotonic_ns() - read_start_ns) * IO_SAMPLE_PERIOD);
+        }
+        if (r < 0) {
+            perror("pread");
+            return -1;
+        }
+        if (r == 0) {
+            break;
+        }
+
+        while (done < (size_t)r) {
+            int w_timed = io_should_sample();
+            uint64_t write_start_ns = w_timed ? monotonic_ns() : 0;
+            ssize_t w = pwrite_nocancel(fd_out, (char *)buf + done, (size_t)r - done, pos + (off_t)done);
+            stats_record_write_op();
+            if (w_timed) {
+                stats_record_write_time((monotonic_ns() - write_start_ns) * IO_SAMPLE_PERIOD);
+            }
+            if (w < 0) {
+                perror("pwrite");
+                return -1;
+            }
+            done += (size_t)w;
+        }
+
+        fadvise_batch_add(&fadv, fd_in, pos, r);
+        pos += r;
+        record_progress_bytes((uint64_t)r, 1);
+    }
+
+    fadvise_batch_flush(&fadv);
+    return 0;
+}
+
+/*
+ * Copy only the data regions of a sparse file, skipping holes, so the
+ * destination keeps the same sparseness and no time is spent moving zeros.
+ * Holes are discovered with lseek(SEEK_DATA/SEEK_HOLE). If the underlying
+ * filesystem does not support that interface, the remaining range is copied
+ * densely, which is still correct (holes simply read back as zeros).
+ */
+static int copy_data_extents_buffered(int fd_in,
+                                      int fd_out,
+                                      off_t size,
+                                      void *buf,
+                                      size_t bufcap)
+{
+    off_t pos = 0;
+
+    while (pos < size) {
+        off_t data = lseek(fd_in, pos, SEEK_DATA);
+        if (data < 0) {
+            if (errno == ENXIO) {
+                /* No more data before EOF; the remainder is a hole. */
+                break;
+            }
+            if (errno == EINVAL || errno == ENOTSUP || errno == EOPNOTSUPP) {
+                return copy_byte_range_buffered(fd_in, fd_out, pos, size, buf, bufcap);
+            }
+            perror("lseek SEEK_DATA");
+            return -1;
+        }
+        if (data >= size) {
+            break;
+        }
+
+        off_t hole = lseek(fd_in, data, SEEK_HOLE);
+        if (hole < 0) {
+            perror("lseek SEEK_HOLE");
+            return -1;
+        }
+        if (hole > size) {
+            hole = size;
+        }
+
+        if (copy_byte_range_buffered(fd_in, fd_out, data, hole, buf, bufcap) != 0) {
+            return -1;
+        }
+        pos = hole;
+    }
+
+    return 0;
+}
+
+/*
+ * Sparse-aware copy. Always uses buffered I/O and the temp-file-plus-rename
+ * strategy (sparse files are rare enough that crash-atomicity is worth more
+ * than the in-place fast path), copies only data extents, and ftruncate()s the
+ * destination to the exact source size so trailing holes are preserved.
+ */
+static int copy_file_sparse(file_task_t *task)
+{
+    int fd_in = -1;
+    int fd_out = -1;
+    int out_direct = 0;
+    int target_created = 0;
+    int rc = -1;
+    void *buf = NULL;
+    size_t bufcap;
+    off_t size = task->src_st.st_size;
+    char tmp_name[PATH_MAX] = "";
+
+    bufcap = (g_chunk_size > 0) ? (size_t)g_chunk_size : (size_t)(1024 * 1024);
+    stats_set_current_file(task->src, (uint64_t)size, 0);
+
+    fd_in = open_read_at_buffered(task->dir->src_fd,
+                                  task->name,
+                                  task->src,
+                                  &task->src_st);
+    if (fd_in < 0) {
+        goto out;
+    }
+
+    fd_out = create_temp_write_at_maybe_direct(task->dir->dst_fd,
+                                               task->dst,
+                                               task->src_st.st_mode & 07777,
+                                               tmp_name,
+                                               sizeof(tmp_name),
+                                               &out_direct);
+    if (fd_out < 0) {
+        goto out;
+    }
+    target_created = 1;
+
+    if (out_direct) {
+        /* Reopen the temp buffered: hole boundaries are not guaranteed to be
+         * O_DIRECT aligned, and sparse files do not need direct I/O. */
+        close(fd_out);
+        fd_out = open_temp_write_existing_at_buffered(task->dir->dst_fd, tmp_name, task->dst);
+        if (fd_out < 0) {
+            fd_out = -1;
+            goto out;
+        }
+    }
+
+    advise_source_streaming(fd_in);
+    advise_dest_streaming(fd_out);
+
+    buf = thread_io_buffer(bufcap);
+    if (!buf) {
+        fprintf(stderr, "thread_io_buffer failed\n");
+        goto out;
+    }
+
+    if (copy_data_extents_buffered(fd_in, fd_out, size, buf, bufcap) != 0) {
+        goto out;
+    }
+
+    /* Set the exact final size so a trailing hole is preserved and the file is
+     * never shorter than the source. */
+    if (ftruncate(fd_out, size) != 0) {
+        perror("ftruncate");
+        goto out;
+    }
+
+    if (finalize_copied_file_fd(fd_out, task->dst, &task->src_st) != 0) {
+        goto out;
+    }
+    if (close(fd_out) != 0) {
+        fd_out = -1;
+        perror(task->dst);
+        goto out;
+    }
+    fd_out = -1;
+
+    if (rename_temp_to_final_at(task->dir->dst_fd, tmp_name, task->name, task->dst) != 0) {
+        goto out;
+    }
+    target_created = 0;
+    rc = 0;
+
+out:
+    if (fd_in >= 0) {
+        close(fd_in);
+    }
+    if (fd_out >= 0) {
+        close(fd_out);
+    }
+    if (target_created) {
+        unlink_temp_at(task->dir->dst_fd, tmp_name);
+    }
+    stats_clear_current_file(task->src);
+    return rc;
+}
+
 static int copy_file_serial_small(file_task_t *task)
 {
     int fd_in = -1;
@@ -736,8 +1182,15 @@ static int copy_file_serial_small(file_task_t *task)
     int inplace = runtime_small_inplace();
     const char *write_name;
     char tmp_name[PATH_MAX] = "";
+    fadvise_batch_t fadv;
 
+    fadvise_batch_init(&fadv);
     init_runtime_config();
+
+    if (workers_file_is_sparse(&task->src_st)) {
+        return copy_file_sparse(task);
+    }
+
     copy_range_available = copy_file_range_enabled();
     size = task->src_st.st_size;
     bulk_end = (size / ALIGNMENT) * ALIGNMENT;
@@ -785,8 +1238,9 @@ static int copy_file_serial_small(file_task_t *task)
         advise_dest_streaming(fd_out);
     }
 
-    if (posix_memalign(&buf, ALIGNMENT, (size_t)g_chunk_size) != 0) {
-        fprintf(stderr, "posix_memalign failed\n");
+    buf = thread_io_buffer((size_t)g_chunk_size);
+    if (!buf) {
+        fprintf(stderr, "thread_io_buffer failed\n");
         goto out;
     }
 
@@ -811,9 +1265,13 @@ static int copy_file_serial_small(file_task_t *task)
         }
 
         {
-            uint64_t read_start_ns = monotonic_ns();
-            ssize_t r = read(fd_in, buf, len);
-            stats_record_read_io(monotonic_ns() - read_start_ns);
+            int r_timed = io_should_sample();
+            uint64_t read_start_ns = r_timed ? monotonic_ns() : 0;
+            ssize_t r = read_nocancel(fd_in, buf, len);
+            stats_record_read_op();
+            if (r_timed) {
+                stats_record_read_time((monotonic_ns() - read_start_ns) * IO_SAMPLE_PERIOD);
+            }
             if (r < 0) {
                 perror("read");
                 goto out;
@@ -827,9 +1285,13 @@ static int copy_file_serial_small(file_task_t *task)
         {
             size_t done = 0;
             while (done < len) {
-                uint64_t write_start_ns = monotonic_ns();
-                ssize_t w = write(fd_out, (char *)buf + done, len - done);
-                stats_record_write_io(monotonic_ns() - write_start_ns);
+                int w_timed = io_should_sample();
+                uint64_t write_start_ns = w_timed ? monotonic_ns() : 0;
+                ssize_t w = write_nocancel(fd_out, (char *)buf + done, len - done);
+                stats_record_write_op();
+                if (w_timed) {
+                    stats_record_write_time((monotonic_ns() - write_start_ns) * IO_SAMPLE_PERIOD);
+                }
                 if (w < 0) {
                     perror("write");
                     goto out;
@@ -838,10 +1300,14 @@ static int copy_file_serial_small(file_task_t *task)
             }
         }
 
-        advise_source_consumed(fd_in, pos, (off_t)len);
+        if (!in_direct) {
+            fadvise_batch_add(&fadv, fd_in, pos, (off_t)len);
+        }
         pos += this_len_off;
         record_progress_bytes((uint64_t)len, 1);
     }
+
+    fadvise_batch_flush(&fadv);
 
     if (!in_direct && !out_direct) {
         if (copy_tail_buffered_fds(fd_in, fd_out, bulk_end, size, 1) != 0) {
@@ -896,7 +1362,6 @@ static int copy_file_serial_small(file_task_t *task)
     rc = 0;
 
 out:
-    free(buf);
     if (fd_in >= 0) {
         close(fd_in);
     }
@@ -930,9 +1395,11 @@ static void *large_reader_main(void *arg)
 
         pthread_mutex_lock(&ctx->lock);
         while (!ctx->failed && !ctx->free_head && ctx->next_read_offset < ctx->bulk_end) {
-            uint64_t wait_start_ns = monotonic_ns();
+            uint64_t wait_start_ns = g_collect_wait_timing ? monotonic_ns() : 0;
             pthread_cond_wait(&ctx->free_cond, &ctx->lock);
-            stats_record_reader_buffer_wait_ns(monotonic_ns() - wait_start_ns);
+            if (g_collect_wait_timing) {
+                stats_record_reader_buffer_wait_ns(monotonic_ns() - wait_start_ns);
+            }
         }
 
         if (ctx->failed || ctx->next_read_offset >= ctx->bulk_end) {
@@ -957,9 +1424,13 @@ static void *large_reader_main(void *arg)
         pthread_mutex_unlock(&ctx->lock);
 
         {
-            uint64_t read_start_ns = monotonic_ns();
-            ssize_t r = pread(ctx->fd_in, buf->data, len, offset);
-            stats_record_read_io(monotonic_ns() - read_start_ns);
+            int timed = io_should_sample();
+            uint64_t read_start_ns = timed ? monotonic_ns() : 0;
+            ssize_t r = pread_nocancel(ctx->fd_in, buf->data, len, offset);
+            stats_record_read_op();
+            if (timed) {
+                stats_record_read_time((monotonic_ns() - read_start_ns) * IO_SAMPLE_PERIOD);
+            }
             if (r < 0) {
                 perror("pread");
                 pthread_mutex_lock(&ctx->lock);
@@ -991,7 +1462,11 @@ static void *large_reader_main(void *arg)
 
         buf->offset = offset;
         buf->len = len;
-        advise_source_consumed(ctx->fd_in, offset, (off_t)len);
+        /* With O_DIRECT the source never enters the page cache, so dropping it
+         * is a wasted syscall per chunk; only advise for buffered reads. */
+        if (!ctx->in_direct) {
+            advise_source_consumed(ctx->fd_in, offset, (off_t)len);
+        }
 
         pthread_mutex_lock(&ctx->lock);
         if (ctx->failed) {
@@ -1007,7 +1482,9 @@ static void *large_reader_main(void *arg)
         }
         enqueue_buffer(&ctx->ready_head, &ctx->ready_tail, buf);
         ctx->ready_count++;
-        stats_record_ready_queue_depth(ctx->ready_count);
+        if (io_should_sample()) {
+            stats_record_ready_queue_depth(ctx->ready_count);
+        }
         pthread_cond_signal(&ctx->ready_cond);
         pthread_mutex_unlock(&ctx->lock);
     }
@@ -1024,9 +1501,11 @@ static void *large_writer_main(void *arg)
 
         pthread_mutex_lock(&ctx->lock);
         while (!ctx->failed && !ctx->ready_head && !ctx->read_done) {
-            uint64_t wait_start_ns = monotonic_ns();
+            uint64_t wait_start_ns = g_collect_wait_timing ? monotonic_ns() : 0;
             pthread_cond_wait(&ctx->ready_cond, &ctx->lock);
-            stats_record_writer_data_wait_ns(monotonic_ns() - wait_start_ns);
+            if (g_collect_wait_timing) {
+                stats_record_writer_data_wait_ns(monotonic_ns() - wait_start_ns);
+            }
         }
 
         if ((ctx->failed && !ctx->ready_head) || (!ctx->ready_head && ctx->read_done)) {
@@ -1039,7 +1518,9 @@ static void *large_writer_main(void *arg)
         if (ctx->ready_count > 0) {
             ctx->ready_count--;
         }
-        stats_record_ready_queue_depth(ctx->ready_count);
+        if (io_should_sample()) {
+            stats_record_ready_queue_depth(ctx->ready_count);
+        }
         pthread_mutex_unlock(&ctx->lock);
 
         {
@@ -1047,12 +1528,16 @@ static void *large_writer_main(void *arg)
             int failed = 0;
 
             while (done < buf->len) {
-                uint64_t write_start_ns = monotonic_ns();
-                ssize_t w = pwrite(ctx->fd_out,
-                                   (char *)buf->data + done,
-                                   buf->len - done,
-                                   buf->offset + (off_t)done);
-                stats_record_write_io(monotonic_ns() - write_start_ns);
+                int timed = io_should_sample();
+                uint64_t write_start_ns = timed ? monotonic_ns() : 0;
+                ssize_t w = pwrite_nocancel(ctx->fd_out,
+                                            (char *)buf->data + done,
+                                            buf->len - done,
+                                            buf->offset + (off_t)done);
+                stats_record_write_op();
+                if (timed) {
+                    stats_record_write_time((monotonic_ns() - write_start_ns) * IO_SAMPLE_PERIOD);
+                }
                 if (w < 0) {
                     perror("pwrite");
                     failed = 1;
@@ -1067,11 +1552,13 @@ static void *large_writer_main(void *arg)
                 done += (size_t)w;
             }
 
+            if (!failed) {
+                progress_add_bytes_batched((uint64_t)buf->len);
+            }
+
             pthread_mutex_lock(&ctx->lock);
             if (failed) {
                 mark_large_file_failed_locked(ctx);
-            } else {
-                stats_add_bytes((uint64_t)buf->len);
             }
             enqueue_buffer(&ctx->free_head, &ctx->free_tail, buf);
             ctx->free_count++;
@@ -1084,6 +1571,7 @@ static void *large_writer_main(void *arg)
         }
     }
 
+    progress_flush_bytes();
     return NULL;
 }
 
@@ -1247,7 +1735,19 @@ static int start_large_file_copy(file_task_t *task)
      * not support fallocate.
      */
     if (ctx->src_st.st_size > 0) {
-        if (fallocate(ctx->fd_out, 0, 0, ctx->src_st.st_size) != 0) {
+        /*
+         * Sparse files never normally reach the large-file pipeline (they are
+         * routed to the serial hole-skipping path), but guard against ever
+         * fallocate()-ing the full logical size of a sparse file: a 5 PB sparse
+         * image would otherwise try to physically reserve 5 PB. For the sparse
+         * case fall back to sizing with ftruncate() only.
+         */
+        if (workers_file_is_sparse(&ctx->src_st)) {
+            if (ftruncate(ctx->fd_out, ctx->src_st.st_size) != 0) {
+                perror("ftruncate");
+                goto fail;
+            }
+        } else if (fallocate(ctx->fd_out, 0, 0, ctx->src_st.st_size) != 0) {
             if (errno != EOPNOTSUPP && errno != ENOSYS) {
                 perror("fallocate");
                 goto fail;
@@ -1385,9 +1885,11 @@ static work_claim_t dequeue_work(void)
         }
 
         {
-            uint64_t wait_start_ns = monotonic_ns();
+            uint64_t wait_start_ns = g_collect_wait_timing ? monotonic_ns() : 0;
             pthread_cond_wait(&g_queue_cond, &g_queue_lock);
-            stats_record_queue_wait_ns(monotonic_ns() - wait_start_ns);
+            if (g_collect_wait_timing) {
+                stats_record_queue_wait_ns(monotonic_ns() - wait_start_ns);
+            }
         }
     }
 
@@ -1453,10 +1955,16 @@ static void *worker_main(void *arg)
         }
     }
 
+    thread_io_buffer_release();
     return NULL;
 }
 
 /* -------------------- public API -------------------- */
+
+void workers_set_collect_wait_timing(int on)
+{
+    g_collect_wait_timing = on ? 1 : 0;
+}
 
 int workers_start(void)
 {
@@ -1513,6 +2021,12 @@ void workers_stop(void)
     while (g_large_workers_active > 0) {
         pthread_cond_wait(&g_large_done_cond, &g_queue_lock);
     }
+    /* All workers have exited; reclaim the recycled task nodes. */
+    while (g_task_freelist) {
+        file_task_t *next = g_task_freelist->next;
+        free(g_task_freelist);
+        g_task_freelist = next;
+    }
     pthread_mutex_unlock(&g_queue_lock);
 
     stats_set_file_work_drained();
@@ -1529,7 +2043,7 @@ int workers_enqueue_small_file(dir_handle_t *dir,
 {
     init_runtime_config();
 
-    if (src_st->st_size > runtime_large_threshold()) {
+    if (src_st->st_size > runtime_large_threshold() && !workers_file_is_sparse(src_st)) {
         return enqueue_task(&g_large_queue_head,
                             &g_large_queue_tail,
                             &g_large_queue_depth,
@@ -1556,6 +2070,22 @@ int workers_enqueue_large_file(dir_handle_t *dir,
                                const char *dst,
                                const struct stat *src_st)
 {
+    /*
+     * Sparse files are copied through the serial hole-skipping path regardless
+     * of their (logical) size, so route them to the small-file queue instead
+     * of spinning up a dense large-file pipeline that would read every hole.
+     */
+    if (workers_file_is_sparse(src_st)) {
+        return enqueue_task(&g_small_queue_head,
+                            &g_small_queue_tail,
+                            &g_small_queue_depth,
+                            dir,
+                            name,
+                            src,
+                            dst,
+                            src_st);
+    }
+
     return enqueue_task(&g_large_queue_head,
                         &g_large_queue_tail,
                         &g_large_queue_depth,

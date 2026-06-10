@@ -14,6 +14,13 @@
 #include "types.h"
 
 int workers_start(void);
+/*
+ * Enable collection of the blocking-wait timing counters (reader buffer waits,
+ * writer data waits, queue waits). These feed verbose-only diagnostics, and the
+ * clock_gettime() calls around every park/wake are costly under contention, so
+ * they default to off and main enables them only for verbose runs.
+ */
+void workers_set_collect_wait_timing(int on);
 int workers_max_workers(void);
 int workers_large_workers(void);
 int workers_large_file_inflight(void);
@@ -24,6 +31,7 @@ int workers_traversal_workers(void);
 int workers_max_queued_files(void);
 int workers_small_worker_limit(void);
 int workers_file_is_large(off_t size);
+int workers_file_is_sparse(const struct stat *st);
 void workers_print_runtime_summary(void);
 void workers_print_startup_config(void);
 void workers_stop(void);

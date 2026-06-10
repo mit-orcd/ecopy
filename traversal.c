@@ -113,6 +113,26 @@ static int copy_path_checked(char *dst, size_t dst_sz, const char *src, const ch
     return 0;
 }
 
+/*
+ * Join "<parent>/<name>" into out. Done by hand because this runs for every
+ * directory entry during traversal; snprintf("%s/%s") showed up as a real cost
+ * under perf. Returns 0 on success, -1 if the result would not fit.
+ */
+static int join_path(char *out, size_t out_sz, const char *parent, const char *name)
+{
+    size_t pl = strlen(parent);
+    size_t nl = strlen(name);
+
+    if (pl + 1 + nl + 1 > out_sz) {
+        return -1;
+    }
+    memcpy(out, parent, pl);
+    out[pl] = '/';
+    memcpy(out + pl + 1, name, nl);
+    out[pl + 1 + nl] = '\0';
+    return 0;
+}
+
 static void mark_traversal_error(void)
 {
     pthread_mutex_lock(&g_status_lock);
@@ -492,12 +512,12 @@ static void process_directory_node(dir_node_t *node)
     while ((entry = readdir(dir)) != NULL) {
         if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
 
-        if (snprintf(src_path, sizeof(src_path), "%s/%s", node->src, entry->d_name) >= (int)sizeof(src_path)) {
+        if (join_path(src_path, sizeof(src_path), node->src, entry->d_name) != 0) {
             fprintf(stderr, "Source path too long: %s/%s\n", node->src, entry->d_name);
             mark_traversal_error();
             continue;
         }
-        if (snprintf(dst_path, sizeof(dst_path), "%s/%s", node->dst, entry->d_name) >= (int)sizeof(dst_path)) {
+        if (join_path(dst_path, sizeof(dst_path), node->dst, entry->d_name) != 0) {
             fprintf(stderr, "Target path too long: %s/%s\n", node->dst, entry->d_name);
             mark_traversal_error();
             continue;

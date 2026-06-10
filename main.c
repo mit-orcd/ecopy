@@ -455,6 +455,7 @@ int main(int argc, char **argv) {
     raise_open_file_limit(verbose);
 
     stats_init();
+    workers_set_collect_wait_timing(verbose);
     if (workers_start() != 0) return 1;
     if (verbose) {
         workers_print_startup_config();

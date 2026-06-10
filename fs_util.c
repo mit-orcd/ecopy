@@ -34,6 +34,9 @@ static int g_read_direct_io_enabled = 1;
 static pthread_once_t g_read_direct_io_once = PTHREAD_ONCE_INIT;
 static int g_write_direct_io_enabled = 1;
 static pthread_once_t g_write_direct_io_once = PTHREAD_ONCE_INIT;
+static uid_t g_self_uid = 0;
+static gid_t g_self_gid = 0;
+static pthread_once_t g_self_id_once = PTHREAD_ONCE_INIT;
 static int g_warned_chown_permission = 0;
 static pthread_mutex_t g_warning_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_tmp_counter = 0;
@@ -97,6 +100,28 @@ void dir_handle_release(dir_handle_t *dir)
 
 static mode_t copy_data_mode(mode_t final_mode) {
     return (final_mode & 0777) | S_IRUSR | S_IWUSR;
+}
+
+static void init_self_ids(void)
+{
+    g_self_uid = geteuid();
+    g_self_gid = getegid();
+}
+
+/*
+ * True when the source is already owned by the running process's effective
+ * uid/gid. Files and directories we create are owned by exactly this identity,
+ * so re-chowning them to the same owner is a no-op SETATTR. Skipping it avoids
+ * a synchronous round-trip per file and, on NFSv4, the per-file id<->name
+ * mapping calls (nfs4_map_name_to_uid / nfs4_map_group_to_gid) that dominate
+ * small-file copies. Caveat: in a setgid parent directory a freshly created
+ * file inherits the directory's group rather than our egid; that rare case is
+ * not corrected when this returns true.
+ */
+static int owner_matches_self(const struct stat *st)
+{
+    pthread_once(&g_self_id_once, init_self_ids);
+    return st->st_uid == g_self_uid && st->st_gid == g_self_gid;
 }
 
 static int open_existing_regular_for_chmod(const char *path) {
@@ -555,22 +580,52 @@ int open_write_existing_buffered(const char *path) {
     return fd;
 }
 
+/* Append the decimal form of v to buf, returning the number of digits. buf must
+ * have room for at least 20 digits. */
+static size_t append_u64(char *buf, uint64_t v)
+{
+    char tmp[20];
+    size_t i = 0;
+    size_t j;
+
+    do {
+        tmp[i++] = (char)('0' + (v % 10u));
+        v /= 10u;
+    } while (v);
+    for (j = 0; j < i; j++) {
+        buf[j] = tmp[i - 1 - j];
+    }
+    return i;
+}
+
+/*
+ * Build ".ecopy.tmp.<pid>.<counter>" by hand. This is on the per-file hot path;
+ * snprintf() here pulled in the whole vfprintf machinery and was a visible cost
+ * on small-file trees.
+ */
 static int make_temp_name(char *tmp_name, size_t tmp_name_sz)
 {
+    static const char prefix[] = ".ecopy.tmp.";
+    const size_t prefix_len = sizeof(prefix) - 1;
     uint64_t n;
+    size_t pos = 0;
 
     pthread_mutex_lock(&g_tmp_lock);
     n = ++g_tmp_counter;
     pthread_mutex_unlock(&g_tmp_lock);
 
-    if (snprintf(tmp_name,
-                 tmp_name_sz,
-                 ".ecopy.tmp.%ld.%llu",
-                 (long)getpid(),
-                 (unsigned long long)n) >= (int)tmp_name_sz) {
+    /* Worst case: prefix + 20 pid digits + '.' + 20 counter digits + NUL. */
+    if (tmp_name_sz < prefix_len + 20 + 1 + 20 + 1) {
         errno = ENAMETOOLONG;
         return -1;
     }
+
+    memcpy(tmp_name, prefix, prefix_len);
+    pos = prefix_len;
+    pos += append_u64(tmp_name + pos, (uint64_t)(long)getpid());
+    tmp_name[pos++] = '.';
+    pos += append_u64(tmp_name + pos, n);
+    tmp_name[pos] = '\0';
     return 0;
 }
 
@@ -856,10 +911,23 @@ int same_size_and_mtime(const struct stat *a, const struct stat *b) {
            a->st_mtim.tv_nsec == b->st_mtim.tv_nsec;
 }
 
-int preserve_fd_metadata(int fd, const char *path_for_warning, const struct stat *src_st) {
+/*
+ * Apply ownership, mode and timestamps from src_st to fd.
+ *
+ * known_mode, when >= 0, is the mode the file was created with (the caller
+ * created it via copy_data_mode()); it lets us skip the fchmod() SETATTR when
+ * the create already produced the final permissions. Pass -1 when the current
+ * on-disk mode is unknown (e.g. re-opened existing files), in which case the
+ * fchmod is always issued.
+ */
+static int preserve_fd_metadata_impl(int fd,
+                                     const char *path_for_warning,
+                                     const struct stat *src_st,
+                                     int known_mode) {
     struct timespec ts[2];
 
-    if (fchown(fd, src_st->st_uid, src_st->st_gid) != 0) {
+    if (!owner_matches_self(src_st) &&
+        fchown(fd, src_st->st_uid, src_st->st_gid) != 0) {
         if (chown_permission_errno(errno)) {
             stats_inc_metadata_warning();
             pthread_mutex_lock(&g_warning_lock);
@@ -881,7 +949,8 @@ int preserve_fd_metadata(int fd, const char *path_for_warning, const struct stat
         }
     }
 
-    if (fchmod(fd, src_st->st_mode & 07777) != 0) {
+    if ((known_mode < 0 || (mode_t)known_mode != (src_st->st_mode & 07777)) &&
+        fchmod(fd, src_st->st_mode & 07777) != 0) {
         progress_interrupt();
         if (path_for_warning && *path_for_warning) {
             fprintf(stderr, "%s: ", path_for_warning);
@@ -904,6 +973,10 @@ int preserve_fd_metadata(int fd, const char *path_for_warning, const struct stat
     }
 
     return 0;
+}
+
+int preserve_fd_metadata(int fd, const char *path_for_warning, const struct stat *src_st) {
+    return preserve_fd_metadata_impl(fd, path_for_warning, src_st, -1);
 }
 
 int preserve_path_metadata(const char *dst, const struct stat *src_st) {
@@ -1018,5 +1091,11 @@ int finalize_copied_file(const char *dst, const struct stat *src_st) {
 }
 
 int finalize_copied_file_fd(int fd, const char *path_for_warning, const struct stat *src_st) {
-    return preserve_fd_metadata(fd, path_for_warning, src_st);
+    /*
+     * The destination fd was created with copy_data_mode(src mode); pass that as
+     * the known current mode so preserve can skip a redundant fchmod SETATTR
+     * when the create already produced the final permissions.
+     */
+    return preserve_fd_metadata_impl(fd, path_for_warning, src_st,
+                                     (int)copy_data_mode(src_st->st_mode));
 }

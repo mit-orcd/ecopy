@@ -24,6 +24,16 @@ void stats_record_write_open(int used_direct);
 void stats_record_queue_wait_ns(uint64_t ns);
 void stats_record_read_io(uint64_t ns);
 void stats_record_write_io(uint64_t ns);
+/*
+ * Split variants for the hot large-file path, where I/O timing is sampled:
+ * the _op functions count every syscall, while the _time functions fold in an
+ * (already extrapolated) duration only on sampled iterations. This keeps
+ * clock_gettime() off most iterations without losing the syscall count.
+ */
+void stats_record_read_op(void);
+void stats_record_write_op(void);
+void stats_record_read_time(uint64_t ns);
+void stats_record_write_time(uint64_t ns);
 void stats_record_copy_file_range_io(uint64_t ns);
 void stats_record_large_chunk_buffer_alloc(void);
 void stats_record_reader_buffer_wait_ns(uint64_t ns);
