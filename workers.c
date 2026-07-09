@@ -439,6 +439,17 @@ static int runtime_small_inplace(void)
 }
 
 /*
+ * Whether a remote copy should write straight to the final name (no temp +
+ * rename). Safe — and a round trip cheaper — when the destination root did not
+ * exist before this run: every file is brand new, so there is nothing to
+ * clobber non-atomically. Also honors the explicit DIRECT_COPY_SMALL_INPLACE.
+ */
+static int remote_inplace(void)
+{
+    return runtime_small_inplace() || !sshx_remote_root_present();
+}
+
+/*
  * A regular file is treated as sparse when the storage actually allocated to
  * it (st_blocks, in 512-byte units) is meaningfully smaller than its logical
  * size. Such files are copied through the hole-skipping path so that a file
@@ -1946,7 +1957,7 @@ static int copy_file_remote_putfile(file_task_t *task, off_t size)
     close(fd_in);
 
     if (sshx_putfile(task->dst, &task->src_st, buf, (size_t)pos,
-                     runtime_small_inplace()) != 0) {
+                     remote_inplace()) != 0) {
         return -1;
     }
     record_progress_bytes((uint64_t)pos, 1);
@@ -1997,7 +2008,7 @@ static int copy_file_remote(file_task_t *task)
     }
 
     f = sshx_file_begin(task->dst, task->src_st.st_mode & 07777, size, sparse,
-                        runtime_small_inplace());
+                        remote_inplace());
     if (!f) {
         goto out;
     }

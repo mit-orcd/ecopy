@@ -9,10 +9,12 @@
  * It executes destination filesystem operations on behalf of the client,
  * confining every path under <root> and using O_NOFOLLOW on leaf opens.
  *
- * The loop is single-threaded: frames are processed in arrival order. Data
- * frames (OPEN/WRITE/FTRUNCATE/ABORT/UNLINK) are fire-and-forget; the client
- * streams ahead into the pipe, so latency is still hidden without server-side
- * threads. Any deferred write error is reported at COMMIT.
+ * A single reader thread pulls frames in arrival order. Fire-and-forget work
+ * (PUTFILE/MKDIR) is handed to an apply pool so many latency-bound NFS RPCs run
+ * concurrently; every other frame first drains the pool, then runs inline, so
+ * ordering that matters (a directory's metadata after its files, streamed
+ * files, barriers) is preserved. Deferred errors are reported at the next
+ * BARRIER (fire-and-forget) or at COMMIT (streamed files).
  */
 
 #define _GNU_SOURCE
@@ -29,6 +31,8 @@
 #include <sys/types.h>
 #include <sys/utsname.h>
 #include <time.h>
+#include <pthread.h>
+#include <stdatomic.h>
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -51,6 +55,8 @@ static open_file_t *g_files;
 static char g_root_norm[PATH_MAX];   /* lexically normalized confinement root */
 static uint32_t g_caps;
 static int g_root_present;           /* did the confinement root exist before we ran? */
+static uid_t g_euid;                 /* our effective ids: skip no-op chown RPCs */
+static gid_t g_egid;
 
 /*
  * Deferred error log for fire-and-forget operations (PUTFILE/MKDIR/SETMETA).
@@ -60,19 +66,43 @@ static int g_root_present;           /* did the confinement root exist before we
 static uint64_t g_err_count;
 static int32_t  g_err_first;         /* negative errno of the first failure */
 static char     g_err_first_path[PATH_MAX];
+static pthread_mutex_t g_err_lock = PTHREAD_MUTEX_INITIALIZER;  /* pool workers log here */
 
 static void log_op_error(const char *path, int err)
 {
+    pthread_mutex_lock(&g_err_lock);
     if (g_err_count == 0) {
         g_err_first = -(err > 0 ? err : -err);
         snprintf(g_err_first_path, sizeof(g_err_first_path), "%s", path ? path : "");
     }
     g_err_count++;
+    pthread_mutex_unlock(&g_err_lock);
 }
 
 /* Cache the last directory we ensured exists, so a run of PUTFILEs into the
- * same directory does not re-walk mkdir -p every time. */
-static char g_last_dir[PATH_MAX];
+ * same directory does not re-walk mkdir -p every time. Thread-local so each
+ * apply-pool worker keeps its own cache without locking. */
+static __thread char g_last_dir[PATH_MAX];
+
+/*
+ * Apply pool state (worker logic lives near server_main). g_pool_n == 0 means
+ * no pool: fire-and-forget ops run inline on the reader thread as before.
+ */
+static pthread_mutex_t g_pool_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_pool_work_cv  = PTHREAD_COND_INITIALIZER; /* job available */
+static pthread_cond_t  g_pool_drain_cv = PTHREAD_COND_INITIALIZER; /* fully drained */
+static pthread_cond_t  g_pool_space_cv = PTHREAD_COND_INITIALIZER; /* room to submit */
+static int g_job_queued;     /* jobs waiting to be taken */
+static int g_job_active;     /* jobs currently being processed */
+static int g_pool_stop;
+static pthread_t *g_pool;
+static int g_pool_n;         /* 0 => no pool, run inline (single-threaded) */
+static int g_pool_limit;     /* max outstanding (queued + active) jobs */
+
+static void pool_start(int n);
+static void pool_submit(uint8_t type, uint8_t *payload, uint32_t plen);
+static void pool_drain(void);
+static void pool_shutdown(void);
 
 static open_file_t *file_find(uint64_t id)
 {
@@ -221,12 +251,26 @@ static int ensure_dir_cached(const char *dir)
     return 0;
 }
 
+/*
+ * Apply uid/gid/mode/times to an open fd, minimizing SETATTR RPCs (each of
+ * fchown/fchmod/futimens is a separate round trip on NFS):
+ *   - skip fchown when the target owner already matches ours (the file was
+ *     created by us, so it already has these ids -- a no-op RPC otherwise);
+ *   - skip fchmod when the caller created the file with the final mode already
+ *     (mode_is_set); directories and re-used temps still pass 0.
+ * futimens is always issued when we want to preserve times.
+ */
 static void apply_meta(int fd, uint32_t uid, uint32_t gid, uint32_t mode,
-                       int64_t at_s, int64_t at_ns, int64_t mt_s, int64_t mt_ns)
+                       int64_t at_s, int64_t at_ns, int64_t mt_s, int64_t mt_ns,
+                       int mode_is_set)
 {
     struct timespec ts[2];
-    (void)fchown(fd, (uid_t)uid, (gid_t)gid);   /* best effort, like local path */
-    (void)fchmod(fd, (mode_t)(mode & 07777));
+    if ((uid_t)uid != g_euid || (gid_t)gid != g_egid) {
+        (void)fchown(fd, (uid_t)uid, (gid_t)gid);   /* best effort, like local path */
+    }
+    if (!mode_is_set) {
+        (void)fchmod(fd, (mode_t)(mode & 07777));
+    }
     ts[0].tv_sec = (time_t)at_s; ts[0].tv_nsec = (long)at_ns;
     ts[1].tv_sec = (time_t)mt_s; ts[1].tv_nsec = (long)mt_ns;
     (void)futimens(fd, ts);
@@ -242,8 +286,19 @@ static int handle_hello(uint64_t id, const uint8_t *payload, uint32_t plen, cons
     char cname[128]; char cpath[PATH_MAX];
     (void)pdec_str(&d, cname, sizeof(cname));
     (void)pdec_str(&d, cpath, sizeof(cpath));
+    /* v2 appends the client's requested apply-pool size; absent -> single. */
+    uint32_t want_threads = pdec_u32(&d);
+    if (d.error) want_threads = 0;
 
     g_caps = ccaps;
+
+    /* Start the apply pool (once). Bounded so a hostile/confused peer can't ask
+     * us to spawn thousands of threads. */
+    if (g_pool_n == 0 && !g_pool) {
+        int n = (int)want_threads;
+        if (n > 256) n = 256;
+        pool_start(n);
+    }
 
     uint8_t buf[512];
     penc_t e; penc_init(&e, buf, sizeof(buf));
@@ -388,7 +443,7 @@ static int handle_commit(uint64_t id, const uint8_t *payload, uint32_t plen)
         status = -EBADF;
     } else {
         if (fsync(f->fd) != 0) status = -errno;
-        if (status == 0) apply_meta(f->fd, uid, gid, mode, at_s, at_ns, mt_s, mt_ns);
+        if (status == 0) apply_meta(f->fd, uid, gid, mode, at_s, at_ns, mt_s, mt_ns, 0);
         if (close(f->fd) != 0 && status == 0) status = -errno;
         f->fd = -1;
         if (status == 0 && !f->inplace) {
@@ -432,8 +487,14 @@ static void handle_mkdir(const uint8_t *payload, uint32_t plen)
         if (!S_ISDIR(st.st_mode)) log_op_error(path, EEXIST);
         return;
     }
-    /* keep the dir owner-writable during the copy; final mode set at finalize */
-    if (mkdir(path, (mode_t)((mode & 07777) | S_IRWXU)) != 0 && errno != EEXIST) {
+    /*
+     * MKDIRs are applied in parallel and out of order by the pool, so a nested
+     * directory can arrive before its parent. Create the whole chain (parents
+     * default, owner-writable) rather than a single component; the final mode
+     * is applied later at finalize via SETMETA.
+     */
+    (void)mode;
+    if (mkdir_p(path) != 0 && errno != EEXIST) {
         log_op_error(path, errno);
     }
 }
@@ -514,7 +575,7 @@ static void handle_setmeta(const uint8_t *payload, uint32_t plen)
         fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     }
     if (fd < 0) { log_op_error(path, errno); return; }
-    apply_meta(fd, uid, gid, mode, at_s, at_ns, mt_s, mt_ns);
+    apply_meta(fd, uid, gid, mode, at_s, at_ns, mt_s, mt_ns, 0);
     close(fd);
 }
 
@@ -549,19 +610,29 @@ static void handle_putfile(const uint8_t *payload, uint32_t plen)
     if (ensure_dir_cached(dir) != 0) { log_op_error(dir, errno); return; }
 
     int inplace = (flags & ECOPY_OPEN_INPLACE) ? 1 : 0;
+
+    /*
+     * If the owner may write (the common case: 0644/0755/...), create the file
+     * with its final mode directly so no fchmod SETATTR is needed. A newly
+     * created fd is writable regardless of the stored mode. Read-only targets
+     * (no S_IWUSR) fall back to a scratch mode + fchmod so the write succeeds.
+     * The server sets umask(0) so the create honors the mode exactly.
+     */
+    int mode_is_set = (mode & S_IWUSR) ? 1 : 0;
+    mode_t create_mode = mode_is_set ? (mode_t)(mode & 07777) : copy_data_mode((mode_t)mode);
+
     char tmp_path[PATH_MAX];
     int fd;
     if (inplace) {
         snprintf(tmp_path, sizeof(tmp_path), "%s", finalp);
-        fd = open(finalp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,
-                  copy_data_mode((mode_t)mode));
+        fd = open(finalp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, create_mode);
     } else {
-        static uint64_t put_seq;
+        static _Atomic uint64_t put_seq;
+        uint64_t seq = atomic_fetch_add(&put_seq, 1) + 1;
         int need = snprintf(tmp_path, sizeof(tmp_path), "%s/.ecopy.tmp.%u.p%llu",
-                            dir, (unsigned)getpid(), (unsigned long long)(++put_seq));
+                            dir, (unsigned)getpid(), (unsigned long long)seq);
         if (need < 0 || need >= (int)sizeof(tmp_path)) { log_op_error(finalp, ENAMETOOLONG); return; }
-        fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
-                  copy_data_mode((mode_t)mode));
+        fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, create_mode);
     }
     if (fd < 0) { log_op_error(finalp, errno); return; }
 
@@ -574,7 +645,7 @@ static void handle_putfile(const uint8_t *payload, uint32_t plen)
         done += (size_t)w;
     }
     if (err == 0) {
-        apply_meta(fd, uid, gid, mode, at_s, at_ns, mt_s, mt_ns);
+        apply_meta(fd, uid, gid, mode, at_s, at_ns, mt_s, mt_ns, mode_is_set);
     }
     if (close(fd) != 0 && err == 0) err = errno;
     if (err == 0 && !inplace) {
@@ -618,6 +689,142 @@ static void handle_unlink(const uint8_t *payload, uint32_t plen)
     (void)unlink(path);
 }
 
+/* -------------------- apply pool -------------------- */
+
+/*
+ * A pool of worker threads that apply the fire-and-forget operations (PUTFILE
+ * and MKDIR) in parallel. Over NFS every one of these blocks on synchronous
+ * RPC latency, so a single-threaded server sat ~90% idle in D-state; issuing
+ * many in flight at once hides that latency.
+ *
+ * The reader thread (server_main) only ever *submits* PUTFILE/MKDIR jobs. Any
+ * other frame (SETMETA, STAT, OPEN/WRITE/COMMIT, BARRIER, ...) first drains the
+ * pool, then runs inline, so ordering that matters is preserved:
+ *   - a directory's final SETMETA lands after its files were written;
+ *   - a streamed OPEN sees its parent directory created;
+ *   - a BARRIER's error aggregate and flush cover all prior work.
+ * PUTFILE self-creates its parent dirs and MKDIR is idempotent, so those two
+ * need no ordering relative to each other.
+ */
+typedef struct pool_job {
+    uint8_t type;
+    uint8_t *payload;
+    uint32_t plen;
+    struct pool_job *next;
+} pool_job_t;
+
+static pool_job_t *g_job_head, *g_job_tail;
+
+static void pool_run_job(pool_job_t *j)
+{
+    if (j->type == MSG_PUTFILE) {
+        handle_putfile(j->payload, j->plen);
+    } else if (j->type == MSG_MKDIR) {
+        handle_mkdir(j->payload, j->plen);
+    }
+    free(j->payload);
+    free(j);
+}
+
+static void *pool_worker(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&g_pool_lock);
+        while (!g_job_head && !g_pool_stop) {
+            pthread_cond_wait(&g_pool_work_cv, &g_pool_lock);
+        }
+        if (!g_job_head) {              /* stop requested and queue empty */
+            pthread_mutex_unlock(&g_pool_lock);
+            break;
+        }
+        pool_job_t *j = g_job_head;
+        g_job_head = j->next;
+        if (!g_job_head) g_job_tail = NULL;
+        g_job_queued--;
+        g_job_active++;
+        pthread_mutex_unlock(&g_pool_lock);
+
+        pool_run_job(j);
+
+        pthread_mutex_lock(&g_pool_lock);
+        g_job_active--;
+        pthread_cond_signal(&g_pool_space_cv);
+        if (g_job_queued == 0 && g_job_active == 0) {
+            pthread_cond_broadcast(&g_pool_drain_cv);
+        }
+        pthread_mutex_unlock(&g_pool_lock);
+    }
+    return NULL;
+}
+
+/* Hand a PUTFILE/MKDIR frame to the pool; takes ownership of payload. Blocks
+ * (back-pressuring the reader, hence the SSH channel) when too many are in
+ * flight, bounding memory to roughly g_pool_limit whole small files. */
+static void pool_submit(uint8_t type, uint8_t *payload, uint32_t plen)
+{
+    pool_job_t *j = malloc(sizeof(*j));
+    if (!j) {                           /* out of memory: just run it inline */
+        if (type == MSG_PUTFILE) handle_putfile(payload, plen);
+        else if (type == MSG_MKDIR) handle_mkdir(payload, plen);
+        free(payload);
+        return;
+    }
+    j->type = type; j->payload = payload; j->plen = plen; j->next = NULL;
+
+    pthread_mutex_lock(&g_pool_lock);
+    while (g_job_queued + g_job_active >= g_pool_limit) {
+        pthread_cond_wait(&g_pool_space_cv, &g_pool_lock);
+    }
+    if (g_job_tail) g_job_tail->next = j; else g_job_head = j;
+    g_job_tail = j;
+    g_job_queued++;
+    pthread_cond_signal(&g_pool_work_cv);
+    pthread_mutex_unlock(&g_pool_lock);
+}
+
+/* Block until every submitted job has finished. */
+static void pool_drain(void)
+{
+    pthread_mutex_lock(&g_pool_lock);
+    while (g_job_queued > 0 || g_job_active > 0) {
+        pthread_cond_wait(&g_pool_drain_cv, &g_pool_lock);
+    }
+    pthread_mutex_unlock(&g_pool_lock);
+}
+
+/* Spin up n worker threads (n <= 1 keeps the inline single-threaded path). */
+static void pool_start(int n)
+{
+    if (n <= 1) { g_pool_n = 0; return; }
+    g_pool = calloc((size_t)n, sizeof(*g_pool));
+    if (!g_pool) { g_pool_n = 0; return; }
+    g_pool_limit = n * 4;               /* outstanding whole-file cap */
+    int started = 0;
+    for (int i = 0; i < n; i++) {
+        if (pthread_create(&g_pool[i], NULL, pool_worker, NULL) == 0) started++;
+        else break;
+    }
+    g_pool_n = started;
+    if (started == 0) { free(g_pool); g_pool = NULL; }
+}
+
+static void pool_shutdown(void)
+{
+    if (g_pool_n <= 0) return;
+    pool_drain();
+    pthread_mutex_lock(&g_pool_lock);
+    g_pool_stop = 1;
+    pthread_cond_broadcast(&g_pool_work_cv);
+    pthread_mutex_unlock(&g_pool_lock);
+    for (int i = 0; i < g_pool_n; i++) {
+        pthread_join(g_pool[i], NULL);
+    }
+    free(g_pool);
+    g_pool = NULL;
+    g_pool_n = 0;
+}
+
 /* -------------------- main loop -------------------- */
 
 int server_main(const char *root)
@@ -626,6 +833,11 @@ int server_main(const char *root)
         fprintf(stderr, "ecopy --server: root must be an absolute path\n");
         return 1;
     }
+    /* Remember our identity so apply_meta can skip no-op chown RPCs, and clear
+     * the umask so O_CREAT lands the exact mode (no follow-up fchmod needed). */
+    g_euid = geteuid();
+    g_egid = getegid();
+    umask(0);
     {
         struct stat rst;
         g_root_present = (lstat(root, &rst) == 0 && S_ISDIR(rst.st_mode)) ? 1 : 0;
@@ -659,6 +871,19 @@ int server_main(const char *root)
             }
         }
 
+        /*
+         * PUTFILE/MKDIR go to the apply pool (parallel, order-independent).
+         * Everything else is an ordering/consistency point: drain the pool so
+         * all prior fire-and-forget work is on disk, then handle inline.
+         */
+        if ((type == MSG_PUTFILE || type == MSG_MKDIR) && g_pool_n > 0) {
+            pool_submit(type, payload, plen);   /* takes ownership of payload */
+            continue;
+        }
+        if (g_pool_n > 0) {
+            pool_drain();
+        }
+
         int rc = 0;
         switch (type) {
         case MSG_HELLO:     rc = handle_hello(id, payload, plen, root); break;
@@ -674,7 +899,7 @@ int server_main(const char *root)
         case MSG_SETMETA:   handle_setmeta(payload, plen); break;
         case MSG_BARRIER:   rc = handle_barrier(id, payload, plen); break;
         case MSG_UNLINK:    handle_unlink(payload, plen); break;
-        case MSG_BYE:       free(payload); return 0;
+        case MSG_BYE:       free(payload); pool_shutdown(); return 0;
         default:            break; /* ignore unknown */
         }
         free(payload);
@@ -683,6 +908,8 @@ int server_main(const char *root)
             break;
         }
     }
+
+    pool_shutdown();
 
     /* Clean up any dangling temp files from an interrupted transfer. */
     while (g_files) {

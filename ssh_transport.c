@@ -381,11 +381,23 @@ static int handshake(const char *expect_path)
     char lname[160];
     local_uname(lname, sizeof(lname));
 
+    /* How many apply threads the remote should run (hides per-op NFS RPC
+     * latency). ssh env usually does not propagate, so we pass it in HELLO. */
+    int want_threads;
+    {
+        const char *s = getenv("DIRECT_COPY_SSH_SERVER_THREADS");
+        long v = (s && *s) ? strtol(s, NULL, 10) : 0;
+        if (v <= 0) v = 16;             /* default */
+        if (v > 256) v = 256;
+        want_threads = (int)v;
+    }
+
     penc_init(&e, buf, sizeof(buf));
     penc_u32(&e, ECOPY_PROTO_VERSION);
     penc_u32(&e, ECOPY_CAP_FALLOCATE | ECOPY_CAP_SPARSE);
     penc_str(&e, lname);
     penc_str(&e, expect_path);
+    penc_u32(&e, (uint32_t)want_threads);
     if (e.overflow) return -1;
 
     if (frame_write(g_conn.in_fd, MSG_HELLO, 1, buf, (uint32_t)e.len) != 0) {
