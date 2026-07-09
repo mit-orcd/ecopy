@@ -459,27 +459,63 @@ typedef struct {
     struct stat st;
 } remote_entry_t;
 
+/*
+ * Per-directory bulk-stat scratch. These arrays are ~200 KiB (batch) + ~73 KiB
+ * (dst_st) each, so malloc/free per directory pushed glibc over its mmap
+ * threshold and cost an mmap/munmap + page faults on every one of (potentially)
+ * hundreds of thousands of directories. Instead each traversal worker keeps one
+ * lazily-allocated, reused set for its lifetime. In fresh-destination mode the
+ * stat-only arrays (names/present/dst_st) are never used, so they are not
+ * allocated at all.
+ */
+typedef struct {
+    remote_entry_t *batch;
+    const char **names;
+    int *present;
+    struct stat *dst_st;
+} remote_scratch_t;
+
+static __thread remote_scratch_t g_remote_scratch;
+
+static remote_scratch_t *remote_scratch_get(void)
+{
+    remote_scratch_t *s = &g_remote_scratch;
+
+    if (!s->batch) {
+        s->batch = malloc(sizeof(*s->batch) * REMOTE_STAT_BATCH);
+        if (!s->batch) {
+            perror("malloc");
+            return NULL;
+        }
+    }
+    if (!g_remote_fresh && !s->names) {
+        s->names = malloc(sizeof(*s->names) * REMOTE_STAT_BATCH);
+        s->present = malloc(sizeof(*s->present) * REMOTE_STAT_BATCH);
+        s->dst_st = malloc(sizeof(*s->dst_st) * REMOTE_STAT_BATCH);
+        if (!s->names || !s->present || !s->dst_st) {
+            perror("malloc");
+            return NULL;
+        }
+    }
+    return s;
+}
+
 static int remote_flush_batch(dir_handle_t *handle,
                               const dir_node_t *node,
-                              remote_entry_t *batch,
-                              int n,
-                              const char **names,
-                              int *present,
-                              struct stat *dst_st)
+                              remote_scratch_t *s,
+                              int n)
 {
+    remote_entry_t *batch = s->batch;
     int rc = 0;
 
     if (n == 0) {
         return 0;
     }
-    if (g_remote_fresh) {
-        /* Fresh destination: everything is new; no stat round trip. */
-        for (int i = 0; i < n; i++) present[i] = 0;
-    } else {
+    if (!g_remote_fresh) {
         for (int i = 0; i < n; i++) {
-            names[i] = batch[i].name;
+            s->names[i] = batch[i].name;
         }
-        if (sshx_stat_bulk(node->dst, names, n, present, dst_st) != 0) {
+        if (sshx_stat_bulk(node->dst, s->names, n, s->present, s->dst_st) != 0) {
             fprintf(stderr, "Bulk stat failed under %s\n", node->dst);
             return -1;
         }
@@ -495,13 +531,14 @@ static int remote_flush_batch(dir_handle_t *handle,
             continue;
         }
 
-        if (present[i]) {
-            if (!S_ISREG(dst_st[i].st_mode)) {
+        /* Fresh destination: everything is new; skip the existence check. */
+        if (!g_remote_fresh && s->present[i]) {
+            if (!S_ISREG(s->dst_st[i].st_mode)) {
                 fprintf(stderr, "Target exists but is not a regular file: %s\n", dst_path);
                 rc = -1;
                 continue;
             }
-            if (same_size_and_mtime(&batch[i].st, &dst_st[i])) {
+            if (same_size_and_mtime(&batch[i].st, &s->dst_st[i])) {
                 if (sshx_setmeta(dst_path, &batch[i].st, 0) != 0) {
                     rc = -1;
                     continue;
@@ -526,16 +563,12 @@ static void process_dir_entries_remote(dir_handle_t *handle,
                                        DIR *dir)
 {
     struct dirent *entry;
-    remote_entry_t *batch = malloc(sizeof(*batch) * REMOTE_STAT_BATCH);
-    const char **names = malloc(sizeof(*names) * REMOTE_STAT_BATCH);
-    int *present = malloc(sizeof(*present) * REMOTE_STAT_BATCH);
-    struct stat *dst_st = malloc(sizeof(*dst_st) * REMOTE_STAT_BATCH);
+    remote_scratch_t *s = remote_scratch_get();
     int n = 0;
 
-    if (!batch || !names || !present || !dst_st) {
-        perror("malloc");
+    if (!s) {
         mark_traversal_error();
-        goto done;
+        return;
     }
 
     while ((entry = readdir(dir)) != NULL) {
@@ -563,17 +596,17 @@ static void process_dir_entries_remote(dir_handle_t *handle,
             }
             pthread_mutex_unlock(&g_dir_lock);
         } else if (S_ISREG(st.st_mode)) {
-            if (strlen(entry->d_name) >= sizeof(batch[0].name)) {
+            if (strlen(entry->d_name) >= sizeof(s->batch[0].name)) {
                 fprintf(stderr, "Name too long: %s\n", entry->d_name);
                 mark_traversal_error();
                 continue;
             }
             stats_inc_files_seen();
-            snprintf(batch[n].name, sizeof(batch[n].name), "%s", entry->d_name);
-            batch[n].st = st;
+            snprintf(s->batch[n].name, sizeof(s->batch[n].name), "%s", entry->d_name);
+            s->batch[n].st = st;
             n++;
             if (n == REMOTE_STAT_BATCH) {
-                if (remote_flush_batch(handle, node, batch, n, names, present, dst_st) != 0) {
+                if (remote_flush_batch(handle, node, s, n) != 0) {
                     mark_traversal_error();
                 }
                 n = 0;
@@ -581,15 +614,9 @@ static void process_dir_entries_remote(dir_handle_t *handle,
         }
     }
 
-    if (remote_flush_batch(handle, node, batch, n, names, present, dst_st) != 0) {
+    if (remote_flush_batch(handle, node, s, n) != 0) {
         mark_traversal_error();
     }
-
-done:
-    free(batch);
-    free(names);
-    free(present);
-    free(dst_st);
 }
 
 static dir_node_t *pop_dir_locked(void)
