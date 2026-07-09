@@ -14,7 +14,10 @@ OBJS = \
 	stats.o \
 	progress.o \
 	fs_util.o \
-	suggestion.o
+	suggestion.o \
+	protocol.o \
+	ssh_transport.o \
+	server.o
 
 ifneq ($(MAKECMDGOALS),clean)
 JEMALLOC_PKGCONFIG := $(shell command -v $(PKG_CONFIG) >/dev/null 2>&1 && $(PKG_CONFIG) --exists jemalloc && echo yes)
@@ -37,7 +40,7 @@ ifeq ($(HAVE_JEMALLOC),yes)
 OPTIONAL_TARGETS += $(JEMALLOC_TARGET)
 endif
 
-.PHONY: all clean test
+.PHONY: all clean test protocol_test
 
 all: $(TARGET) $(OPTIONAL_TARGETS)
 
@@ -56,11 +59,16 @@ $(JEMALLOC_TARGET):
 	@false
 endif
 
-clean:
-	rm -f *.o $(TARGET) $(JEMALLOC_TARGET) direct_copy
+protocol_test: tests/protocol_test.c protocol.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tests/protocol_test.c protocol.o $(LDFLAGS)
 
-test: $(TARGET)
+clean:
+	rm -f *.o $(TARGET) $(JEMALLOC_TARGET) direct_copy protocol_test
+
+test: $(TARGET) protocol_test
 	@set -e; \
+	echo "==> protocol_test"; \
+	./protocol_test; \
 	for t in tests/*.sh; do \
 		echo "==> $$t"; \
 		bash "$$t"; \

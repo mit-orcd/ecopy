@@ -11,6 +11,7 @@
 #include "types.h"
 #include "stats.h"
 #include "fs_util.h"
+#include "ssh_transport.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -155,6 +156,7 @@ static int g_collect_wait_timing = 0;
 
 static uint64_t monotonic_ns(void);
 static void copy_path_field(char *dst, size_t dstsz, const char *src);
+static int copy_file_remote(file_task_t *task);
 
 /* -------------------- runtime config -------------------- */
 
@@ -1897,6 +1899,120 @@ static work_claim_t dequeue_work(void)
     return claim;
 }
 
+/* -------------------- remote (SSH) destination copy -------------------- */
+
+/*
+ * Stream one source file to the remote peer. Reads the source locally (O_DIRECT
+ * where possible; buffered for sparse files so SEEK_DATA/SEEK_HOLE works) and
+ * emits pipelined WRITE frames. Sparse files send only their data extents and a
+ * trailing FTRUNCATE so holes are preserved. The COMMIT is the synchronization
+ * point that reports any deferred server-side write error.
+ *
+ * Concurrency across files (many workers each streaming into the shared,
+ * pipelined channel) is what hides link latency; a single file is streamed
+ * sequentially.
+ */
+static int copy_file_remote(file_task_t *task)
+{
+    int fd_in = -1;
+    int in_direct = 0;
+    int rc = -1;
+    void *buf = NULL;
+    off_t size = task->src_st.st_size;
+    int sparse = workers_file_is_sparse(&task->src_st);
+    size_t chunk = (g_chunk_size > 0) ? (size_t)g_chunk_size : (size_t)(1024 * 1024);
+    sshx_file_t *f = NULL;
+
+    init_runtime_config();
+    stats_set_current_file(task->src, (uint64_t)size, 0);
+
+    if (sparse) {
+        fd_in = open_read_at_buffered(task->dir->src_fd, task->name, task->src, &task->src_st);
+    } else {
+        fd_in = open_read_at_maybe_direct(task->dir->src_fd, task->name, task->src,
+                                          &task->src_st, &in_direct);
+    }
+    if (fd_in < 0) {
+        goto out;
+    }
+
+    f = sshx_file_begin(task->dst, task->src_st.st_mode & 07777, size, sparse,
+                        runtime_small_inplace());
+    if (!f) {
+        goto out;
+    }
+
+    buf = thread_io_buffer(chunk);
+    if (!buf) {
+        fprintf(stderr, "thread_io_buffer failed\n");
+        goto out;
+    }
+
+    if (sparse) {
+        off_t pos = 0;
+        while (pos < size) {
+            off_t data = lseek(fd_in, pos, SEEK_DATA);
+            if (data < 0) {
+                if (errno == ENXIO) break;
+                if (errno == EINVAL || errno == ENOTSUP || errno == EOPNOTSUPP) {
+                    data = pos; /* no hole support: treat rest as data */
+                } else {
+                    perror("lseek SEEK_DATA");
+                    goto out;
+                }
+            }
+            if (data >= size) break;
+            off_t hole = lseek(fd_in, data, SEEK_HOLE);
+            if (hole < 0) { perror("lseek SEEK_HOLE"); goto out; }
+            if (hole > size) hole = size;
+
+            off_t p = data;
+            while (p < hole) {
+                off_t remain = hole - p;
+                size_t want = (remain < (off_t)chunk) ? (size_t)remain : chunk;
+                ssize_t r = pread_nocancel(fd_in, buf, want, p);
+                if (r < 0) { perror("pread"); goto out; }
+                if (r == 0) break;
+                if (sshx_file_write(f, buf, (size_t)r, p) != 0) goto out;
+                p += r;
+                record_progress_bytes((uint64_t)r, 1);
+            }
+            pos = hole;
+        }
+        if (sshx_file_ftruncate(f, size) != 0) {
+            goto out;
+        }
+    } else {
+        off_t pos = 0;
+        while (pos < size) {
+            /* Chunk-aligned count keeps O_DIRECT reads valid up to EOF. */
+            ssize_t r = pread_nocancel(fd_in, buf, chunk, pos);
+            if (r < 0) { perror("pread"); goto out; }
+            if (r == 0) break;
+            if (sshx_file_write(f, buf, (size_t)r, pos) != 0) goto out;
+            pos += r;
+            record_progress_bytes((uint64_t)r, 1);
+        }
+    }
+
+    if (sshx_file_commit(f, &task->src_st) != 0) {
+        f = NULL; /* commit frees the handle even on failure */
+        goto out;
+    }
+    f = NULL;
+    rc = 0;
+
+out:
+    if (f) {
+        sshx_file_abort(f);
+    }
+    if (fd_in >= 0) {
+        close(fd_in);
+    }
+    stats_clear_current_file(task->src);
+    return rc;
+}
+
 /* -------------------- worker threads -------------------- */
 
 static void *worker_main(void *arg)
@@ -1910,7 +2026,10 @@ static void *worker_main(void *arg)
         }
 
         if (claim.kind == WORK_SMALL_FILE) {
-            if (copy_file_serial_small(claim.file_task) == 0) {
+            int ok = sshx_active()
+                         ? (copy_file_remote(claim.file_task) == 0)
+                         : (copy_file_serial_small(claim.file_task) == 0);
+            if (ok) {
                 stats_inc_files_copied();
             } else {
                 mark_worker_error();
@@ -2043,7 +2162,15 @@ int workers_enqueue_small_file(dir_handle_t *dir,
 {
     init_runtime_config();
 
-    if (src_st->st_size > runtime_large_threshold() && !workers_file_is_sparse(src_st)) {
+    /*
+     * Remote destinations do not use the local large-file pipeline (its
+     * O_DIRECT/pwrite writer is meaningless across the wire); every file is
+     * streamed through the remote copy path, so keep them all on the small
+     * queue. Multi-file concurrency over the pipelined channel provides the
+     * throughput instead.
+     */
+    if (!sshx_active() &&
+        src_st->st_size > runtime_large_threshold() && !workers_file_is_sparse(src_st)) {
         return enqueue_task(&g_large_queue_head,
                             &g_large_queue_tail,
                             &g_large_queue_depth,
@@ -2075,7 +2202,7 @@ int workers_enqueue_large_file(dir_handle_t *dir,
      * of their (logical) size, so route them to the small-file queue instead
      * of spinning up a dense large-file pipeline that would read every hole.
      */
-    if (workers_file_is_sparse(src_st)) {
+    if (sshx_active() || workers_file_is_sparse(src_st)) {
         return enqueue_task(&g_small_queue_head,
                             &g_small_queue_tail,
                             &g_small_queue_depth,

@@ -10,6 +10,7 @@
 #include "stats.h"
 #include "fs_util.h"
 #include "workers.h"
+#include "ssh_transport.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -342,8 +343,15 @@ static void *finalize_batch_worker(void *arg)
         idx_local = ctx->next++;
         pthread_mutex_unlock(&ctx->lock);
 
-        if (preserve_path_metadata(g_finalize_dirs[idx_local].dst,
-                                   &g_finalize_dirs[idx_local].src_st) != 0) {
+        int frc;
+        if (sshx_active()) {
+            frc = sshx_setmeta(g_finalize_dirs[idx_local].dst,
+                               &g_finalize_dirs[idx_local].src_st, 1);
+        } else {
+            frc = preserve_path_metadata(g_finalize_dirs[idx_local].dst,
+                                         &g_finalize_dirs[idx_local].src_st);
+        }
+        if (frc != 0) {
             pthread_mutex_lock(&ctx->lock);
             ctx->failed = 1;
             pthread_mutex_unlock(&ctx->lock);
@@ -430,6 +438,147 @@ static int finalize_directories_parallel(void)
     return 0;
 }
 
+/*
+ * Remote destination: process one directory's entries with batched bulk STAT.
+ * Regular files are gathered in chunks and their destination stats fetched in a
+ * single round-trip (the main small-file latency killer), then skip/enqueue
+ * decisions are made locally. Subdirectories are queued immediately.
+ */
+#define REMOTE_STAT_BATCH 512
+
+typedef struct {
+    char name[256];
+    struct stat st;
+} remote_entry_t;
+
+static int remote_flush_batch(dir_handle_t *handle,
+                              const dir_node_t *node,
+                              remote_entry_t *batch,
+                              int n,
+                              const char **names,
+                              int *present,
+                              struct stat *dst_st)
+{
+    int rc = 0;
+
+    if (n == 0) {
+        return 0;
+    }
+    for (int i = 0; i < n; i++) {
+        names[i] = batch[i].name;
+    }
+    if (sshx_stat_bulk(node->dst, names, n, present, dst_st) != 0) {
+        fprintf(stderr, "Bulk stat failed under %s\n", node->dst);
+        return -1;
+    }
+
+    for (int i = 0; i < n; i++) {
+        char src_path[PATH_MAX], dst_path[PATH_MAX];
+
+        if (join_path(src_path, sizeof(src_path), node->src, batch[i].name) != 0 ||
+            join_path(dst_path, sizeof(dst_path), node->dst, batch[i].name) != 0) {
+            fprintf(stderr, "Path too long under %s\n", node->src);
+            rc = -1;
+            continue;
+        }
+
+        if (present[i]) {
+            if (!S_ISREG(dst_st[i].st_mode)) {
+                fprintf(stderr, "Target exists but is not a regular file: %s\n", dst_path);
+                rc = -1;
+                continue;
+            }
+            if (same_size_and_mtime(&batch[i].st, &dst_st[i])) {
+                if (sshx_setmeta(dst_path, &batch[i].st, 0) != 0) {
+                    rc = -1;
+                    continue;
+                }
+                stats_add_skipped_bytes((uint64_t)batch[i].st.st_size);
+                stats_inc_files_skipped();
+                continue;
+            }
+        }
+
+        stats_add_planned_copy_bytes((uint64_t)batch[i].st.st_size);
+        if (workers_enqueue_small_file(handle, batch[i].name, src_path, dst_path,
+                                       &batch[i].st) != 0) {
+            rc = -1;
+        }
+    }
+    return rc;
+}
+
+static void process_dir_entries_remote(dir_handle_t *handle,
+                                       const dir_node_t *node,
+                                       DIR *dir)
+{
+    struct dirent *entry;
+    remote_entry_t *batch = malloc(sizeof(*batch) * REMOTE_STAT_BATCH);
+    const char **names = malloc(sizeof(*names) * REMOTE_STAT_BATCH);
+    int *present = malloc(sizeof(*present) * REMOTE_STAT_BATCH);
+    struct stat *dst_st = malloc(sizeof(*dst_st) * REMOTE_STAT_BATCH);
+    int n = 0;
+
+    if (!batch || !names || !present || !dst_st) {
+        perror("malloc");
+        mark_traversal_error();
+        goto done;
+    }
+
+    while ((entry = readdir(dir)) != NULL) {
+        struct stat st;
+        char src_path[PATH_MAX], dst_path[PATH_MAX];
+
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+
+        if (fstatat(handle->src_fd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+            perror(entry->d_name);
+            mark_traversal_error();
+            continue;
+        }
+
+        if (S_ISDIR(st.st_mode)) {
+            if (join_path(src_path, sizeof(src_path), node->src, entry->d_name) != 0 ||
+                join_path(dst_path, sizeof(dst_path), node->dst, entry->d_name) != 0) {
+                fprintf(stderr, "Path too long under %s\n", node->src);
+                mark_traversal_error();
+                continue;
+            }
+            pthread_mutex_lock(&g_dir_lock);
+            if (push_dir_locked(src_path, dst_path, &st, node->depth + 1) != 0) {
+                mark_traversal_error();
+            }
+            pthread_mutex_unlock(&g_dir_lock);
+        } else if (S_ISREG(st.st_mode)) {
+            if (strlen(entry->d_name) >= sizeof(batch[0].name)) {
+                fprintf(stderr, "Name too long: %s\n", entry->d_name);
+                mark_traversal_error();
+                continue;
+            }
+            stats_inc_files_seen();
+            snprintf(batch[n].name, sizeof(batch[n].name), "%s", entry->d_name);
+            batch[n].st = st;
+            n++;
+            if (n == REMOTE_STAT_BATCH) {
+                if (remote_flush_batch(handle, node, batch, n, names, present, dst_st) != 0) {
+                    mark_traversal_error();
+                }
+                n = 0;
+            }
+        }
+    }
+
+    if (remote_flush_batch(handle, node, batch, n, names, present, dst_st) != 0) {
+        mark_traversal_error();
+    }
+
+done:
+    free(batch);
+    free(names);
+    free(present);
+    free(dst_st);
+}
+
 static dir_node_t *pop_dir_locked(void)
 {
     dir_node_t *node = g_dir_head;
@@ -472,11 +621,24 @@ static void process_directory_node(dir_node_t *node)
         mark_traversal_error();
         return;
     }
-    dst_fd = open_or_create_target_dir_path(node->dst, node->src_st.st_mode & 07777);
-    if (dst_fd < 0) {
-        close(src_fd);
-        mark_traversal_error();
-        return;
+    if (sshx_active()) {
+        /* Remote destination: create the directory over the protocol; there is
+         * no local destination fd. */
+        if (sshx_mkdir(node->dst, node->src_st.st_mode & 07777) != 0) {
+            perror(node->dst);
+            close(src_fd);
+            mark_traversal_error();
+            return;
+        }
+        stats_inc_dirs_created();
+        dst_fd = -1;
+    } else {
+        dst_fd = open_or_create_target_dir_path(node->dst, node->src_st.st_mode & 07777);
+        if (dst_fd < 0) {
+            close(src_fd);
+            mark_traversal_error();
+            return;
+        }
     }
     handle = dir_handle_create(node->src, node->dst, src_fd, dst_fd);
     if (!handle) {
@@ -506,6 +668,13 @@ static void process_directory_node(dir_node_t *node)
         perror(node->src);
         dir_handle_release(handle);
         mark_traversal_error();
+        return;
+    }
+
+    if (sshx_active()) {
+        process_dir_entries_remote(handle, node, dir);
+        closedir(dir);
+        dir_handle_release(handle);
         return;
     }
 

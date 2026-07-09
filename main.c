@@ -11,6 +11,8 @@
 #include "workers.h"
 #include "traversal.h"
 #include "suggestion.h"
+#include "ssh_transport.h"
+#include "server.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,7 +25,10 @@
 #include <fcntl.h>
 
 static void usage(const char *prog) {
-    fprintf(stderr, "Usage: %s [-v|--verbose] <source_dir> <target_dir>\n", prog);
+    fprintf(stderr,
+            "Usage: %s [-v|--verbose] <source_dir> <target_dir>\n"
+            "       <target_dir> may be a local path or ssh://[user@]host[:port]/path\n",
+            prog);
 }
 
 /*
@@ -421,7 +426,15 @@ int main(int argc, char **argv) {
     char dst_abs[PATH_MAX];
     const char *src_arg;
     const char *dst_arg;
+    const char *dst_root;
     int verbose = 0;
+    int remote = 0;
+    ssh_target_t target;
+
+    /* Hidden remote peer mode: `ecopy --server <root>`. */
+    if (argc == 3 && strcmp(argv[1], "--server") == 0) {
+        return server_main(argv[2]);
+    }
 
     if (argc == 4 && (strcmp(argv[1], "-v") == 0 || strcmp(argv[1], "--verbose") == 0)) {
         verbose = 1;
@@ -435,36 +448,61 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    if (ssh_target_is_url(src_arg)) {
+        fprintf(stderr, "ecopy: ssh:// sources are not supported yet (push only)\n");
+        return 1;
+    }
+
     if (lstat(src_arg, &st) != 0) { perror(src_arg); return 1; }
     if (!S_ISDIR(st.st_mode)) { fprintf(stderr, "Source is not a directory: %s\n", src_arg); return 1; }
 
-    if (to_canonical_dir_path(src_arg, src_abs, sizeof(src_abs)) != 0 ||
-        to_canonical_requested_dir_path(dst_arg, dst_abs, sizeof(dst_abs)) != 0) {
+    if (to_canonical_dir_path(src_arg, src_abs, sizeof(src_abs)) != 0) {
         return 1;
     }
 
-    if (is_same_or_child_path(src_abs, dst_abs) || is_same_or_child_path(dst_abs, src_abs)) {
-        fprintf(stderr, "Source and target directories overlap: %s <-> %s\n", src_abs, dst_abs);
-        return 1;
-    }
-
-    if (ensure_destination_root(dst_abs) != 0) {
-        return 1;
+    remote = ssh_target_is_url(dst_arg);
+    if (remote) {
+        if (ssh_target_parse(dst_arg, &target) != 0) {
+            fprintf(stderr, "ecopy: malformed ssh target: %s\n", dst_arg);
+            return 1;
+        }
+        if (sshx_connect(&target) != 0) {
+            return 1;
+        }
+        dst_root = sshx_remote_root();
+    } else {
+        if (to_canonical_requested_dir_path(dst_arg, dst_abs, sizeof(dst_abs)) != 0) {
+            return 1;
+        }
+        if (is_same_or_child_path(src_abs, dst_abs) || is_same_or_child_path(dst_abs, src_abs)) {
+            fprintf(stderr, "Source and target directories overlap: %s <-> %s\n", src_abs, dst_abs);
+            return 1;
+        }
+        if (ensure_destination_root(dst_abs) != 0) {
+            return 1;
+        }
+        dst_root = dst_abs;
     }
 
     raise_open_file_limit(verbose);
 
     stats_init();
     workers_set_collect_wait_timing(verbose);
-    if (workers_start() != 0) return 1;
+    if (workers_start() != 0) { sshx_disconnect(); return 1; }
     if (verbose) {
         workers_print_startup_config();
     }
-    if (progress_start() != 0) { workers_stop(); return 1; }
-    if (traversal_start(src_abs, dst_abs) != 0) { progress_stop(); workers_stop(); return 1; }
+    if (progress_start() != 0) { workers_stop(); sshx_disconnect(); return 1; }
+    if (traversal_start(src_abs, dst_root) != 0) {
+        progress_stop();
+        workers_stop();
+        sshx_disconnect();
+        return 1;
+    }
     traversal_wait();
     workers_stop();
     if (traversal_finalize_metadata() != 0) {
+        sshx_disconnect();
         progress_stop();
         stats_set_shutdown_done();
         printf("\n");
@@ -475,6 +513,8 @@ int main(int argc, char **argv) {
         suggestion_print_next_run();
         return 1;
     }
+    /* All remote operations are complete; close the SSH channel. */
+    sshx_disconnect();
     progress_stop();
     stats_set_shutdown_done();
     printf("\n");

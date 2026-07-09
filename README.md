@@ -28,6 +28,26 @@ DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_MAX_WORKERS=16 ./ecopy /src /dst
 DIRECT_COPY_DISABLE_READ_DIRECT_IO=1 ./ecopy /src /dst
 ```
 
+## Remote (SSH) Targets
+
+The target may be an `ssh://` URL to push a local tree to another host:
+
+```bash
+./ecopy /local/src ssh://user@host:22/data/dst
+```
+
+- **Push only.** The source is always local; an `ssh://` source is rejected.
+- `ecopy` opens one SSH connection and runs `ecopy --server <path>` on the remote host, then streams
+  data and metadata over a single pipelined binary channel. Reads stay local (O_DIRECT, sparse detection);
+  the remote peer performs the destination syscalls confined under `<path>`.
+- **Latency-aware by design:** writes are pipelined without per-operation round-trips, many files stream
+  concurrently, and each directory's skip decisions use one bulk stat instead of a stat per file. Sparse files
+  send only their data extents so holes are recreated remotely.
+- **Self-bootstrapping:** if the remote `ecopy` is missing or an incompatible version, the local binary is
+  streamed over and executed (guarded by a matching `uname -sm`). Install `ecopy` in the remote `PATH` to skip this.
+- Requires working SSH access (key-based auth recommended). Set `ECOPY_SSH` to override the ssh command and
+  `ECOPY_REMOTE_CMD` to point at a specific remote `ecopy` binary.
+
 ## What It Does
 
 - Walks the source tree and recreates it on the target. Copies regular files only.
@@ -75,6 +95,8 @@ Best settings are workload- and environment-dependent. Key knobs (defaults in pa
 | `DIRECT_COPY_DISABLE_DIRECT_IO` | 0 | Disable `O_DIRECT` on both sides (buffered I/O) |
 | `DIRECT_COPY_DISABLE_READ_DIRECT_IO` / `DIRECT_COPY_DISABLE_WRITE_DIRECT_IO` | 0 / 0 | Per-side direct-I/O switches |
 | `DIRECT_COPY_DISABLE_COPY_FILE_RANGE` | 0 | Skip `copy_file_range()` on buffered paths |
+| `ECOPY_SSH` | `ssh` | Command used to reach an `ssh://` target (e.g. `ssh -i key`) |
+| `ECOPY_REMOTE_CMD` | `ecopy` | Remote `ecopy` binary/command for `ssh://` targets |
 
 Out-of-range numeric values are clamped with a warning. The final report prints one suggested next-run experiment;
 `-v` adds the full diagnostic counters (per-phase seconds, read/write opens, queue/buffer waits, etc.) to help you
@@ -84,12 +106,15 @@ see whether time is going to traversal, copy, metadata, or teardown.
 
 ```bash
 make          # builds ecopy (and ecopy-jemalloc if jemalloc is available)
-make test     # runs the smoke tests and tests/ecopy_harness.sh
+make test     # runs protocol_test, the smoke tests, and tests/ecopy_harness.sh
 ```
 
 `tests/ecopy_harness.sh` builds varied source trees (small/large/sparse/pure-hole files, nested dirs, symlinks,
-read-only files) and verifies ecopy reproduces them across several runtime profiles. Run it directly with
-`tests/ecopy_harness.sh` (or `ECOPY_HARNESS_VERBOSE=1 tests/ecopy_harness.sh`).
+read-only files) and verifies ecopy reproduces them across several runtime profiles, including an `ssh://localhost`
+loopback profile. The loopback profile uses `tests/fake_ssh.sh` (a stand-in that runs `ecopy --server` over a local
+pipe) so the full protocol path is exercised without SSH keys; set `ECOPY_HARNESS_REAL_SSH=1` to use real ssh.
+Run it directly with `tests/ecopy_harness.sh` (or `ECOPY_HARNESS_VERBOSE=1 tests/ecopy_harness.sh`).
+`make protocol_test` builds the wire-protocol unit tests.
 
 Warning-clean verification build:
 

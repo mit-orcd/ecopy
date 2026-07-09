@@ -81,6 +81,20 @@ run_ecopy() {
     env "${common_env[@]}" "${env_extra[@]}" "$bin" "$src" "$dst"
 }
 
+# run_ecopy_ssh <src> <dst_abs>: push to a remote-style ssh:// target.
+# By default this uses tests/fake_ssh.sh, a stand-in that runs `ecopy --server`
+# locally over a pipe, so the full protocol/transport/server path is exercised
+# without needing SSH keys. Set ECOPY_HARNESS_REAL_SSH=1 to use the real ssh to
+# localhost instead (requires working key-based auth).
+run_ecopy_ssh() {
+    local src="$1" dst_abs="$2"
+    local -a env_extra=(DIRECT_COPY_LARGE_THRESHOLD_MB=1 ECOPY_REMOTE_CMD="$bin")
+    if [[ "${ECOPY_HARNESS_REAL_SSH:-0}" != "1" ]]; then
+        env_extra+=(ECOPY_SSH="$repo_root/tests/fake_ssh.sh")
+    fi
+    env "${common_env[@]}" "${env_extra[@]}" "$bin" "$src" "ssh://localhost${dst_abs}"
+}
+
 # allocated_blocks <file> -> number of 512-byte blocks actually allocated.
 allocated_blocks() { stat -c %b "$1"; }
 logical_size()     { stat -c %s "$1"; }
@@ -318,6 +332,58 @@ case_readonly_mode() {
     fi
 }
 
+case_ssh_loopback() {
+    case_begin "ssh-loopback"
+    local s="$work/ssh_src" d="$work/ssh_dst"
+    mkdir -p "$s/a/b" "$s/empty"
+    printf 'top payload\n'        > "$s/top.txt"
+    printf ''                     > "$s/zero.bin"
+    head -c 300000 /dev/urandom   > "$s/a/mid.bin"
+    printf 'nested\n'             > "$s/a/b/deep.txt"
+    chmod 0640 "$s/top.txt"
+    chmod 0750 "$s/a/b"
+    local i
+    for i in $(seq 1 20); do printf 'file %d\n' "$i" > "$s/many_$i.txt"; done
+    truncate -s 64M "$s/sparse.bin"
+    dd if=/dev/urandom of="$s/sparse.bin" bs=1M count=2 conv=notrunc status=none
+    dd if=/dev/urandom of="$s/sparse.bin" bs=1M count=2 seek=32 conv=notrunc status=none
+
+    if ! run_ecopy_ssh "$s" "$d" >/dev/null 2>&1; then
+        fail "ssh push run failed"; return
+    fi
+    if verify_regular_files "$s" "$d"; then
+        ok "all regular files match over ssh"
+    fi
+    if [[ -d "$d/empty" ]]; then ok "empty dir preserved over ssh"; else fail "empty dir missing over ssh"; fi
+    if [[ "$(mode_bits "$s/a/b")" == "$(mode_bits "$d/a/b")" ]]; then
+        ok "directory mode preserved over ssh"
+    else
+        fail "directory mode mismatch over ssh"
+    fi
+    if [[ "$(logical_size "$s/sparse.bin")" == "$(logical_size "$d/sparse.bin")" ]]; then
+        ok "sparse logical size preserved over ssh"
+    else
+        fail "sparse size mismatch over ssh"
+    fi
+    if sparse_supported; then
+        local dst_blocks; dst_blocks="$(allocated_blocks "$d/sparse.bin")"
+        if [[ "$dst_blocks" -lt $((64 * 1024 * 1024 / 512 / 4)) ]]; then
+            ok "sparseness preserved over ssh (dst=$dst_blocks blocks)"
+        else
+            fail "sparseness NOT preserved over ssh (dst=$dst_blocks blocks)"
+        fi
+    fi
+
+    # Second run must skip everything (bulk-stat skip path).
+    local out
+    out="$(run_ecopy_ssh "$s" "$d" 2>&1)"
+    if grep -q "Files copied  : 0" <<<"$out"; then
+        ok "unchanged tree fully skipped over ssh"
+    else
+        fail "expected 0 copied on rerun; got: $(grep -E 'Files (copied|skipped)' <<<"$out" | tr '\n' ' ')"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
@@ -331,6 +397,7 @@ case_all_hole_file
 case_skip_rerun
 case_symlink_ignored
 case_readonly_mode
+case_ssh_loopback
 
 echo
 echo "ecopy harness results: $pass_count passed, $fail_count failed"
