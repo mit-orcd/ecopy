@@ -8,16 +8,28 @@ same time using a shared pool of read/write/traversal workers.
 
 ```bash
 make
-./ecopy <source_dir> <target_dir>
+./ecopy <source> <target>
 ```
 
-- `source_dir` must be an existing directory; source and target must not overlap.
-- The target root and the matching tree beneath it are created as needed.
+- `source` may be an existing directory or a single regular file.
+- For a **directory** source, source and target must not overlap; the target root and the matching tree beneath it
+  are created as needed.
+- For a **single file** source, `target` is the destination directory (the file keeps its name), or — locally — a
+  full destination path to also rename it. `ssh://` targets are always treated as the destination directory.
 - Add `-v`/`--verbose` to print the resolved config and full diagnostic counters.
 
 Common variations:
 
 ```bash
+# Copy one file into a directory (keeps its name)
+./ecopy /src/data.bin /dst/
+
+# Copy + rename one file (local only)
+./ecopy /src/data.bin /dst/data-2026.bin
+
+# Push one file to a remote directory
+./ecopy /src/data.bin ssh://user@host/data/incoming/
+
 # Many small files / metadata-heavy trees: buffered I/O is often faster
 DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_MAX_WORKERS=16 ./ecopy /src /dst
 
@@ -40,9 +52,17 @@ The target may be an `ssh://` URL to push a local tree to another host:
 - `ecopy` opens one SSH connection and runs `ecopy --server <path>` on the remote host, then streams
   data and metadata over a single pipelined binary channel. Reads stay local (O_DIRECT, sparse detection);
   the remote peer performs the destination syscalls confined under `<path>`.
-- **Latency-aware by design:** writes are pipelined without per-operation round-trips, many files stream
-  concurrently, and each directory's skip decisions use one bulk stat instead of a stat per file. Sparse files
-  send only their data extents so holes are recreated remotely.
+- **Latency-aware by design:** small files, directory creation, and metadata updates are *fire-and-forget* (no
+  per-item round-trip). A small file at or below `DIRECT_COPY_SSH_PUTFILE_MAX` ships as a single frame (path +
+  metadata + data); larger files stream in pipelined chunks. Many files stream concurrently. Sparse files send
+  only their data extents so holes are recreated remotely.
+- **Batched durability:** each file is still written to a temp and atomically renamed into place, but there is no
+  per-file `fsync`. A periodic and a final *barrier* drain the server, flush to stable storage, and report any
+  errors as a batch (with the first offending path); a nonzero count fails the run. Tune the barrier cadence with
+  `DIRECT_COPY_SSH_BARRIER_OPS`.
+- **Fresh vs. incremental:** on the first copy into a non-existent destination root, per-directory bulk stats are
+  skipped entirely (everything is new). Re-running into an existing destination keeps one bulk stat per directory
+  so unchanged files (`size + mtime`) are still skipped.
 - **Self-bootstrapping:** if the remote `ecopy` is missing or an incompatible version, the local binary is
   streamed over and executed (guarded by a matching `uname -sm`). Install `ecopy` in the remote `PATH` to skip this.
 - Requires working SSH access (key-based auth recommended). Set `ECOPY_SSH` to override the ssh command and
@@ -97,6 +117,8 @@ Best settings are workload- and environment-dependent. Key knobs (defaults in pa
 | `DIRECT_COPY_DISABLE_COPY_FILE_RANGE` | 0 | Skip `copy_file_range()` on buffered paths |
 | `ECOPY_SSH` | `ssh` | Command used to reach an `ssh://` target (e.g. `ssh -i key`) |
 | `ECOPY_REMOTE_CMD` | `ecopy` | Remote `ecopy` binary/command for `ssh://` targets |
+| `DIRECT_COPY_SSH_PUTFILE_MAX` | 1024 | Max size (KiB) a file may be to ship as a single `ssh://` PUTFILE frame |
+| `DIRECT_COPY_SSH_BARRIER_OPS` | 8192 | Fire-and-forget remote ops between drain/flush barriers (min 256) |
 
 Out-of-range numeric values are clamped with a warning. The final report prints one suggested next-run experiment;
 `-v` adds the full diagnostic counters (per-phase seconds, read/write opens, queue/buffer waits, etc.) to help you

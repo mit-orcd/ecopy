@@ -94,6 +94,11 @@ static void *writer_thread(void *arg)
     frame_write(fd, MSG_MKDIR, 0x42, p1, sizeof(p1));
     frame_write(fd, MSG_STATUS, 0x43, NULL, 0);
     frame_write_data(fd, 0x44, 0x99, 4096, "DATA", 4);
+    /* PUTFILE-style two-segment frame: head (meta+path) + data, no copy. */
+    {
+        uint8_t head[16] = { 0xAA };
+        frame_write_parts(fd, MSG_PUTFILE, 0x45, head, sizeof(head), "hello", 5);
+    }
     close(fd);
     return NULL;
 }
@@ -126,7 +131,13 @@ static void test_frame_pipe(void)
         CHECK(memcmp(pl + 16, "DATA", 4) == 0, "data frame bytes");
     }
 
-    /* Writer closed after 3 frames: next header read must fail. */
+    CHECK(frame_read_header(fds[0], &type, &id, &plen) == 0, "read frame 4 header");
+    CHECK(type == MSG_PUTFILE && id == 0x45 && plen == 21, "frame 4 (putfile) header fields");
+    CHECK(io_read_all(fds[0], pl, plen) == 0, "read frame 4 payload");
+    CHECK(pl[0] == 0xAA, "putfile head first byte");
+    CHECK(memcmp(pl + 16, "hello", 5) == 0, "putfile data segment follows head");
+
+    /* Writer closed after 4 frames: next header read must fail. */
     CHECK(frame_read_header(fds[0], &type, &id, &plen) == -1, "EOF after last frame");
 
     pthread_join(t, NULL);

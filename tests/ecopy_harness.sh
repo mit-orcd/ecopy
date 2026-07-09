@@ -335,7 +335,7 @@ case_readonly_mode() {
 case_ssh_loopback() {
     case_begin "ssh-loopback"
     local s="$work/ssh_src" d="$work/ssh_dst"
-    mkdir -p "$s/a/b" "$s/empty"
+    mkdir -p "$s/a/b" "$s/empty" "$s/deep/d1/d2/d3"
     printf 'top payload\n'        > "$s/top.txt"
     printf ''                     > "$s/zero.bin"
     head -c 300000 /dev/urandom   > "$s/a/mid.bin"
@@ -344,6 +344,10 @@ case_ssh_loopback() {
     chmod 0750 "$s/a/b"
     local i
     for i in $(seq 1 20); do printf 'file %d\n' "$i" > "$s/many_$i.txt"; done
+    # Lots of tiny files across nested dirs to exercise the PUTFILE batch path.
+    mkdir -p "$s/tiny/one" "$s/tiny/two"
+    for i in $(seq 1 60); do printf 'x' > "$s/tiny/one/t_$i"; done
+    for i in $(seq 1 60); do printf 'yy' > "$s/tiny/two/u_$i"; done
     truncate -s 64M "$s/sparse.bin"
     dd if=/dev/urandom of="$s/sparse.bin" bs=1M count=2 conv=notrunc status=none
     dd if=/dev/urandom of="$s/sparse.bin" bs=1M count=2 seek=32 conv=notrunc status=none
@@ -355,6 +359,7 @@ case_ssh_loopback() {
         ok "all regular files match over ssh"
     fi
     if [[ -d "$d/empty" ]]; then ok "empty dir preserved over ssh"; else fail "empty dir missing over ssh"; fi
+    if [[ -d "$d/deep/d1/d2/d3" ]]; then ok "deep empty dir chain created over ssh"; else fail "deep empty dir chain missing over ssh"; fi
     if [[ "$(mode_bits "$s/a/b")" == "$(mode_bits "$d/a/b")" ]]; then
         ok "directory mode preserved over ssh"
     else
@@ -384,6 +389,90 @@ case_ssh_loopback() {
     fi
 }
 
+# A server-side failure on a fire-and-forget op must surface at the barrier and
+# make the run exit nonzero (batch-level error reporting).
+case_ssh_batch_failure() {
+    case_begin "ssh-batch-failure"
+    local s="$work/sshf_src" d="$work/sshf_dst"
+    mkdir -p "$s/collide"
+    printf 'inner\n' > "$s/collide/inner.txt"
+    # Pre-create the destination with 'collide' as a regular FILE, so both the
+    # remote mkdir and the child PUTFILE fail on the server.
+    mkdir -p "$d"
+    printf 'i am a file, not a dir\n' > "$d/collide"
+
+    local out rc
+    out="$(run_ecopy_ssh "$s" "$d" 2>&1)"; rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        ok "run exits nonzero when a remote op fails"
+    else
+        fail "expected nonzero exit on remote failure"
+    fi
+    if grep -q "remote reported" <<<"$out"; then
+        ok "barrier surfaced remote error"
+    else
+        fail "expected 'remote reported' diagnostic; got: $(tr '\n' ' ' <<<"$out")"
+    fi
+}
+
+# Single regular file as the source (not a directory).
+case_single_file() {
+    case_begin "single-file"
+    local s="$work/one_src" d="$work/one_dst"
+    mkdir -p "$s"
+    printf 'single file payload\n' > "$s/note.txt"
+    chmod 0640 "$s/note.txt"
+    head -c 250000 /dev/urandom > "$s/blob.bin"
+    mkdir -p "$d/existing"
+
+    # Into an existing directory: keeps the source name.
+    if env "${common_env[@]}" DIRECT_COPY_LARGE_THRESHOLD_MB=128 "$bin" "$s/note.txt" "$d/existing" >/dev/null 2>&1 \
+        && cmp -s "$s/note.txt" "$d/existing/note.txt"; then
+        ok "file copied into existing dir"
+    else
+        fail "file into existing dir"
+    fi
+    if [[ "$(mode_bits "$s/note.txt")" == "$(mode_bits "$d/existing/note.txt")" ]]; then
+        ok "single-file mode preserved"
+    else
+        fail "single-file mode mismatch"
+    fi
+
+    # Trailing slash: create the directory, keep the source name.
+    if env "${common_env[@]}" DIRECT_COPY_LARGE_THRESHOLD_MB=128 "$bin" "$s/note.txt" "$d/made/" >/dev/null 2>&1 \
+        && cmp -s "$s/note.txt" "$d/made/note.txt"; then
+        ok "file copied into new dir (trailing slash)"
+    else
+        fail "file into new dir"
+    fi
+
+    # Full destination path: rename, creating parent dirs.
+    if env "${common_env[@]}" DIRECT_COPY_LARGE_THRESHOLD_MB=128 "$bin" "$s/note.txt" "$d/a/b/renamed.txt" >/dev/null 2>&1 \
+        && cmp -s "$s/note.txt" "$d/a/b/renamed.txt"; then
+        ok "file renamed to full path"
+    else
+        fail "file rename to full path"
+    fi
+
+    # Forced through the large-file pipeline.
+    if env "${common_env[@]}" DIRECT_COPY_LARGE_THRESHOLD_MB=1 "$bin" "$s/blob.bin" "$d/big/" >/dev/null 2>&1 \
+        && cmp -s "$s/blob.bin" "$d/big/blob.bin"; then
+        ok "large single file copied"
+    else
+        fail "large single file"
+    fi
+
+    # Over ssh: the ssh:// path is the destination directory.
+    local r="$work/one_remote"
+    mkdir -p "$r"
+    if run_ecopy_ssh "$s/note.txt" "$r" >/dev/null 2>&1 \
+        && cmp -s "$s/note.txt" "$r/note.txt"; then
+        ok "single file pushed over ssh"
+    else
+        fail "single file over ssh"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
@@ -397,7 +486,9 @@ case_all_hole_file
 case_skip_rerun
 case_symlink_ignored
 case_readonly_mode
+case_single_file
 case_ssh_loopback
+case_ssh_batch_failure
 
 echo
 echo "ecopy harness results: $pass_count passed, $fail_count failed"

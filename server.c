@@ -50,6 +50,29 @@ typedef struct open_file {
 static open_file_t *g_files;
 static char g_root_norm[PATH_MAX];   /* lexically normalized confinement root */
 static uint32_t g_caps;
+static int g_root_present;           /* did the confinement root exist before we ran? */
+
+/*
+ * Deferred error log for fire-and-forget operations (PUTFILE/MKDIR/SETMETA).
+ * These get no per-op reply; the client learns about failures at the next
+ * BARRIER, which reports the cumulative count and the first failing path.
+ */
+static uint64_t g_err_count;
+static int32_t  g_err_first;         /* negative errno of the first failure */
+static char     g_err_first_path[PATH_MAX];
+
+static void log_op_error(const char *path, int err)
+{
+    if (g_err_count == 0) {
+        g_err_first = -(err > 0 ? err : -err);
+        snprintf(g_err_first_path, sizeof(g_err_first_path), "%s", path ? path : "");
+    }
+    g_err_count++;
+}
+
+/* Cache the last directory we ensured exists, so a run of PUTFILEs into the
+ * same directory does not re-walk mkdir -p every time. */
+static char g_last_dir[PATH_MAX];
 
 static open_file_t *file_find(uint64_t id)
 {
@@ -181,6 +204,23 @@ static int mkdir_p(const char *path)
     return 0;
 }
 
+/*
+ * Ensure a (confined) directory exists, creating missing components. Caches the
+ * last directory so a stream of PUTFILEs into the same directory does not
+ * re-walk mkdir -p on every file. dir must already be resolved under the root.
+ */
+static int ensure_dir_cached(const char *dir)
+{
+    if (strcmp(dir, g_last_dir) == 0) {
+        return 0;
+    }
+    if (mkdir_p(dir) != 0) {
+        return -1;
+    }
+    snprintf(g_last_dir, sizeof(g_last_dir), "%s", dir);
+    return 0;
+}
+
 static void apply_meta(int fd, uint32_t uid, uint32_t gid, uint32_t mode,
                        int64_t at_s, int64_t at_ns, int64_t mt_s, int64_t mt_ns)
 {
@@ -215,6 +255,9 @@ static int handle_hello(uint64_t id, const uint8_t *payload, uint32_t plen, cons
     else snprintf(uname_s, sizeof(uname_s), "unknown unknown");
     penc_str(&e, uname_s);
     penc_str(&e, g_root_norm);
+    /* Report whether the destination root already existed, so the client can
+     * pick fresh (skip per-directory bulk stat) vs incremental mode. */
+    penc_u8(&e, (uint8_t)(g_root_present ? 1 : 0));
 
     /* If the client speaks a different major version, still answer so it can
      * decide to bootstrap; the version field is what it checks. */
@@ -372,26 +415,27 @@ static void handle_abort(const uint8_t *payload, uint32_t plen)
     file_remove(f);
 }
 
-static int handle_mkdir(uint64_t id, const uint8_t *payload, uint32_t plen)
+/* Fire-and-forget in v2: create the directory, record failures in the log. */
+static void handle_mkdir(const uint8_t *payload, uint32_t plen)
 {
     char in[PATH_MAX];
     pdec_t d; pdec_init(&d, payload, plen);
-    if (pdec_str(&d, in, sizeof(in)) != 0) return reply_status(id, -EINVAL);
+    if (pdec_str(&d, in, sizeof(in)) != 0) return;
     uint32_t mode = pdec_u32(&d);
-    if (d.error) return reply_status(id, -EINVAL);
+    if (d.error) return;
 
     char path[PATH_MAX];
-    if (resolve_path(in, path, sizeof(path)) != 0) return reply_status(id, -errno);
+    if (resolve_path(in, path, sizeof(path)) != 0) { log_op_error(in, errno); return; }
 
     struct stat st;
     if (lstat(path, &st) == 0) {
-        return reply_status(id, S_ISDIR(st.st_mode) ? 0 : -EEXIST);
+        if (!S_ISDIR(st.st_mode)) log_op_error(path, EEXIST);
+        return;
     }
     /* keep the dir owner-writable during the copy; final mode set at finalize */
     if (mkdir(path, (mode_t)((mode & 07777) | S_IRWXU)) != 0 && errno != EEXIST) {
-        return reply_status(id, -errno);
+        log_op_error(path, errno);
     }
-    return reply_status(id, 0);
 }
 
 static int handle_stat(uint64_t id, const uint8_t *payload, uint32_t plen)
@@ -445,11 +489,12 @@ static int handle_stat_bulk(uint64_t id, const uint8_t *payload, uint32_t plen)
     return rc;
 }
 
-static int handle_setmeta(uint64_t id, const uint8_t *payload, uint32_t plen)
+/* Fire-and-forget in v2: apply metadata, record failures in the log. */
+static void handle_setmeta(const uint8_t *payload, uint32_t plen)
 {
     char in[PATH_MAX];
     pdec_t d; pdec_init(&d, payload, plen);
-    if (pdec_str(&d, in, sizeof(in)) != 0) return reply_status(id, -EINVAL);
+    if (pdec_str(&d, in, sizeof(in)) != 0) return;
     uint32_t uid = pdec_u32(&d);
     uint32_t gid = pdec_u32(&d);
     uint32_t mode = pdec_u32(&d);
@@ -458,20 +503,109 @@ static int handle_setmeta(uint64_t id, const uint8_t *payload, uint32_t plen)
     int64_t mt_s = pdec_i64(&d);
     int64_t mt_ns = pdec_i64(&d);
     (void)pdec_u8(&d); /* is_dir; open works for both */
-    if (d.error) return reply_status(id, -EINVAL);
+    if (d.error) return;
 
     char path[PATH_MAX];
-    if (resolve_path(in, path, sizeof(path)) != 0) return reply_status(id, -errno);
+    if (resolve_path(in, path, sizeof(path)) != 0) { log_op_error(in, errno); return; }
 
     int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) {
         /* Directories may need O_DIRECTORY on some systems; retry. */
         fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     }
-    if (fd < 0) return reply_status(id, -errno);
+    if (fd < 0) { log_op_error(path, errno); return; }
     apply_meta(fd, uid, gid, mode, at_s, at_ns, mt_s, mt_ns);
     close(fd);
-    return reply_status(id, 0);
+}
+
+/*
+ * Whole small file in one fire-and-forget frame: metadata + path + data.
+ * Creates parent dirs, writes a temp (or the final name for inplace), applies
+ * metadata, and renames into place. No per-file fsync (durability is a flush at
+ * the next BARRIER). Failures go to the error log.
+ */
+static void handle_putfile(const uint8_t *payload, uint32_t plen)
+{
+    pdec_t d; pdec_init(&d, payload, plen);
+    uint32_t mode = pdec_u32(&d);
+    uint32_t uid = pdec_u32(&d);
+    uint32_t gid = pdec_u32(&d);
+    int64_t at_s = pdec_i64(&d);
+    int64_t at_ns = pdec_i64(&d);
+    int64_t mt_s = pdec_i64(&d);
+    int64_t mt_ns = pdec_i64(&d);
+    uint32_t flags = pdec_u32(&d);
+    char final_in[PATH_MAX];
+    if (pdec_str(&d, final_in, sizeof(final_in)) != 0 || d.error) return;
+
+    const uint8_t *data = payload + d.off;
+    size_t data_len = plen - d.off;
+
+    char finalp[PATH_MAX];
+    if (resolve_path(final_in, finalp, sizeof(finalp)) != 0) { log_op_error(final_in, errno); return; }
+
+    char dir[PATH_MAX], base[PATH_MAX];
+    split_dir_base(finalp, dir, sizeof(dir), base, sizeof(base));
+    if (ensure_dir_cached(dir) != 0) { log_op_error(dir, errno); return; }
+
+    int inplace = (flags & ECOPY_OPEN_INPLACE) ? 1 : 0;
+    char tmp_path[PATH_MAX];
+    int fd;
+    if (inplace) {
+        snprintf(tmp_path, sizeof(tmp_path), "%s", finalp);
+        fd = open(finalp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,
+                  copy_data_mode((mode_t)mode));
+    } else {
+        static uint64_t put_seq;
+        int need = snprintf(tmp_path, sizeof(tmp_path), "%s/.ecopy.tmp.%u.p%llu",
+                            dir, (unsigned)getpid(), (unsigned long long)(++put_seq));
+        if (need < 0 || need >= (int)sizeof(tmp_path)) { log_op_error(finalp, ENAMETOOLONG); return; }
+        fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                  copy_data_mode((mode_t)mode));
+    }
+    if (fd < 0) { log_op_error(finalp, errno); return; }
+
+    int err = 0;
+    size_t done = 0;
+    while (done < data_len) {
+        ssize_t w = write(fd, data + done, data_len - done);
+        if (w < 0) { if (errno == EINTR) continue; err = errno; break; }
+        if (w == 0) { err = EIO; break; }
+        done += (size_t)w;
+    }
+    if (err == 0) {
+        apply_meta(fd, uid, gid, mode, at_s, at_ns, mt_s, mt_ns);
+    }
+    if (close(fd) != 0 && err == 0) err = errno;
+    if (err == 0 && !inplace) {
+        if (rename(tmp_path, finalp) != 0) err = errno;
+    }
+    if (err != 0) {
+        if (!inplace) (void)unlink(tmp_path);
+        log_op_error(finalp, err);
+    }
+}
+
+/*
+ * Drain point: all prior fire-and-forget frames have been processed by now
+ * (single-threaded, in-order). Optionally flush, then report the cumulative
+ * error count and the first failing path so the client can surface failures.
+ */
+static int handle_barrier(uint64_t id, const uint8_t *payload, uint32_t plen)
+{
+    pdec_t d; pdec_init(&d, payload, plen);
+    uint8_t flush = pdec_u8(&d);
+
+    if (flush) {
+        sync();
+    }
+
+    uint8_t buf[PATH_MAX + 32];
+    penc_t e; penc_init(&e, buf, sizeof(buf));
+    penc_u32(&e, (uint32_t)(g_err_count ? g_err_first : 0));
+    penc_u32(&e, (uint32_t)(g_err_count > 0xffffffffULL ? 0xffffffffU : g_err_count));
+    penc_str(&e, g_err_first_path);
+    return frame_write(STDOUT_FILENO, MSG_STATUS, id, buf, (uint32_t)e.len);
 }
 
 static void handle_unlink(const uint8_t *payload, uint32_t plen)
@@ -491,6 +625,10 @@ int server_main(const char *root)
     if (!root || root[0] != '/') {
         fprintf(stderr, "ecopy --server: root must be an absolute path\n");
         return 1;
+    }
+    {
+        struct stat rst;
+        g_root_present = (lstat(root, &rst) == 0 && S_ISDIR(rst.st_mode)) ? 1 : 0;
     }
     if (mkdir_p(root) != 0) {
         fprintf(stderr, "ecopy --server: cannot create root %s: %s\n", root, strerror(errno));
@@ -529,10 +667,12 @@ int server_main(const char *root)
         case MSG_FTRUNCATE: handle_ftruncate(payload, plen); break;
         case MSG_COMMIT:    rc = handle_commit(id, payload, plen); break;
         case MSG_ABORT:     handle_abort(payload, plen); break;
-        case MSG_MKDIR:     rc = handle_mkdir(id, payload, plen); break;
+        case MSG_PUTFILE:   handle_putfile(payload, plen); break;
+        case MSG_MKDIR:     handle_mkdir(payload, plen); break;
         case MSG_STAT:      rc = handle_stat(id, payload, plen); break;
         case MSG_STAT_BULK: rc = handle_stat_bulk(id, payload, plen); break;
-        case MSG_SETMETA:   rc = handle_setmeta(id, payload, plen); break;
+        case MSG_SETMETA:   handle_setmeta(payload, plen); break;
+        case MSG_BARRIER:   rc = handle_barrier(id, payload, plen); break;
         case MSG_UNLINK:    handle_unlink(payload, plen); break;
         case MSG_BYE:       free(payload); return 0;
         default:            break; /* ignore unknown */

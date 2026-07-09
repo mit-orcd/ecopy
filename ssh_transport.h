@@ -55,6 +55,12 @@ void sshx_disconnect(void);
 /* The canonical remote root path (server-confirmed) for building child paths. */
 const char *sshx_remote_root(void);
 
+/*
+ * Whether the destination root already existed before this run (reported at
+ * handshake). 0 => fresh destination (per-directory bulk stat can be skipped).
+ */
+int sshx_remote_root_present(void);
+
 /* ---- directory / metadata operations (synchronous, used by traversal) ---- */
 
 /* Ensure a remote directory exists with mode. Returns 0 ok, -1 error. */
@@ -76,6 +82,26 @@ int sshx_stat_bulk(const char *base, const char *const *names, int n,
 
 /* Apply uid/gid/mode/atime/mtime from src_st to a remote path. */
 int sshx_setmeta(const char *path, const struct stat *src_st, int is_dir);
+
+/*
+ * Send a whole small file in one fire-and-forget frame (metadata from src_st +
+ * path + data). The server creates parent dirs, writes, applies metadata, and
+ * renames into place. No per-file round trip; failures surface at the next
+ * barrier. Returns 0 if the frame was queued, -1 on transport failure.
+ */
+int sshx_putfile(const char *final_path, const struct stat *src_st,
+                 const void *buf, size_t len, int inplace);
+
+/*
+ * Synchronization point: drain all prior fire-and-forget frames on the server,
+ * optionally flush to stable storage, and collect the cumulative remote error
+ * count. Returns 0 if no remote errors so far, -1 otherwise (a diagnostic with
+ * the first failing path is printed).
+ */
+int sshx_barrier(int flush);
+
+/* Final drain + flush. Equivalent to sshx_barrier(1). */
+int sshx_flush(void);
 
 /* ---- per-file streaming (used by the remote copy path) ---- */
 

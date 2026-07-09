@@ -44,6 +44,14 @@ static pthread_mutex_t g_status_lock = PTHREAD_MUTEX_INITIALIZER;
 static char g_src_root[PATH_MAX];
 static char g_dst_root[PATH_MAX];
 
+/* Remote fresh-destination fast path: skip per-directory bulk STAT. */
+static int g_remote_fresh = 0;
+
+void traversal_set_remote_fresh(int fresh)
+{
+    g_remote_fresh = fresh ? 1 : 0;
+}
+
 static pthread_mutex_t g_dir_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_dir_cond = PTHREAD_COND_INITIALIZER;
 static dir_node_t *g_dir_head = NULL;
@@ -464,12 +472,17 @@ static int remote_flush_batch(dir_handle_t *handle,
     if (n == 0) {
         return 0;
     }
-    for (int i = 0; i < n; i++) {
-        names[i] = batch[i].name;
-    }
-    if (sshx_stat_bulk(node->dst, names, n, present, dst_st) != 0) {
-        fprintf(stderr, "Bulk stat failed under %s\n", node->dst);
-        return -1;
+    if (g_remote_fresh) {
+        /* Fresh destination: everything is new; no stat round trip. */
+        for (int i = 0; i < n; i++) present[i] = 0;
+    } else {
+        for (int i = 0; i < n; i++) {
+            names[i] = batch[i].name;
+        }
+        if (sshx_stat_bulk(node->dst, names, n, present, dst_st) != 0) {
+            fprintf(stderr, "Bulk stat failed under %s\n", node->dst);
+            return -1;
+        }
     }
 
     for (int i = 0; i < n; i++) {

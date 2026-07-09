@@ -13,6 +13,8 @@
 #include "suggestion.h"
 #include "ssh_transport.h"
 #include "server.h"
+#include "fs_util.h"
+#include "types.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,8 +28,11 @@
 
 static void usage(const char *prog) {
     fprintf(stderr,
-            "Usage: %s [-v|--verbose] <source_dir> <target_dir>\n"
-            "       <target_dir> may be a local path or ssh://[user@]host[:port]/path\n",
+            "Usage: %s [-v|--verbose] <source> <target>\n"
+            "       <source> may be a directory or a single regular file\n"
+            "       <target> may be a local path or ssh://[user@]host[:port]/path\n"
+            "       For a file source, <target> is the destination directory (or\n"
+            "       a full destination path locally); ssh:// targets are directories.\n",
             prog);
 }
 
@@ -420,13 +425,66 @@ static int is_same_or_child_path(const char *base, const char *path) {
     return path[n] == '\0' || path[n] == '/';
 }
 
+/* Split an absolute path into its parent directory and final component. */
+static void split_parent_name(const char *abs, char *parent, size_t psz,
+                              char *name, size_t nsz) {
+    const char *slash = strrchr(abs, '/');
+    if (!slash) {
+        snprintf(parent, psz, ".");
+        snprintf(name, nsz, "%s", abs);
+        return;
+    }
+    size_t plen = (size_t)(slash - abs);
+    if (plen == 0) {
+        snprintf(parent, psz, "/");
+    } else {
+        if (plen >= psz) plen = psz - 1;
+        memcpy(parent, abs, plen);
+        parent[plen] = '\0';
+    }
+    snprintf(name, nsz, "%s", slash + 1);
+}
+
+/*
+ * Enqueue a single regular file for copy through the normal worker path (so it
+ * shares the sparse/large/remote handling). Builds a one-shot directory handle
+ * for the source parent (and, locally, the destination directory). The worker
+ * lands the file under its source name in the destination directory; callers
+ * that requested a different final name rename it afterwards.
+ */
+static int enqueue_single_file(const char *src_parent, const char *src_name,
+                               const char *src_full, const char *dst_full,
+                               const struct stat *st, int remote) {
+    int src_fd = open(src_parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (src_fd < 0) { perror(src_parent); return -1; }
+
+    int dst_fd = -1;
+    char dst_dir[PATH_MAX];
+    dst_dir[0] = '\0';
+    if (!remote) {
+        char tmp_name[PATH_MAX];
+        split_parent_name(dst_full, dst_dir, sizeof(dst_dir), tmp_name, sizeof(tmp_name));
+        dst_fd = open(dst_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dst_fd < 0) { perror(dst_dir); close(src_fd); return -1; }
+    }
+
+    dir_handle_t *h = dir_handle_create(src_parent, dst_dir, src_fd, dst_fd);
+    if (!h) { close(src_fd); if (dst_fd >= 0) close(dst_fd); return -1; }
+
+    stats_inc_files_seen();
+    stats_add_planned_copy_bytes((uint64_t)st->st_size);
+    int rc = workers_enqueue_small_file(h, src_name, src_full, dst_full, st);
+    dir_handle_release(h);
+    return rc;
+}
+
 int main(int argc, char **argv) {
     struct stat st;
     char src_abs[PATH_MAX];
     char dst_abs[PATH_MAX];
     const char *src_arg;
     const char *dst_arg;
-    const char *dst_root;
+    const char *dst_root = NULL;
     int verbose = 0;
     int remote = 0;
     ssh_target_t target;
@@ -454,10 +512,26 @@ int main(int argc, char **argv) {
     }
 
     if (lstat(src_arg, &st) != 0) { perror(src_arg); return 1; }
-    if (!S_ISDIR(st.st_mode)) { fprintf(stderr, "Source is not a directory: %s\n", src_arg); return 1; }
+    int src_is_dir = S_ISDIR(st.st_mode);
+    if (!src_is_dir && !S_ISREG(st.st_mode)) {
+        fprintf(stderr, "Source is not a regular file or directory: %s\n", src_arg);
+        return 1;
+    }
 
     if (to_canonical_dir_path(src_arg, src_abs, sizeof(src_abs)) != 0) {
         return 1;
+    }
+
+    /* Single-file mode: destination file path (enqueue target) and, locally,
+     * the final path if the user asked for a different name. */
+    char src_parent[PATH_MAX];
+    char src_name[PATH_MAX];
+    char file_enqueue_dst[PATH_MAX];
+    char file_final_dst[PATH_MAX];
+    file_enqueue_dst[0] = '\0';
+    file_final_dst[0] = '\0';
+    if (!src_is_dir) {
+        split_parent_name(src_abs, src_parent, sizeof(src_parent), src_name, sizeof(src_name));
     }
 
     remote = ssh_target_is_url(dst_arg);
@@ -470,7 +544,21 @@ int main(int argc, char **argv) {
             return 1;
         }
         dst_root = sshx_remote_root();
-    } else {
+        /* Pick the scan mode from the handshake: absent root -> fresh (skip
+         * per-dir bulk STAT); present -> incremental (keep bulk STAT so re-runs
+         * skip unchanged files). */
+        traversal_set_remote_fresh(!sshx_remote_root_present());
+        if (!src_is_dir) {
+            /* The ssh:// path is always the destination directory; the file
+             * keeps its source name inside it. */
+            if (snprintf(file_enqueue_dst, sizeof(file_enqueue_dst), "%s/%s",
+                         dst_root, src_name) >= (int)sizeof(file_enqueue_dst)) {
+                fprintf(stderr, "ecopy: remote path too long\n");
+                sshx_disconnect();
+                return 1;
+            }
+        }
+    } else if (src_is_dir) {
         if (to_canonical_requested_dir_path(dst_arg, dst_abs, sizeof(dst_abs)) != 0) {
             return 1;
         }
@@ -482,6 +570,52 @@ int main(int argc, char **argv) {
             return 1;
         }
         dst_root = dst_abs;
+    } else {
+        /* Local single-file destination. If it names an existing directory or
+         * ends with '/', the file is placed inside it under its source name;
+         * otherwise the argument is the full destination path (rename). */
+        char dst_dir[PATH_MAX];
+        char final_name[PATH_MAX];
+        struct stat dstat;
+        size_t dlen = strlen(dst_arg);
+        int is_existing_dir = (lstat(dst_arg, &dstat) == 0 && S_ISDIR(dstat.st_mode));
+        int trailing_slash = (dlen > 0 && dst_arg[dlen - 1] == '/');
+
+        if (is_existing_dir) {
+            if (to_canonical_dir_path(dst_arg, dst_dir, sizeof(dst_dir)) != 0) {
+                return 1;
+            }
+            snprintf(final_name, sizeof(final_name), "%s", src_name);
+        } else {
+            char dabs[PATH_MAX];
+            char dnorm[PATH_MAX];
+            if (to_abs_path(dst_arg, dabs, sizeof(dabs)) != 0 ||
+                normalize_abs_path_lexically(dabs, dnorm, sizeof(dnorm)) != 0) {
+                fprintf(stderr, "Target path too long: %s\n", dst_arg);
+                return 1;
+            }
+            if (trailing_slash) {
+                snprintf(dst_dir, sizeof(dst_dir), "%s", dnorm);
+                snprintf(final_name, sizeof(final_name), "%s", src_name);
+            } else {
+                split_parent_name(dnorm, dst_dir, sizeof(dst_dir), final_name, sizeof(final_name));
+            }
+        }
+
+        if (mkdir_p_dir(dst_dir, 0777) != 0) {
+            return 1;
+        }
+        if (snprintf(file_enqueue_dst, sizeof(file_enqueue_dst), "%s/%s", dst_dir, src_name)
+                >= (int)sizeof(file_enqueue_dst) ||
+            snprintf(file_final_dst, sizeof(file_final_dst), "%s/%s", dst_dir, final_name)
+                >= (int)sizeof(file_final_dst)) {
+            fprintf(stderr, "Target path too long: %s\n", dst_arg);
+            return 1;
+        }
+        if (strcmp(src_abs, file_final_dst) == 0) {
+            fprintf(stderr, "Source and destination are the same file: %s\n", src_abs);
+            return 1;
+        }
     }
 
     raise_open_file_limit(verbose);
@@ -493,15 +627,44 @@ int main(int argc, char **argv) {
         workers_print_startup_config();
     }
     if (progress_start() != 0) { workers_stop(); sshx_disconnect(); return 1; }
-    if (traversal_start(src_abs, dst_root) != 0) {
-        progress_stop();
-        workers_stop();
-        sshx_disconnect();
-        return 1;
+
+    int enqueue_failed = 0;
+    if (src_is_dir) {
+        if (traversal_start(src_abs, dst_root) != 0) {
+            progress_stop();
+            workers_stop();
+            sshx_disconnect();
+            return 1;
+        }
+        traversal_wait();
+    } else {
+        enqueue_failed = (enqueue_single_file(src_parent, src_name, src_abs,
+                                              file_enqueue_dst, &st, remote) != 0);
+        stats_set_traversal_done();
     }
-    traversal_wait();
     workers_stop();
-    if (traversal_finalize_metadata() != 0) {
+    int finalize_failed = src_is_dir ? (traversal_finalize_metadata() != 0) : enqueue_failed;
+
+    /* Single-file local rename: the worker landed the file under its source
+     * name; move it to the requested final name if they differ. */
+    if (!finalize_failed && !src_is_dir && !remote &&
+        strcmp(file_enqueue_dst, file_final_dst) != 0) {
+        if (rename(file_enqueue_dst, file_final_dst) != 0) {
+            perror(file_final_dst);
+            finalize_failed = 1;
+        }
+    }
+
+    /*
+     * Remote runs are fire-and-forget: every PUTFILE / MKDIR / SETMETA has been
+     * sent by now (workers stopped, metadata finalized). A final barrier drains
+     * the server, flushes to stable storage, and reports any deferred errors.
+     */
+    int remote_failed = 0;
+    if (remote) {
+        remote_failed = (sshx_flush() != 0);
+    }
+    if (finalize_failed) {
         sshx_disconnect();
         progress_stop();
         stats_set_shutdown_done();
@@ -524,7 +687,7 @@ int main(int argc, char **argv) {
     }
     suggestion_print_next_run();
 
-    if (traversal_status() != 0 || workers_status() != 0) {
+    if (traversal_status() != 0 || workers_status() != 0 || remote_failed) {
         return 1;
     }
     return 0;

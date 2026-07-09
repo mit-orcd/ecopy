@@ -22,7 +22,7 @@
 #include <string.h>
 #include <sys/types.h>
 
-#define ECOPY_PROTO_VERSION 1u
+#define ECOPY_PROTO_VERSION 2u
 
 /* Upper bound on a single control-frame payload we are willing to read. Data
  * frames (WRITE) carry their own length and are streamed, so this only bounds
@@ -44,11 +44,27 @@ typedef enum {
     MSG_ABORT          = 12, /* file_id ; fire */
     MSG_SETMETA        = 13, /* path, meta, is_dir ; reply STATUS */
     MSG_UNLINK         = 14, /* path ; fire */
-    MSG_STATUS         = 15, /* status(i32) + optional message */
-    MSG_BYE            = 16  /* client->server: clean shutdown ; fire */
+    MSG_STATUS         = 15, /* status(i32) [+ barrier aggregate] */
+    MSG_BYE            = 16, /* client->server: clean shutdown ; fire */
+    MSG_PUTFILE        = 17, /* meta + path + data (whole small file) ; fire */
+    MSG_BARRIER        = 18  /* flush + drain ; reply STATUS w/ aggregate */
 } msg_type_t;
 
-/* OPEN flags */
+/*
+ * In protocol v2 the small-file and directory paths are fire-and-forget to
+ * remove per-item round trips:
+ *   - MSG_PUTFILE carries an entire small file (metadata + path + data) in one
+ *     frame and gets no reply.
+ *   - MSG_MKDIR / MSG_SETMETA no longer reply; failures are accumulated in the
+ *     server's error log.
+ *   - MSG_BARRIER is the only synchronization point: the server drains all
+ *     prior frames, optionally flushes, and replies MSG_STATUS whose payload is
+ *     [status(i32), error_count(u32), first_failing_path(str)].
+ * The streamed OPEN/WRITE/FTRUNCATE/COMMIT path (large + sparse files) is
+ * unchanged and still confirms via COMMIT.
+ */
+
+/* OPEN / PUTFILE flags */
 #define ECOPY_OPEN_SPARSE   0x1u  /* file is sparse; do not preallocate */
 #define ECOPY_OPEN_INPLACE  0x2u  /* write straight to final name (no temp+rename) */
 
@@ -164,6 +180,16 @@ int frame_write(int fd, uint8_t type, uint64_t id, const void *payload, uint32_t
  */
 int frame_write_data(int fd, uint64_t id, uint64_t file_id, int64_t offset,
                      const void *data, size_t len);
+
+/*
+ * Write a frame in two segments without an intermediate copy of the bulk data:
+ * the header (payload length = head_len + data_len), then head, then data. Used
+ * by MSG_PUTFILE (head = metadata + path, data = file contents). Returns 0 on
+ * success, -1 on I/O error.
+ */
+int frame_write_parts(int fd, uint8_t type, uint64_t id,
+                      const void *head, uint32_t head_len,
+                      const void *data, size_t data_len);
 
 /* Read one frame header. Returns 0 on success, -1 on EOF/error. */
 int frame_read_header(int fd, uint8_t *type, uint64_t *id, uint32_t *plen);

@@ -12,6 +12,7 @@
 #include "stats.h"
 #include "fs_util.h"
 #include "ssh_transport.h"
+#include "protocol.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -113,6 +114,7 @@ static off_t g_large_threshold = 0;
 static int g_max_queued_files = 0;
 static int g_small_worker_limit = 0;
 static int g_small_inplace = 0;
+static off_t g_ssh_putfile_max = 0;   /* max size streamed as one PUTFILE frame */
 
 #define MAX_LARGE_BUFFER_BUDGET_MB 8192
 
@@ -326,6 +328,15 @@ static void init_runtime_config(void)
     {
         const char *s = getenv("DIRECT_COPY_SMALL_INPLACE");
         g_small_inplace = (s && *s && strcmp(s, "0") != 0) ? 1 : 0;
+    }
+
+    {
+        /* Files at or below this size are shipped to an SSH target as a single
+         * fire-and-forget PUTFILE frame (KiB; default 1 MiB). Capped so the
+         * frame stays within the protocol limit. */
+        int kib = env_int_or_default("DIRECT_COPY_SSH_PUTFILE_MAX", 1024, 0,
+                                     (int)((ECOPY_MAX_FRAME - (1u << 16)) / 1024u));
+        g_ssh_putfile_max = (off_t)kib * 1024;
     }
 
     if (g_explicit_large_readers > 0 && g_explicit_large_writers > 0) {
@@ -1902,6 +1913,47 @@ static work_claim_t dequeue_work(void)
 /* -------------------- remote (SSH) destination copy -------------------- */
 
 /*
+ * Small-file fast path: read the whole file locally and ship it as a single
+ * fire-and-forget PUTFILE frame (no OPEN/COMMIT round trip). This is the main
+ * lever for gazillion-tiny-file trees, where per-file round trips - not
+ * bandwidth - are the bottleneck. Returns 0 on success, -1 on local read
+ * error (transport errors surface at the next barrier).
+ */
+static int copy_file_remote_putfile(file_task_t *task, off_t size)
+{
+    int fd_in;
+    void *buf;
+    off_t pos = 0;
+
+    fd_in = open_read_at_buffered(task->dir->src_fd, task->name, task->src, &task->src_st);
+    if (fd_in < 0) {
+        return -1;
+    }
+
+    buf = thread_io_buffer((size_t)(size > 0 ? size : 1));
+    if (!buf) {
+        fprintf(stderr, "thread_io_buffer failed\n");
+        close(fd_in);
+        return -1;
+    }
+
+    while (pos < size) {
+        ssize_t r = pread_nocancel(fd_in, (char *)buf + pos, (size_t)(size - pos), pos);
+        if (r < 0) { perror("pread"); close(fd_in); return -1; }
+        if (r == 0) break; /* file shrank under us; send what we have */
+        pos += r;
+    }
+    close(fd_in);
+
+    if (sshx_putfile(task->dst, &task->src_st, buf, (size_t)pos,
+                     runtime_small_inplace()) != 0) {
+        return -1;
+    }
+    record_progress_bytes((uint64_t)pos, 1);
+    return 0;
+}
+
+/*
  * Stream one source file to the remote peer. Reads the source locally (O_DIRECT
  * where possible; buffered for sparse files so SEEK_DATA/SEEK_HOLE works) and
  * emits pipelined WRITE frames. Sparse files send only their data extents and a
@@ -1925,6 +1977,14 @@ static int copy_file_remote(file_task_t *task)
 
     init_runtime_config();
     stats_set_current_file(task->src, (uint64_t)size, 0);
+
+    /* Non-sparse small files go in one fire-and-forget frame. Sparse files stay
+     * on the streamed path so their holes are preserved on the far side. */
+    if (!sparse && size <= g_ssh_putfile_max) {
+        int prc = copy_file_remote_putfile(task, size);
+        stats_clear_current_file(task->src);
+        return prc;
+    }
 
     if (sparse) {
         fd_in = open_read_at_buffered(task->dir->src_fd, task->name, task->src, &task->src_st);

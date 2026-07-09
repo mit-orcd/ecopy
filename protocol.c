@@ -93,6 +93,20 @@ int frame_write_data(int fd, uint64_t id, uint64_t file_id, int64_t offset,
     return 0;
 }
 
+int frame_write_parts(int fd, uint8_t type, uint64_t id,
+                      const void *head, uint32_t head_len,
+                      const void *data, size_t data_len)
+{
+    uint8_t hdr[ECOPY_HDR_LEN];
+    uint32_t plen = (uint32_t)(head_len + data_len);
+
+    encode_header(hdr, type, id, plen);
+    if (io_write_all(fd, hdr, ECOPY_HDR_LEN) != 0) return -1;
+    if (head_len && io_write_all(fd, head, head_len) != 0) return -1;
+    if (data_len && io_write_all(fd, data, data_len) != 0) return -1;
+    return 0;
+}
+
 int frame_read_header(int fd, uint8_t *type, uint64_t *id, uint32_t *plen)
 {
     uint8_t hdr[ECOPY_HDR_LEN];

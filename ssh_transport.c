@@ -58,7 +58,13 @@ typedef struct {
     _Atomic uint64_t next_id;
     _Atomic uint64_t next_file_id;
 
+    _Atomic uint64_t ops_since_barrier;  /* fire-and-forget ops awaiting a drain */
+    uint64_t barrier_ops;                /* periodic-barrier threshold */
+    int remote_failed;                   /* a barrier reported remote errors */
+    pthread_mutex_t barrier_lock;        /* only one periodic barrier in flight */
+
     char remote_root[PATH_MAX];
+    int remote_root_present;             /* dst root existed before this run */
 } conn_t;
 
 static conn_t g_conn;
@@ -413,7 +419,10 @@ static int handshake(const char *expect_path)
     if (sver != ECOPY_PROTO_VERSION) {
         return 1; /* version mismatch: bootstrap a matching binary */
     }
+    /* v2 appends a root-present flag; absent bytes decode as 0 (fresh). */
+    uint8_t root_present = pdec_u8(&d);
     g_conn.caps = scaps;
+    g_conn.remote_root_present = (!d.error && root_present) ? 1 : 0;
     snprintf(g_conn.remote_root, sizeof(g_conn.remote_root), "%s", sroot);
     return 0;
 }
@@ -533,8 +542,18 @@ int sshx_connect(const ssh_target_t *t)
     pthread_mutex_init(&g_conn.send_lock, NULL);
     pthread_mutex_init(&g_conn.pend_lock, NULL);
     pthread_cond_init(&g_conn.pend_cond, NULL);
+    pthread_mutex_init(&g_conn.barrier_lock, NULL);
     atomic_store(&g_conn.next_id, 1);
     atomic_store(&g_conn.next_file_id, 1);
+    atomic_store(&g_conn.ops_since_barrier, 0);
+
+    {
+        const char *s = getenv("DIRECT_COPY_SSH_BARRIER_OPS");
+        long v = (s && *s) ? strtol(s, NULL, 10) : 0;
+        if (v < 256) v = 8192;          /* default / floor */
+        if (v > 1000000) v = 1000000;
+        g_conn.barrier_ops = (uint64_t)v;
+    }
 
     /* SIGPIPE would kill us if ssh dies mid-write; treat write errors instead. */
     signal(SIGPIPE, SIG_IGN);
@@ -591,6 +610,11 @@ const char *sshx_remote_root(void)
     return g_conn.remote_root;
 }
 
+int sshx_remote_root_present(void)
+{
+    return g_conn.remote_root_present;
+}
+
 void sshx_disconnect(void)
 {
     if (!g_conn.active) return;
@@ -638,6 +662,27 @@ static int request_status(uint8_t type, const uint8_t *payload, uint32_t plen)
     return 0;
 }
 
+/*
+ * Count one fire-and-forget op and, once enough have accumulated, issue a
+ * periodic BARRIER to bound the outstanding window and surface remote errors
+ * mid-run. Guarded so only one periodic barrier is ever in flight.
+ */
+static void maybe_periodic_barrier(void)
+{
+    uint64_t n = atomic_fetch_add(&g_conn.ops_since_barrier, 1) + 1;
+    if (n < g_conn.barrier_ops) {
+        return;
+    }
+    if (pthread_mutex_trylock(&g_conn.barrier_lock) != 0) {
+        return;
+    }
+    if (atomic_load(&g_conn.ops_since_barrier) >= g_conn.barrier_ops) {
+        atomic_store(&g_conn.ops_since_barrier, 0);
+        (void)sshx_barrier(0);
+    }
+    pthread_mutex_unlock(&g_conn.barrier_lock);
+}
+
 int sshx_mkdir(const char *path, mode_t mode)
 {
     uint8_t buf[PATH_MAX + 16];
@@ -645,7 +690,12 @@ int sshx_mkdir(const char *path, mode_t mode)
     penc_str(&e, path);
     penc_u32(&e, (uint32_t)mode);
     if (e.overflow) { errno = ENAMETOOLONG; return -1; }
-    return request_status(MSG_MKDIR, buf, (uint32_t)e.len);
+    /* Fire-and-forget: errors surface at the next barrier. */
+    if (conn_send(MSG_MKDIR, next_request_id(), buf, (uint32_t)e.len) != 0) {
+        return -1;
+    }
+    maybe_periodic_barrier();
+    return 0;
 }
 
 static void decode_stat_entry(pdec_t *d, int *present, struct stat *st)
@@ -743,7 +793,78 @@ int sshx_setmeta(const char *path, const struct stat *src_st, int is_dir)
     encode_meta(&e, src_st);
     penc_u8(&e, (uint8_t)(is_dir ? 1 : 0));
     if (e.overflow) { errno = ENAMETOOLONG; return -1; }
-    return request_status(MSG_SETMETA, buf, (uint32_t)e.len);
+    /* Fire-and-forget: errors surface at the next barrier. */
+    if (conn_send(MSG_SETMETA, next_request_id(), buf, (uint32_t)e.len) != 0) {
+        return -1;
+    }
+    maybe_periodic_barrier();
+    return 0;
+}
+
+int sshx_putfile(const char *final_path, const struct stat *src_st,
+                 const void *buf, size_t len, int inplace)
+{
+    uint8_t head[PATH_MAX + 64];
+    penc_t e; penc_init(&e, head, sizeof(head));
+    penc_u32(&e, (uint32_t)(src_st->st_mode & 07777));
+    penc_u32(&e, (uint32_t)src_st->st_uid);
+    penc_u32(&e, (uint32_t)src_st->st_gid);
+    penc_i64(&e, (int64_t)src_st->st_atim.tv_sec);
+    penc_i64(&e, (int64_t)src_st->st_atim.tv_nsec);
+    penc_i64(&e, (int64_t)src_st->st_mtim.tv_sec);
+    penc_i64(&e, (int64_t)src_st->st_mtim.tv_nsec);
+    penc_u32(&e, (uint32_t)(inplace ? ECOPY_OPEN_INPLACE : 0));
+    penc_str(&e, final_path);
+    if (e.overflow) { errno = ENAMETOOLONG; return -1; }
+
+    int rc;
+    pthread_mutex_lock(&g_conn.send_lock);
+    rc = frame_write_parts(g_conn.in_fd, MSG_PUTFILE, next_request_id(),
+                           head, (uint32_t)e.len, buf, len);
+    pthread_mutex_unlock(&g_conn.send_lock);
+    if (rc != 0) {
+        conn_mark_failed();
+        return -1;
+    }
+    maybe_periodic_barrier();
+    return 0;
+}
+
+int sshx_barrier(int flush)
+{
+    uint8_t buf[1];
+    penc_t e; penc_init(&e, buf, sizeof(buf));
+    penc_u8(&e, (uint8_t)(flush ? 1 : 0));
+
+    uint64_t id = next_request_id();
+    pending_t *p = pending_add(id);
+    if (!p) return -1;
+    if (conn_send(MSG_BARRIER, id, buf, (uint32_t)e.len) != 0) { pending_remove(p); return -1; }
+    if (pending_wait(p) != 0) { pending_remove(p); return -1; }
+
+    pdec_t d; pdec_init(&d, p->resp, p->resp_len);
+    int32_t status = (int32_t)pdec_u32(&d);
+    uint32_t err_count = pdec_u32(&d);
+    char first[PATH_MAX];
+    if (pdec_str(&d, first, sizeof(first)) != 0) first[0] = '\0';
+    pending_remove(p);
+
+    if (err_count > 0) {
+        if (!g_conn.remote_failed) {
+            fprintf(stderr, "ecopy: remote reported %u error(s); first: %s (%s)\n",
+                    err_count, first[0] ? first : "(unknown)",
+                    strerror(status < 0 ? -status : (status ? status : EIO)));
+        }
+        g_conn.remote_failed = 1;
+        return -1;
+    }
+    return 0;
+}
+
+int sshx_flush(void)
+{
+    int rc = sshx_barrier(1);
+    return (rc != 0 || g_conn.remote_failed) ? -1 : 0;
 }
 
 /* -------------------- per-file streaming -------------------- */
