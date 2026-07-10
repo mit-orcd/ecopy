@@ -2163,6 +2163,14 @@ int workers_start(void)
 
     init_runtime_config();
     validate_runtime_config();
+    /*
+     * Every SSH file is routed through the small queue. Creating the remaining
+     * generic workers only leaves hundreds of threads parked on g_queue_cond
+     * (and makes a batch wake unnecessarily expensive).
+     */
+    if (sshx_active() && g_worker_count > g_small_worker_limit) {
+        g_worker_count = g_small_worker_limit;
+    }
     clear_worker_error();
 
     pthread_mutex_lock(&g_queue_lock);
@@ -2354,7 +2362,19 @@ int workers_enqueue_remote_batch(dir_handle_t *dir,
         }
         g_small_queue_tail = chunk_tail;
         g_small_queue_depth += take;
-        pthread_cond_broadcast(&g_queue_cond);
+        {
+            int wake_count = g_small_worker_limit - (int)g_small_workers_active;
+            int free_slots = g_worker_count - total_worker_slots_used_locked();
+            if (wake_count > free_slots) {
+                wake_count = free_slots;
+            }
+            if (wake_count > (int)g_small_queue_depth) {
+                wake_count = (int)g_small_queue_depth;
+            }
+            for (int i = 0; i < wake_count; i++) {
+                pthread_cond_signal(&g_queue_cond);
+            }
+        }
         pthread_mutex_unlock(&g_queue_lock);
 
         batch_head = rest;

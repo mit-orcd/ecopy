@@ -88,7 +88,9 @@ static void log_op_error(const char *path, int err)
  *
  * An entry is inserted as CREATING before the syscall. Other workers asking
  * for that exact directory wait on the entry, so only one mkdir sequence is
- * ever in flight per path. Entries live for the server process lifetime.
+ * ever in flight per path. A wide table keeps chains short on million-dir
+ * trees, while sharded locks let unrelated paths proceed concurrently.
+ * Entries live for the server process lifetime.
  */
 typedef enum {
     DIR_CREATING = 0,
@@ -106,9 +108,11 @@ typedef struct dir_cache_entry {
     char path[];
 } dir_cache_entry_t;
 
-#define DIR_CACHE_BUCKETS 4096u
+#define DIR_CACHE_BUCKETS (1u << 20)
+#define DIR_CACHE_SHARDS  256u
 static dir_cache_entry_t *g_dir_cache[DIR_CACHE_BUCKETS];
-static pthread_mutex_t g_dir_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_dir_cache_locks[DIR_CACHE_SHARDS];
+static int g_dir_cache_initialized;
 static __thread char g_last_dir[PATH_MAX];
 
 /*
@@ -292,6 +296,20 @@ static dir_cache_entry_t *dir_cache_find_locked(const char *path, uint32_t bucke
     return NULL;
 }
 
+static int dir_cache_init(void)
+{
+    for (size_t i = 0; i < DIR_CACHE_SHARDS; i++) {
+        if (pthread_mutex_init(&g_dir_cache_locks[i], NULL) != 0) {
+            for (size_t j = 0; j < i; j++) {
+                pthread_mutex_destroy(&g_dir_cache_locks[j]);
+            }
+            return -1;
+        }
+    }
+    g_dir_cache_initialized = 1;
+    return 0;
+}
+
 static int existing_path_is_dir(const char *path)
 {
     struct stat st;
@@ -313,7 +331,10 @@ static int existing_path_is_dir(const char *path)
  */
 static int ensure_dir_cached_mode(const char *dir, mode_t mode)
 {
+    uint32_t hash;
     uint32_t bucket;
+    uint32_t shard;
+    pthread_mutex_t *lock;
     dir_cache_entry_t *entry;
     size_t len;
     int rc = -1;
@@ -323,20 +344,23 @@ static int ensure_dir_cached_mode(const char *dir, mode_t mode)
         return 0;
     }
 
-    bucket = dir_cache_hash(dir) % DIR_CACHE_BUCKETS;
-    pthread_mutex_lock(&g_dir_cache_lock);
+    hash = dir_cache_hash(dir);
+    bucket = hash & (DIR_CACHE_BUCKETS - 1u);
+    shard = hash & (DIR_CACHE_SHARDS - 1u);
+    lock = &g_dir_cache_locks[shard];
+    pthread_mutex_lock(lock);
     entry = dir_cache_find_locked(dir, bucket);
     if (entry) {
         while (entry->state == DIR_CREATING) {
-            pthread_cond_wait(&entry->ready, &g_dir_cache_lock);
+            pthread_cond_wait(&entry->ready, lock);
         }
         if (entry->state == DIR_READY) {
             snprintf(g_last_dir, sizeof(g_last_dir), "%s", dir);
-            pthread_mutex_unlock(&g_dir_cache_lock);
+            pthread_mutex_unlock(lock);
             return 0;
         }
         saved_err = entry->err;
-        pthread_mutex_unlock(&g_dir_cache_lock);
+        pthread_mutex_unlock(lock);
         errno = saved_err;
         return -1;
     }
@@ -344,7 +368,7 @@ static int ensure_dir_cached_mode(const char *dir, mode_t mode)
     len = strlen(dir);
     entry = malloc(sizeof(*entry) + len + 1);
     if (!entry) {
-        pthread_mutex_unlock(&g_dir_cache_lock);
+        pthread_mutex_unlock(lock);
         errno = ENOMEM;
         return -1;
     }
@@ -356,7 +380,7 @@ static int ensure_dir_cached_mode(const char *dir, mode_t mode)
     pthread_cond_init(&entry->ready, NULL);
     entry->next = g_dir_cache[bucket];
     g_dir_cache[bucket] = entry;
-    pthread_mutex_unlock(&g_dir_cache_lock);
+    pthread_mutex_unlock(lock);
 
     if (mkdir(dir, mode) == 0) {
         entry->mode_known = 1;
@@ -393,7 +417,7 @@ static int ensure_dir_cached_mode(const char *dir, mode_t mode)
         saved_err = errno;
     }
 
-    pthread_mutex_lock(&g_dir_cache_lock);
+    pthread_mutex_lock(lock);
     if (rc == 0) {
         entry->state = DIR_READY;
         snprintf(g_last_dir, sizeof(g_last_dir), "%s", dir);
@@ -402,7 +426,7 @@ static int ensure_dir_cached_mode(const char *dir, mode_t mode)
         entry->err = saved_err ? saved_err : EIO;
     }
     pthread_cond_broadcast(&entry->ready);
-    pthread_mutex_unlock(&g_dir_cache_lock);
+    pthread_mutex_unlock(lock);
 
     if (rc != 0) {
         errno = entry->err;
@@ -412,16 +436,18 @@ static int ensure_dir_cached_mode(const char *dir, mode_t mode)
 
 static int dir_cache_mode_matches(const char *dir, mode_t mode)
 {
-    uint32_t bucket = dir_cache_hash(dir) % DIR_CACHE_BUCKETS;
+    uint32_t hash = dir_cache_hash(dir);
+    uint32_t bucket = hash & (DIR_CACHE_BUCKETS - 1u);
+    pthread_mutex_t *lock = &g_dir_cache_locks[hash & (DIR_CACHE_SHARDS - 1u)];
     int matches = 0;
 
-    pthread_mutex_lock(&g_dir_cache_lock);
+    pthread_mutex_lock(lock);
     dir_cache_entry_t *entry = dir_cache_find_locked(dir, bucket);
     if (entry && entry->state == DIR_READY && entry->mode_known &&
         entry->mode == (mode & 07777)) {
         matches = 1;
     }
-    pthread_mutex_unlock(&g_dir_cache_lock);
+    pthread_mutex_unlock(lock);
     return matches;
 }
 
@@ -436,6 +462,12 @@ static void dir_cache_destroy(void)
             entry = next;
         }
         g_dir_cache[i] = NULL;
+    }
+    if (g_dir_cache_initialized) {
+        for (size_t i = 0; i < DIR_CACHE_SHARDS; i++) {
+            pthread_mutex_destroy(&g_dir_cache_locks[i]);
+        }
+        g_dir_cache_initialized = 0;
     }
 }
 
@@ -1056,6 +1088,10 @@ int server_main(const char *root)
     }
     if (normalize_abs(root, g_root_norm, sizeof(g_root_norm)) != 0) {
         fprintf(stderr, "ecopy --server: bad root path\n");
+        return 1;
+    }
+    if (dir_cache_init() != 0) {
+        fprintf(stderr, "ecopy --server: cannot initialize directory cache\n");
         return 1;
     }
 

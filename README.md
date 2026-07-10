@@ -58,7 +58,7 @@ The target may be an `ssh://` URL to push a local tree to another host:
   only their data extents so holes are recreated remotely.
 - **Directories are created lazily by their contents:** the first file written into a directory creates it (and any
   missing parents), so no separate `MKDIR` round-trip is spent on directories that hold files. A shared
-  single-flight cache guarantees that only one server worker creates a path; the others reuse the result instead of
+  sharded single-flight cache guarantees that only one server worker creates a path; the others reuse the result instead of
   duplicating NFS LOOKUP/MKDIR RPCs. Missing parents are walked only after an optimistic leaf `mkdir` returns
   `ENOENT`. An explicit `MKDIR` is sent only for directories that end up with no files.
 - **Batched durability:** each file is written and (incrementally) atomically renamed into place, but there is no
@@ -125,7 +125,7 @@ Best settings are workload- and environment-dependent. Key knobs (defaults in pa
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `DIRECT_COPY_MAX_WORKERS` | 256 | Total shared worker-slot budget (clamped 2–512) |
-| `DIRECT_COPY_SMALL_MAX_WORKERS` | 32 | Cap on concurrent small-file workers |
+| `DIRECT_COPY_SMALL_MAX_WORKERS` | 32 | Cap on concurrent small-file workers; also caps threads created for SSH targets |
 | `DIRECT_COPY_LARGE_READERS` / `DIRECT_COPY_LARGE_WRITERS` | 4 / 2 | Threads per active large file |
 | `DIRECT_COPY_LARGE_FILE_INFLIGHT` | 16 | Chunk buffers in flight per large file |
 | `DIRECT_COPY_CHUNK_MB` | 1 | Aligned bulk-transfer chunk size (1–4096) |
