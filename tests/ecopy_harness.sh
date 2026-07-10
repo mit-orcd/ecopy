@@ -348,6 +348,11 @@ case_ssh_loopback() {
     mkdir -p "$s/tiny/one" "$s/tiny/two"
     for i in $(seq 1 60); do printf 'x' > "$s/tiny/one/t_$i"; done
     for i in $(seq 1 60); do printf 'yy' > "$s/tiny/two/u_$i"; done
+    # A directory whose ONLY child is a large (streamed) file. The client sends
+    # no explicit MKDIR for it, so the server's streamed OPEN must create the
+    # parent on its own. run_ecopy_ssh forces the large-file threshold to 1 MiB.
+    mkdir -p "$s/bigonly"
+    head -c 2200000 /dev/urandom > "$s/bigonly/stream.bin"
     truncate -s 64M "$s/sparse.bin"
     dd if=/dev/urandom of="$s/sparse.bin" bs=1M count=2 conv=notrunc status=none
     dd if=/dev/urandom of="$s/sparse.bin" bs=1M count=2 seek=32 conv=notrunc status=none
@@ -360,6 +365,11 @@ case_ssh_loopback() {
     fi
     if [[ -d "$d/empty" ]]; then ok "empty dir preserved over ssh"; else fail "empty dir missing over ssh"; fi
     if [[ -d "$d/deep/d1/d2/d3" ]]; then ok "deep empty dir chain created over ssh"; else fail "deep empty dir chain missing over ssh"; fi
+    if [[ -d "$d/bigonly" && -f "$d/bigonly/stream.bin" ]]; then
+        ok "dir with only a streamed file created over ssh"
+    else
+        fail "streamed-only dir not created over ssh"
+    fi
     if [[ "$(mode_bits "$s/a/b")" == "$(mode_bits "$d/a/b")" ]]; then
         ok "directory mode preserved over ssh"
     else
@@ -473,6 +483,40 @@ case_single_file() {
     fi
 }
 
+# --no-preserve-times: content and mode are still reproduced, but the mtime is
+# NOT carried over (the server skips the futimens SETATTR).
+case_ssh_no_preserve_times() {
+    case_begin "ssh-no-preserve-times"
+    local s="$work/nptime_src" d="$work/nptime_dst"
+    mkdir -p "$s/sub"
+    printf 'keep my content\n' > "$s/sub/f.txt"
+    chmod 0640 "$s/sub/f.txt"
+    # Give the source a distinctly old mtime so "not preserved" is unambiguous.
+    touch -d '2001-02-03 04:05:06' "$s/sub/f.txt"
+
+    local -a env_extra=(DIRECT_COPY_LARGE_THRESHOLD_MB=1 ECOPY_REMOTE_CMD="$bin")
+    if [[ "${ECOPY_HARNESS_REAL_SSH:-0}" != "1" ]]; then
+        env_extra+=(ECOPY_SSH="$repo_root/tests/fake_ssh.sh")
+    fi
+    if env "${common_env[@]}" "${env_extra[@]}" "$bin" --no-preserve-times \
+        "$s" "ssh://localhost${d}" >/dev/null 2>&1 \
+        && cmp -s "$s/sub/f.txt" "$d/sub/f.txt"; then
+        ok "content copied with --no-preserve-times"
+    else
+        fail "content mismatch with --no-preserve-times"
+    fi
+    if [[ "$(mode_bits "$s/sub/f.txt")" == "$(mode_bits "$d/sub/f.txt")" ]]; then
+        ok "mode preserved with --no-preserve-times"
+    else
+        fail "mode mismatch with --no-preserve-times"
+    fi
+    if [[ "$(stat -c %Y "$s/sub/f.txt")" != "$(stat -c %Y "$d/sub/f.txt")" ]]; then
+        ok "mtime not carried over with --no-preserve-times"
+    else
+        fail "mtime unexpectedly preserved with --no-preserve-times"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
@@ -489,6 +533,7 @@ case_readonly_mode
 case_single_file
 case_ssh_loopback
 case_ssh_batch_failure
+case_ssh_no_preserve_times
 
 echo
 echo "ecopy harness results: $pass_count passed, $fail_count failed"

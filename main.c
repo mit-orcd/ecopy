@@ -28,11 +28,13 @@
 
 static void usage(const char *prog) {
     fprintf(stderr,
-            "Usage: %s [-v|--verbose] <source> <target>\n"
+            "Usage: %s [-v|--verbose] [--no-preserve-times] <source> <target>\n"
             "       <source> may be a directory or a single regular file\n"
             "       <target> may be a local path or ssh://[user@]host[:port]/path\n"
             "       For a file source, <target> is the destination directory (or\n"
-            "       a full destination path locally); ssh:// targets are directories.\n",
+            "       a full destination path locally); ssh:// targets are directories.\n"
+            "       --no-preserve-times skips atime/mtime on ssh:// targets (one\n"
+            "       fewer SETATTR RPC per file/dir).\n",
             prog);
 }
 
@@ -494,16 +496,33 @@ int main(int argc, char **argv) {
         return server_main(argv[2]);
     }
 
-    if (argc == 4 && (strcmp(argv[1], "-v") == 0 || strcmp(argv[1], "--verbose") == 0)) {
-        verbose = 1;
-        src_arg = argv[2];
-        dst_arg = argv[3];
-    } else if (argc == 3) {
-        src_arg = argv[1];
-        dst_arg = argv[2];
-    } else {
-        usage(argv[0]);
-        return 1;
+    int no_preserve_times = 0;
+    {
+        const char *pos[2] = { NULL, NULL };
+        int npos = 0;
+        for (int i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
+                verbose = 1;
+            } else if (strcmp(argv[i], "--no-preserve-times") == 0) {
+                no_preserve_times = 1;
+            } else if (argv[i][0] == '-' && argv[i][1] != '\0' &&
+                       strcmp(argv[i], "-") != 0) {
+                fprintf(stderr, "ecopy: unknown option: %s\n", argv[i]);
+                usage(argv[0]);
+                return 1;
+            } else if (npos < 2) {
+                pos[npos++] = argv[i];
+            } else {
+                usage(argv[0]);
+                return 1;
+            }
+        }
+        if (npos != 2) {
+            usage(argv[0]);
+            return 1;
+        }
+        src_arg = pos[0];
+        dst_arg = pos[1];
     }
 
     if (ssh_target_is_url(src_arg)) {
@@ -539,6 +558,9 @@ int main(int argc, char **argv) {
         if (ssh_target_parse(dst_arg, &target) != 0) {
             fprintf(stderr, "ecopy: malformed ssh target: %s\n", dst_arg);
             return 1;
+        }
+        if (no_preserve_times) {
+            sshx_set_preserve_times(0);
         }
         if (sshx_connect(&target) != 0) {
             return 1;

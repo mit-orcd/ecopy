@@ -72,6 +72,13 @@ typedef enum {
 #define ECOPY_CAP_FALLOCATE 0x1u
 #define ECOPY_CAP_SPARSE    0x2u
 
+/*
+ * Client option bits appended to HELLO (after the requested thread count).
+ * Absent (older clients) decodes as 0; the server treats a missing
+ * PRESERVE_TIMES bit as "preserve" so behavior is unchanged by default.
+ */
+#define ECOPY_OPT_PRESERVE_TIMES 0x1u  /* apply atime/mtime (else skip the SETATTR) */
+
 /* Fixed frame header: type(u8), request id(u64 LE), payload length(u32 LE). */
 #define ECOPY_HDR_LEN 13u
 

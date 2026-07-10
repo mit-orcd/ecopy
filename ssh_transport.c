@@ -69,6 +69,14 @@ typedef struct {
 
 static conn_t g_conn;
 
+/* -1 = unset (consult env); 0/1 = explicit override for time preservation. */
+static int g_preserve_times = -1;
+
+void sshx_set_preserve_times(int on)
+{
+    g_preserve_times = on ? 1 : 0;
+}
+
 struct sshx_file {
     uint64_t file_id;
     char final_path[PATH_MAX];
@@ -392,12 +400,24 @@ static int handshake(const char *expect_path)
         want_threads = (int)v;
     }
 
+    /* Whether the remote should preserve atime/mtime. Explicit setter wins;
+     * otherwise DIRECT_COPY_NO_PRESERVE_TIMES; default preserve. */
+    int preserve_times;
+    if (g_preserve_times >= 0) {
+        preserve_times = g_preserve_times ? 1 : 0;
+    } else {
+        const char *s = getenv("DIRECT_COPY_NO_PRESERVE_TIMES");
+        preserve_times = (s && *s && strcmp(s, "0") != 0) ? 0 : 1;
+    }
+    uint32_t options = preserve_times ? ECOPY_OPT_PRESERVE_TIMES : 0;
+
     penc_init(&e, buf, sizeof(buf));
     penc_u32(&e, ECOPY_PROTO_VERSION);
     penc_u32(&e, ECOPY_CAP_FALLOCATE | ECOPY_CAP_SPARSE);
     penc_str(&e, lname);
     penc_str(&e, expect_path);
     penc_u32(&e, (uint32_t)want_threads);
+    penc_u32(&e, options);
     if (e.overflow) return -1;
 
     if (frame_write(g_conn.in_fd, MSG_HELLO, 1, buf, (uint32_t)e.len) != 0) {

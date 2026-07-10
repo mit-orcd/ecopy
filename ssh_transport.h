@@ -39,6 +39,15 @@ int ssh_target_parse(const char *s, ssh_target_t *out);
 int ssh_target_is_url(const char *s);
 
 /*
+ * Request that the remote peer skip (0) or apply (1) atime/mtime on copied
+ * items, saving one SETATTR RPC per file and directory when disabled. Must be
+ * called before sshx_connect() (it is sent in the handshake). If never called,
+ * the DIRECT_COPY_NO_PRESERVE_TIMES environment variable is consulted, else
+ * times are preserved.
+ */
+void sshx_set_preserve_times(int on);
+
+/*
  * Connect to the remote target: spawn ssh + `ecopy --server <path>`, perform
  * the version/capability handshake, and self-bootstrap the remote binary if it
  * is missing or an incompatible version. Returns 0 on success. On success the

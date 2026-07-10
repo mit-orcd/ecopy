@@ -57,6 +57,7 @@ static uint32_t g_caps;
 static int g_root_present;           /* did the confinement root exist before we ran? */
 static uid_t g_euid;                 /* our effective ids: skip no-op chown RPCs */
 static gid_t g_egid;
+static int g_preserve_times = 1;     /* client HELLO option: apply atime/mtime? */
 
 /*
  * Deferred error log for fire-and-forget operations (PUTFILE/MKDIR/SETMETA).
@@ -258,22 +259,24 @@ static int ensure_dir_cached(const char *dir)
  *     created by us, so it already has these ids -- a no-op RPC otherwise);
  *   - skip fchmod when the caller created the file with the final mode already
  *     (mode_is_set); directories and re-used temps still pass 0.
- * futimens is always issued when we want to preserve times.
+ *   - skip futimens entirely when the client asked not to preserve times.
  */
 static void apply_meta(int fd, uint32_t uid, uint32_t gid, uint32_t mode,
                        int64_t at_s, int64_t at_ns, int64_t mt_s, int64_t mt_ns,
                        int mode_is_set)
 {
-    struct timespec ts[2];
     if ((uid_t)uid != g_euid || (gid_t)gid != g_egid) {
         (void)fchown(fd, (uid_t)uid, (gid_t)gid);   /* best effort, like local path */
     }
     if (!mode_is_set) {
         (void)fchmod(fd, (mode_t)(mode & 07777));
     }
-    ts[0].tv_sec = (time_t)at_s; ts[0].tv_nsec = (long)at_ns;
-    ts[1].tv_sec = (time_t)mt_s; ts[1].tv_nsec = (long)mt_ns;
-    (void)futimens(fd, ts);
+    if (g_preserve_times) {
+        struct timespec ts[2];
+        ts[0].tv_sec = (time_t)at_s; ts[0].tv_nsec = (long)at_ns;
+        ts[1].tv_sec = (time_t)mt_s; ts[1].tv_nsec = (long)mt_ns;
+        (void)futimens(fd, ts);
+    }
 }
 
 /* -------------------- message handlers -------------------- */
@@ -289,6 +292,10 @@ static int handle_hello(uint64_t id, const uint8_t *payload, uint32_t plen, cons
     /* v2 appends the client's requested apply-pool size; absent -> single. */
     uint32_t want_threads = pdec_u32(&d);
     if (d.error) want_threads = 0;
+    /* ...followed by client option bits. A missing PRESERVE_TIMES bit from an
+     * older client is treated as "preserve" so default behavior is unchanged. */
+    uint32_t opts = pdec_u32(&d);
+    g_preserve_times = (d.error || (opts & ECOPY_OPT_PRESERVE_TIMES)) ? 1 : 0;
 
     g_caps = ccaps;
 
@@ -344,14 +351,23 @@ static void handle_open(const uint8_t *payload, uint32_t plen)
     }
     snprintf(f->final_path, sizeof(f->final_path), "%s", finalp);
 
+    /* Ensure the parent exists. The client no longer sends a per-directory
+     * MKDIR for directories that contain files, so a streamed file may be the
+     * thing that first materializes its directory. */
+    char dir[PATH_MAX], base[PATH_MAX];
+    split_dir_base(finalp, dir, sizeof(dir), base, sizeof(base));
+    if (ensure_dir_cached(dir) != 0) {
+        f->failed = 1; f->err = -errno;
+        f->next = g_files; g_files = f;
+        return;
+    }
+
     int fd;
     if (f->inplace) {
         snprintf(f->tmp_path, sizeof(f->tmp_path), "%s", finalp);
         fd = open(finalp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,
                   copy_data_mode((mode_t)mode));
     } else {
-        char dir[PATH_MAX], base[PATH_MAX];
-        split_dir_base(finalp, dir, sizeof(dir), base, sizeof(base));
         int need = snprintf(f->tmp_path, sizeof(f->tmp_path), "%s/.ecopy.tmp.%u.%llu",
                             dir, (unsigned)getpid(), (unsigned long long)fid);
         if (need < 0 || need >= (int)sizeof(f->tmp_path)) {

@@ -565,6 +565,7 @@ static void process_dir_entries_remote(dir_handle_t *handle,
     struct dirent *entry;
     remote_scratch_t *s = remote_scratch_get();
     int n = 0;
+    int saw_file = 0;
 
     if (!s) {
         mark_traversal_error();
@@ -602,6 +603,7 @@ static void process_dir_entries_remote(dir_handle_t *handle,
                 continue;
             }
             stats_inc_files_seen();
+            saw_file = 1;
             snprintf(s->batch[n].name, sizeof(s->batch[n].name), "%s", entry->d_name);
             s->batch[n].st = st;
             n++;
@@ -616,6 +618,21 @@ static void process_dir_entries_remote(dir_handle_t *handle,
 
     if (remote_flush_batch(handle, node, s, n) != 0) {
         mark_traversal_error();
+    }
+
+    /*
+     * A directory that holds at least one file is materialized by that file's
+     * PUTFILE/OPEN (both mkdir -p their parent), so the explicit MKDIR would be
+     * a redundant round trip. Only send it for directories with no files
+     * (empty leaves and directories that hold only subdirectories), which
+     * guarantees empty subtrees are still created. The finalize SETMETA later
+     * fixes the mode/times of every directory regardless of how it was made.
+     */
+    if (!saw_file) {
+        if (sshx_mkdir(node->dst, node->src_st.st_mode & 07777) != 0) {
+            perror(node->dst);
+            mark_traversal_error();
+        }
     }
 }
 
@@ -662,14 +679,13 @@ static void process_directory_node(dir_node_t *node)
         return;
     }
     if (sshx_active()) {
-        /* Remote destination: create the directory over the protocol; there is
-         * no local destination fd. */
-        if (sshx_mkdir(node->dst, node->src_st.st_mode & 07777) != 0) {
-            perror(node->dst);
-            close(src_fd);
-            mark_traversal_error();
-            return;
-        }
+        /*
+         * Remote destination: no local descriptor. The directory is created
+         * lazily by its first file (PUTFILE/OPEN both mkdir -p their parent),
+         * so we only send an explicit MKDIR for directories that turn out to
+         * hold no files -- see process_dir_entries_remote. There is no local
+         * destination fd.
+         */
         stats_inc_dirs_created();
         dst_fd = -1;
     } else {

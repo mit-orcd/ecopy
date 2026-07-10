@@ -56,6 +56,9 @@ The target may be an `ssh://` URL to push a local tree to another host:
   per-item round-trip). A small file at or below `DIRECT_COPY_SSH_PUTFILE_MAX` ships as a single frame (path +
   metadata + data); larger files stream in pipelined chunks. Many files stream concurrently. Sparse files send
   only their data extents so holes are recreated remotely.
+- **Directories are created lazily by their contents:** the first file written into a directory creates it (and any
+  missing parents), so no separate `MKDIR` round-trip is spent on directories that hold files. An explicit `MKDIR`
+  is sent only for directories that end up with no files (empty leaves and directory-only nodes).
 - **Batched durability:** each file is written and (incrementally) atomically renamed into place, but there is no
   per-file `fsync`. A periodic and a final *barrier* drain the server, flush to stable storage, and report any
   errors as a batch (with the first offending path); a nonzero count fails the run. Tune the barrier cadence with
@@ -65,7 +68,9 @@ The target may be an `ssh://` URL to push a local tree to another host:
   (`DIRECT_COPY_SSH_SERVER_THREADS`, default 16) so many files land concurrently; ordering that matters (a
   directory's metadata, barriers, streamed files) is still preserved.
 - **Fewer RPCs per file:** the peer creates files with their final mode (no extra `fchmod`) and skips `chown` when
-  the owner already matches, so a fresh small file costs about a create + write + one time-stamp RPC.
+  the owner already matches, so a fresh small file costs about a create + write + one time-stamp RPC. Add
+  `--no-preserve-times` to drop the time-stamp SETATTR too (atime/mtime are not carried over), leaving roughly a
+  create + write per file.
 - **Fresh vs. incremental:** on the first copy into a non-existent destination root, per-directory bulk stats are
   skipped entirely and files are written straight to their final name (no temp + rename). Re-running into an
   existing destination keeps one bulk stat per directory (so unchanged files by `size + mtime` are skipped) and
@@ -74,6 +79,8 @@ The target may be an `ssh://` URL to push a local tree to another host:
   streamed over and executed (guarded by a matching `uname -sm`). Install `ecopy` in the remote `PATH` to skip this.
 - Requires working SSH access (key-based auth recommended). Set `ECOPY_SSH` to override the ssh command and
   `ECOPY_REMOTE_CMD` to point at a specific remote `ecopy` binary.
+- **Tip:** when the remote peer writes to an NFS-mounted destination, mounting it with `nconnect=N` (multiple TCP
+  connections) is a complementary, zero-code way to raise the concurrent-RPC ceiling that the apply pool feeds.
 
 ## What It Does
 
@@ -127,6 +134,7 @@ Best settings are workload- and environment-dependent. Key knobs (defaults in pa
 | `DIRECT_COPY_SSH_PUTFILE_MAX` | 1024 | Max size (KiB) a file may be to ship as a single `ssh://` PUTFILE frame |
 | `DIRECT_COPY_SSH_BARRIER_OPS` | 8192 | Fire-and-forget remote ops between drain/flush barriers (min 256) |
 | `DIRECT_COPY_SSH_SERVER_THREADS` | 16 | Apply threads on the `ssh://` peer; higher hides more per-op RPC latency (max 256) |
+| `DIRECT_COPY_NO_PRESERVE_TIMES` | 0 | Skip atime/mtime on `ssh://` targets (same as `--no-preserve-times`) |
 
 Out-of-range numeric values are clamped with a warning. The final report prints one suggested next-run experiment;
 `-v` adds the full diagnostic counters (per-phase seconds, read/write opens, queue/buffer waits, etc.) to help you
