@@ -8,6 +8,7 @@
 #ifndef WORKERS_H
 #define WORKERS_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -46,6 +47,19 @@ int workers_enqueue_large_file(dir_handle_t *dir,
                                const char *src,
                                const char *dst,
                                const struct stat *src_st);
+
+typedef struct {
+    const char *name;
+    const struct stat *src_st;
+} workers_batch_item_t;
+
+/*
+ * Enqueue remote files from one source/destination directory as one queue
+ * operation. Paths are built from dir->src/dir->dst and each item name.
+ */
+int workers_enqueue_remote_batch(dir_handle_t *dir,
+                                 const workers_batch_item_t *items,
+                                 size_t count);
 uint64_t workers_small_queue_depth(void);
 uint64_t workers_small_active_count(void);
 uint64_t workers_large_queue_depth(void);

@@ -345,14 +345,23 @@ case_ssh_loopback() {
     local i
     for i in $(seq 1 20); do printf 'file %d\n' "$i" > "$s/many_$i.txt"; done
     # Lots of tiny files across nested dirs to exercise the PUTFILE batch path.
-    mkdir -p "$s/tiny/one" "$s/tiny/two"
+    mkdir -p "$s/tiny/one" "$s/tiny/two" "$s/tiny/batch"
     for i in $(seq 1 60); do printf 'x' > "$s/tiny/one/t_$i"; done
     for i in $(seq 1 60); do printf 'yy' > "$s/tiny/two/u_$i"; done
+    # More than REMOTE_STAT_BATCH (512) entries exercises multi-task queue
+    # appends and the transition to a second batch.
+    for i in $(seq 1 600); do printf 'z' > "$s/tiny/batch/b_$i"; done
     # A directory whose ONLY child is a large (streamed) file. The client sends
     # no explicit MKDIR for it, so the server's streamed OPEN must create the
     # parent on its own. run_ecopy_ssh forces the large-file threshold to 1 MiB.
     mkdir -p "$s/bigonly"
     head -c 2200000 /dev/urandom > "$s/bigonly/stream.bin"
+    # Final directory metadata is pooled remotely; preserve distinctive modes
+    # and mtimes to validate its barrier/order rules.
+    chmod 0710 "$s/tiny"
+    chmod 0750 "$s/tiny/one"
+    touch -d '2002-03-04 05:06:07' "$s/tiny/one"
+    touch -d '2001-02-03 04:05:06' "$s/tiny"
     truncate -s 64M "$s/sparse.bin"
     dd if=/dev/urandom of="$s/sparse.bin" bs=1M count=2 conv=notrunc status=none
     dd if=/dev/urandom of="$s/sparse.bin" bs=1M count=2 seek=32 conv=notrunc status=none
@@ -374,6 +383,18 @@ case_ssh_loopback() {
         ok "directory mode preserved over ssh"
     else
         fail "directory mode mismatch over ssh"
+    fi
+    if [[ "$(mode_bits "$s/tiny")" == "$(mode_bits "$d/tiny")" &&
+          "$(mode_bits "$s/tiny/one")" == "$(mode_bits "$d/tiny/one")" ]]; then
+        ok "pooled directory modes preserved over ssh"
+    else
+        fail "pooled directory mode mismatch over ssh"
+    fi
+    if [[ "$(stat -c %Y "$s/tiny")" == "$(stat -c %Y "$d/tiny")" &&
+          "$(stat -c %Y "$s/tiny/one")" == "$(stat -c %Y "$d/tiny/one")" ]]; then
+        ok "pooled directory mtimes preserved over ssh"
+    else
+        fail "pooled directory mtime mismatch over ssh"
     fi
     if [[ "$(logical_size "$s/sparse.bin")" == "$(logical_size "$d/sparse.bin")" ]]; then
         ok "sparse logical size preserved over ssh"
@@ -422,6 +443,28 @@ case_ssh_batch_failure() {
         ok "barrier surfaced remote error"
     else
         fail "expected 'remote reported' diagnostic; got: $(tr '\n' ' ' <<<"$out")"
+    fi
+}
+
+# An empty source directory must not silently accept a destination regular file
+# as an already-created directory (the shared mkdir cache validates EEXIST).
+case_ssh_empty_dir_collision() {
+    case_begin "ssh-empty-dir-collision"
+    local s="$work/sshe_src" d="$work/sshe_dst"
+    mkdir -p "$s/empty" "$d"
+    printf 'do not modify\n' > "$d/empty"
+
+    local out rc
+    out="$(run_ecopy_ssh "$s" "$d" 2>&1)"; rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        ok "empty-dir collision exits nonzero"
+    else
+        fail "empty-dir collision unexpectedly succeeded"
+    fi
+    if [[ "$(cat "$d/empty")" == "do not modify" ]]; then
+        ok "empty-dir collision leaves destination file untouched"
+    else
+        fail "empty-dir collision modified destination file"
     fi
 }
 
@@ -533,6 +576,7 @@ case_readonly_mode
 case_single_file
 case_ssh_loopback
 case_ssh_batch_failure
+case_ssh_empty_dir_collision
 case_ssh_no_preserve_times
 
 echo

@@ -834,7 +834,7 @@ int sshx_setmeta(const char *path, const struct stat *src_st, int is_dir)
 }
 
 int sshx_putfile(const char *final_path, const struct stat *src_st,
-                 const void *buf, size_t len, int inplace)
+                 mode_t parent_mode, const void *buf, size_t len, int inplace)
 {
     uint8_t head[PATH_MAX + 64];
     penc_t e; penc_init(&e, head, sizeof(head));
@@ -846,6 +846,7 @@ int sshx_putfile(const char *final_path, const struct stat *src_st,
     penc_i64(&e, (int64_t)src_st->st_mtim.tv_sec);
     penc_i64(&e, (int64_t)src_st->st_mtim.tv_nsec);
     penc_u32(&e, (uint32_t)(inplace ? ECOPY_OPEN_INPLACE : 0));
+    penc_u32(&e, (uint32_t)(parent_mode & 07777));
     penc_str(&e, final_path);
     if (e.overflow) { errno = ENAMETOOLONG; return -1; }
 
@@ -902,7 +903,8 @@ int sshx_flush(void)
 /* -------------------- per-file streaming -------------------- */
 
 sshx_file_t *sshx_file_begin(const char *final_path, mode_t mode,
-                             off_t expected_size, int sparse, int inplace)
+                             mode_t parent_mode, off_t expected_size,
+                             int sparse, int inplace)
 {
     sshx_file_t *f = calloc(1, sizeof(*f));
     if (!f) return NULL;
@@ -918,6 +920,7 @@ sshx_file_t *sshx_file_begin(const char *final_path, mode_t mode,
     if (sparse) flags |= ECOPY_OPEN_SPARSE;
     if (inplace) flags |= ECOPY_OPEN_INPLACE;
     penc_u32(&e, flags);
+    penc_u32(&e, (uint32_t)(parent_mode & 07777));
     penc_str(&e, final_path);
     if (e.overflow) { free(f); return NULL; }
 

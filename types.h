@@ -24,6 +24,7 @@ typedef struct dir_handle {
     char dst[PATH_MAX];
     int src_fd;
     int dst_fd;
+    mode_t src_mode;       /* source directory mode; used by remote lazy mkdir */
     unsigned int refs;
     pthread_mutex_t lock;
 } dir_handle_t;

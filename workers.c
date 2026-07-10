@@ -1956,7 +1956,8 @@ static int copy_file_remote_putfile(file_task_t *task, off_t size)
     }
     close(fd_in);
 
-    if (sshx_putfile(task->dst, &task->src_st, buf, (size_t)pos,
+    if (sshx_putfile(task->dst, &task->src_st, task->dir->src_mode,
+                     buf, (size_t)pos,
                      remote_inplace()) != 0) {
         return -1;
     }
@@ -2007,8 +2008,8 @@ static int copy_file_remote(file_task_t *task)
         goto out;
     }
 
-    f = sshx_file_begin(task->dst, task->src_st.st_mode & 07777, size, sparse,
-                        remote_inplace());
+    f = sshx_file_begin(task->dst, task->src_st.st_mode & 07777,
+                        task->dir->src_mode, size, sparse, remote_inplace());
     if (!f) {
         goto out;
     }
@@ -2223,6 +2224,164 @@ void workers_stop(void)
 
     free(g_workers);
     g_workers = NULL;
+}
+
+static int build_child_path(char *out, size_t outsz,
+                            const char *parent, const char *name)
+{
+    size_t plen = strlen(parent);
+    const char *sep = (plen > 0 && parent[plen - 1] == '/') ? "" : "/";
+    int n = snprintf(out, outsz, "%s%s%s", parent, sep, name);
+    if (n < 0 || (size_t)n >= outsz) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * Remote traversal discovers up to REMOTE_STAT_BATCH files at once. Build all
+ * their task nodes first, then append as many as fit under one queue lock. This
+ * replaces two queue-lock acquisitions plus one condition signal per file with
+ * one operation per batch in the normal (queue has room) case.
+ */
+int workers_enqueue_remote_batch(dir_handle_t *dir,
+                                 const workers_batch_item_t *items,
+                                 size_t count)
+{
+    file_task_t *spares = NULL;
+    file_task_t *batch_head = NULL;
+    file_task_t *batch_tail = NULL;
+    size_t built = 0;
+
+    if (!dir || (!items && count != 0) || !sshx_active()) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (count == 0) {
+        return 0;
+    }
+    init_runtime_config();
+
+    /* Pull recycled nodes in one critical section. */
+    pthread_mutex_lock(&g_queue_lock);
+    for (size_t i = 0; i < count && g_task_freelist; i++) {
+        file_task_t *t = g_task_freelist;
+        g_task_freelist = t->next;
+        t->next = spares;
+        spares = t;
+    }
+    pthread_mutex_unlock(&g_queue_lock);
+
+    for (size_t i = 0; i < count; i++) {
+        file_task_t *t;
+        if (!items[i].name || !items[i].src_st) {
+            errno = EINVAL;
+            goto fail;
+        }
+        if (spares) {
+            t = spares;
+            spares = t->next;
+        } else {
+            t = malloc(sizeof(*t));
+            if (!t) {
+                errno = ENOMEM;
+                goto fail;
+            }
+        }
+
+        copy_path_field(t->name, sizeof(t->name), items[i].name);
+        if (build_child_path(t->src, sizeof(t->src), dir->src, items[i].name) != 0 ||
+            build_child_path(t->dst, sizeof(t->dst), dir->dst, items[i].name) != 0) {
+            t->next = spares;
+            spares = t;
+            goto fail;
+        }
+        dir_handle_retain(dir);
+        t->dir = dir;
+        t->src_st = *items[i].src_st;
+        t->next = NULL;
+        if (batch_tail) {
+            batch_tail->next = t;
+        } else {
+            batch_head = t;
+        }
+        batch_tail = t;
+        built++;
+    }
+
+    /* Return any excess recycled nodes before potentially waiting for space. */
+    if (spares) {
+        pthread_mutex_lock(&g_queue_lock);
+        while (spares) {
+            file_task_t *next = spares->next;
+            spares->next = g_task_freelist;
+            g_task_freelist = spares;
+            spares = next;
+        }
+        pthread_mutex_unlock(&g_queue_lock);
+    }
+
+    while (batch_head) {
+        size_t room;
+        size_t take;
+        file_task_t *chunk_tail;
+        file_task_t *rest;
+
+        pthread_mutex_lock(&g_queue_lock);
+        while ((int)(g_small_queue_depth + g_large_queue_depth) >=
+               g_max_queued_files) {
+            uint64_t wait_start_ns = g_collect_wait_timing ? monotonic_ns() : 0;
+            pthread_cond_wait(&g_space_cond, &g_queue_lock);
+            if (g_collect_wait_timing) {
+                stats_record_queue_wait_ns(monotonic_ns() - wait_start_ns);
+            }
+        }
+        room = (size_t)(g_max_queued_files -
+                        (int)(g_small_queue_depth + g_large_queue_depth));
+        take = built < room ? built : room;
+        chunk_tail = batch_head;
+        for (size_t i = 1; i < take; i++) {
+            chunk_tail = chunk_tail->next;
+        }
+        rest = chunk_tail->next;
+        chunk_tail->next = NULL;
+
+        if (g_small_queue_tail) {
+            g_small_queue_tail->next = batch_head;
+        } else {
+            g_small_queue_head = batch_head;
+        }
+        g_small_queue_tail = chunk_tail;
+        g_small_queue_depth += take;
+        pthread_cond_broadcast(&g_queue_cond);
+        pthread_mutex_unlock(&g_queue_lock);
+
+        batch_head = rest;
+        built -= take;
+    }
+    return 0;
+
+fail:
+    while (batch_head) {
+        file_task_t *next = batch_head->next;
+        dir_handle_release(batch_head->dir);
+        batch_head->next = spares;
+        spares = batch_head;
+        batch_head = next;
+    }
+    pthread_mutex_lock(&g_queue_lock);
+    while (spares) {
+        file_task_t *next = spares->next;
+        spares->next = g_task_freelist;
+        g_task_freelist = spares;
+        spares = next;
+    }
+    pthread_mutex_unlock(&g_queue_lock);
+    if (errno == ENOMEM) {
+        perror("malloc");
+    }
+    return -1;
 }
 
 int workers_enqueue_small_file(dir_handle_t *dir,

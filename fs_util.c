@@ -45,6 +45,7 @@ static pthread_mutex_t g_tmp_lock = PTHREAD_MUTEX_INITIALIZER;
 dir_handle_t *dir_handle_create(const char *src, const char *dst, int src_fd, int dst_fd)
 {
     dir_handle_t *dir = calloc(1, sizeof(*dir));
+    struct stat src_st;
     if (!dir) {
         perror("calloc");
         return NULL;
@@ -54,6 +55,7 @@ dir_handle_t *dir_handle_create(const char *src, const char *dst, int src_fd, in
     snprintf(dir->dst, sizeof(dir->dst), "%s", dst);
     dir->src_fd = src_fd;
     dir->dst_fd = dst_fd;
+    dir->src_mode = (fstat(src_fd, &src_st) == 0) ? src_st.st_mode : 0777;
     dir->refs = 1;
     pthread_mutex_init(&dir->lock, NULL);
     return dir;

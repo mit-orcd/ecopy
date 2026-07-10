@@ -99,7 +99,7 @@ int sshx_setmeta(const char *path, const struct stat *src_st, int is_dir);
  * barrier. Returns 0 if the frame was queued, -1 on transport failure.
  */
 int sshx_putfile(const char *final_path, const struct stat *src_st,
-                 const void *buf, size_t len, int inplace);
+                 mode_t parent_mode, const void *buf, size_t len, int inplace);
 
 /*
  * Synchronization point: drain all prior fire-and-forget frames on the server,
@@ -124,7 +124,8 @@ typedef struct sshx_file sshx_file_t;
  * or NULL on failure.
  */
 sshx_file_t *sshx_file_begin(const char *final_path, mode_t mode,
-                             off_t expected_size, int sparse, int inplace);
+                             mode_t parent_mode, off_t expected_size,
+                             int sparse, int inplace);
 
 /* Queue a positioned write (fire-and-forget, flow-controlled by the pipe). */
 int sshx_file_write(sshx_file_t *f, const void *buf, size_t len, off_t offset);

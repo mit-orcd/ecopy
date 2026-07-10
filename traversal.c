@@ -377,6 +377,15 @@ static int finalize_directories_parallel(void)
         return 0;
     }
 
+    /*
+     * Remote SETMETA is processed by the server apply pool. Drain all file and
+     * mkdir work once before finalization, then drain after each depth group:
+     * children must finish before their parent receives its final timestamp.
+     */
+    if (sshx_active() && sshx_barrier(0) != 0) {
+        return -1;
+    }
+
     qsort(g_finalize_dirs,
           g_finalize_dir_count,
           sizeof(*g_finalize_dirs),
@@ -437,6 +446,10 @@ static int finalize_directories_parallel(void)
         free(threads);
 
         if (rc != 0) {
+            return -1;
+        }
+
+        if (sshx_active() && sshx_barrier(0) != 0) {
             return -1;
         }
 
@@ -506,6 +519,8 @@ static int remote_flush_batch(dir_handle_t *handle,
                               int n)
 {
     remote_entry_t *batch = s->batch;
+    workers_batch_item_t enqueue_items[REMOTE_STAT_BATCH];
+    int enqueue_count = 0;
     int rc = 0;
 
     if (n == 0) {
@@ -550,10 +565,14 @@ static int remote_flush_batch(dir_handle_t *handle,
         }
 
         stats_add_planned_copy_bytes((uint64_t)batch[i].st.st_size);
-        if (workers_enqueue_small_file(handle, batch[i].name, src_path, dst_path,
-                                       &batch[i].st) != 0) {
-            rc = -1;
-        }
+        enqueue_items[enqueue_count].name = batch[i].name;
+        enqueue_items[enqueue_count].src_st = &batch[i].st;
+        enqueue_count++;
+    }
+
+    if (workers_enqueue_remote_batch(handle, enqueue_items,
+                                     (size_t)enqueue_count) != 0) {
+        rc = -1;
     }
     return rc;
 }

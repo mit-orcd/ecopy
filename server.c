@@ -80,9 +80,35 @@ static void log_op_error(const char *path, int err)
     pthread_mutex_unlock(&g_err_lock);
 }
 
-/* Cache the last directory we ensured exists, so a run of PUTFILEs into the
- * same directory does not re-walk mkdir -p every time. Thread-local so each
- * apply-pool worker keeps its own cache without locking. */
+/*
+ * Directory creation cache. The thread-local last-hit avoids locking for runs
+ * of files in one directory. The shared hash table is the important part:
+ * without it every apply worker independently ran mkdir -p for the same path,
+ * multiplying synchronous NFS LOOKUP/MKDIR RPCs by the pool width.
+ *
+ * An entry is inserted as CREATING before the syscall. Other workers asking
+ * for that exact directory wait on the entry, so only one mkdir sequence is
+ * ever in flight per path. Entries live for the server process lifetime.
+ */
+typedef enum {
+    DIR_CREATING = 0,
+    DIR_READY = 1,
+    DIR_FAILED = 2
+} dir_cache_state_t;
+
+typedef struct dir_cache_entry {
+    struct dir_cache_entry *next;
+    pthread_cond_t ready;
+    dir_cache_state_t state;
+    int err;
+    int mode_known;
+    mode_t mode;
+    char path[];
+} dir_cache_entry_t;
+
+#define DIR_CACHE_BUCKETS 4096u
+static dir_cache_entry_t *g_dir_cache[DIR_CACHE_BUCKETS];
+static pthread_mutex_t g_dir_cache_lock = PTHREAD_MUTEX_INITIALIZER;
 static __thread char g_last_dir[PATH_MAX];
 
 /*
@@ -128,6 +154,15 @@ static void file_remove(open_file_t *f)
 static mode_t copy_data_mode(mode_t final_mode)
 {
     return (final_mode & 0777) | S_IRUSR | S_IWUSR;
+}
+
+static mode_t copy_dir_mode(mode_t final_mode)
+{
+    mode_t mode = final_mode & 07777;
+    if ((mode & (S_IWUSR | S_IXUSR)) != (S_IWUSR | S_IXUSR)) {
+        mode |= S_IRWXU;
+    }
+    return mode;
 }
 
 /* Lexically normalize an absolute path (resolve . and ..), no filesystem access. */
@@ -235,21 +270,173 @@ static int mkdir_p(const char *path)
     return 0;
 }
 
-/*
- * Ensure a (confined) directory exists, creating missing components. Caches the
- * last directory so a stream of PUTFILEs into the same directory does not
- * re-walk mkdir -p on every file. dir must already be resolved under the root.
- */
-static int ensure_dir_cached(const char *dir)
+static uint32_t dir_cache_hash(const char *path)
 {
+    uint64_t h = 1469598103934665603ULL;
+    const unsigned char *p = (const unsigned char *)path;
+
+    while (*p) {
+        h ^= (uint64_t)*p++;
+        h *= 1099511628211ULL;
+    }
+    return (uint32_t)(h ^ (h >> 32));
+}
+
+static dir_cache_entry_t *dir_cache_find_locked(const char *path, uint32_t bucket)
+{
+    for (dir_cache_entry_t *e = g_dir_cache[bucket]; e; e = e->next) {
+        if (strcmp(e->path, path) == 0) {
+            return e;
+        }
+    }
+    return NULL;
+}
+
+static int existing_path_is_dir(const char *path)
+{
+    struct stat st;
+    if (lstat(path, &st) != 0) {
+        return -1;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        errno = ENOTDIR;
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * Optimistic mkdir: the common case is either that the exact directory
+ * already exists, or only its leaf is missing. Walk upward only after ENOENT,
+ * and use the same shared cache recursively so sibling creators single-flight
+ * their common parents too.
+ */
+static int ensure_dir_cached_mode(const char *dir, mode_t mode)
+{
+    uint32_t bucket;
+    dir_cache_entry_t *entry;
+    size_t len;
+    int rc = -1;
+    int saved_err = 0;
+
     if (strcmp(dir, g_last_dir) == 0) {
         return 0;
     }
-    if (mkdir_p(dir) != 0) {
+
+    bucket = dir_cache_hash(dir) % DIR_CACHE_BUCKETS;
+    pthread_mutex_lock(&g_dir_cache_lock);
+    entry = dir_cache_find_locked(dir, bucket);
+    if (entry) {
+        while (entry->state == DIR_CREATING) {
+            pthread_cond_wait(&entry->ready, &g_dir_cache_lock);
+        }
+        if (entry->state == DIR_READY) {
+            snprintf(g_last_dir, sizeof(g_last_dir), "%s", dir);
+            pthread_mutex_unlock(&g_dir_cache_lock);
+            return 0;
+        }
+        saved_err = entry->err;
+        pthread_mutex_unlock(&g_dir_cache_lock);
+        errno = saved_err;
         return -1;
     }
-    snprintf(g_last_dir, sizeof(g_last_dir), "%s", dir);
-    return 0;
+
+    len = strlen(dir);
+    entry = malloc(sizeof(*entry) + len + 1);
+    if (!entry) {
+        pthread_mutex_unlock(&g_dir_cache_lock);
+        errno = ENOMEM;
+        return -1;
+    }
+    entry->state = DIR_CREATING;
+    entry->err = 0;
+    entry->mode_known = 0;
+    entry->mode = 0;
+    memcpy(entry->path, dir, len + 1);
+    pthread_cond_init(&entry->ready, NULL);
+    entry->next = g_dir_cache[bucket];
+    g_dir_cache[bucket] = entry;
+    pthread_mutex_unlock(&g_dir_cache_lock);
+
+    if (mkdir(dir, mode) == 0) {
+        entry->mode_known = 1;
+        entry->mode = mode & 07777;
+        rc = 0;
+    } else if (errno == EEXIST) {
+        if (existing_path_is_dir(dir) == 0) {
+            rc = 0;
+        } else {
+            saved_err = errno;
+        }
+    } else if (errno == ENOENT) {
+        char parent[PATH_MAX], base[PATH_MAX];
+        split_dir_base(dir, parent, sizeof(parent), base, sizeof(base));
+        if (strcmp(parent, dir) != 0 &&
+            ensure_dir_cached_mode(parent, 0777) == 0) {
+            if (mkdir(dir, mode) == 0) {
+                entry->mode_known = 1;
+                entry->mode = mode & 07777;
+                rc = 0;
+            } else if (errno == EEXIST) {
+                if (existing_path_is_dir(dir) == 0) {
+                    rc = 0;
+                } else {
+                    saved_err = errno;
+                }
+            } else {
+                saved_err = errno;
+            }
+        } else {
+            saved_err = errno;
+        }
+    } else {
+        saved_err = errno;
+    }
+
+    pthread_mutex_lock(&g_dir_cache_lock);
+    if (rc == 0) {
+        entry->state = DIR_READY;
+        snprintf(g_last_dir, sizeof(g_last_dir), "%s", dir);
+    } else {
+        entry->state = DIR_FAILED;
+        entry->err = saved_err ? saved_err : EIO;
+    }
+    pthread_cond_broadcast(&entry->ready);
+    pthread_mutex_unlock(&g_dir_cache_lock);
+
+    if (rc != 0) {
+        errno = entry->err;
+    }
+    return rc;
+}
+
+static int dir_cache_mode_matches(const char *dir, mode_t mode)
+{
+    uint32_t bucket = dir_cache_hash(dir) % DIR_CACHE_BUCKETS;
+    int matches = 0;
+
+    pthread_mutex_lock(&g_dir_cache_lock);
+    dir_cache_entry_t *entry = dir_cache_find_locked(dir, bucket);
+    if (entry && entry->state == DIR_READY && entry->mode_known &&
+        entry->mode == (mode & 07777)) {
+        matches = 1;
+    }
+    pthread_mutex_unlock(&g_dir_cache_lock);
+    return matches;
+}
+
+static void dir_cache_destroy(void)
+{
+    for (size_t i = 0; i < DIR_CACHE_BUCKETS; i++) {
+        dir_cache_entry_t *entry = g_dir_cache[i];
+        while (entry) {
+            dir_cache_entry_t *next = entry->next;
+            pthread_cond_destroy(&entry->ready);
+            free(entry);
+            entry = next;
+        }
+        g_dir_cache[i] = NULL;
+    }
 }
 
 /*
@@ -334,6 +521,7 @@ static void handle_open(const uint8_t *payload, uint32_t plen)
     uint32_t mode = pdec_u32(&d);
     int64_t expected = pdec_i64(&d);
     uint32_t flags = pdec_u32(&d);
+    uint32_t parent_mode = pdec_u32(&d);
     char final_in[PATH_MAX];
     if (pdec_str(&d, final_in, sizeof(final_in)) != 0 || d.error) return;
 
@@ -356,7 +544,7 @@ static void handle_open(const uint8_t *payload, uint32_t plen)
      * thing that first materializes its directory. */
     char dir[PATH_MAX], base[PATH_MAX];
     split_dir_base(finalp, dir, sizeof(dir), base, sizeof(base));
-    if (ensure_dir_cached(dir) != 0) {
+    if (ensure_dir_cached_mode(dir, copy_dir_mode((mode_t)parent_mode)) != 0) {
         f->failed = 1; f->err = -errno;
         f->next = g_files; g_files = f;
         return;
@@ -498,19 +686,13 @@ static void handle_mkdir(const uint8_t *payload, uint32_t plen)
     char path[PATH_MAX];
     if (resolve_path(in, path, sizeof(path)) != 0) { log_op_error(in, errno); return; }
 
-    struct stat st;
-    if (lstat(path, &st) == 0) {
-        if (!S_ISDIR(st.st_mode)) log_op_error(path, EEXIST);
-        return;
-    }
     /*
      * MKDIRs are applied in parallel and out of order by the pool, so a nested
-     * directory can arrive before its parent. Create the whole chain (parents
-     * default, owner-writable) rather than a single component; the final mode
-     * is applied later at finalize via SETMETA.
+     * directory can arrive before its parent. The shared cache creates missing
+     * parents recursively and suppresses duplicate NFS RPCs from other workers.
+     * Keep the leaf owner-writable until final SETMETA.
      */
-    (void)mode;
-    if (mkdir_p(path) != 0 && errno != EEXIST) {
+    if (ensure_dir_cached_mode(path, (mode_t)((mode & 07777) | S_IRWXU)) != 0) {
         log_op_error(path, errno);
     }
 }
@@ -566,7 +748,7 @@ static int handle_stat_bulk(uint64_t id, const uint8_t *payload, uint32_t plen)
     return rc;
 }
 
-/* Fire-and-forget in v2: apply metadata, record failures in the log. */
+/* Fire-and-forget: apply metadata, record failures in the log. */
 static void handle_setmeta(const uint8_t *payload, uint32_t plen)
 {
     char in[PATH_MAX];
@@ -579,7 +761,7 @@ static void handle_setmeta(const uint8_t *payload, uint32_t plen)
     int64_t at_ns = pdec_i64(&d);
     int64_t mt_s = pdec_i64(&d);
     int64_t mt_ns = pdec_i64(&d);
-    (void)pdec_u8(&d); /* is_dir; open works for both */
+    int is_dir = pdec_u8(&d) ? 1 : 0;
     if (d.error) return;
 
     char path[PATH_MAX];
@@ -591,7 +773,12 @@ static void handle_setmeta(const uint8_t *payload, uint32_t plen)
         fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     }
     if (fd < 0) { log_op_error(path, errno); return; }
-    apply_meta(fd, uid, gid, mode, at_s, at_ns, mt_s, mt_ns, 0);
+    int mode_is_set = is_dir && dir_cache_mode_matches(path, (mode_t)mode);
+    if (((uid_t)uid != g_euid || (gid_t)gid != g_egid) &&
+        (mode & (S_ISUID | S_ISGID))) {
+        mode_is_set = 0; /* chown may clear special mode bits */
+    }
+    apply_meta(fd, uid, gid, mode, at_s, at_ns, mt_s, mt_ns, mode_is_set);
     close(fd);
 }
 
@@ -612,6 +799,7 @@ static void handle_putfile(const uint8_t *payload, uint32_t plen)
     int64_t mt_s = pdec_i64(&d);
     int64_t mt_ns = pdec_i64(&d);
     uint32_t flags = pdec_u32(&d);
+    uint32_t parent_mode = pdec_u32(&d);
     char final_in[PATH_MAX];
     if (pdec_str(&d, final_in, sizeof(final_in)) != 0 || d.error) return;
 
@@ -623,7 +811,10 @@ static void handle_putfile(const uint8_t *payload, uint32_t plen)
 
     char dir[PATH_MAX], base[PATH_MAX];
     split_dir_base(finalp, dir, sizeof(dir), base, sizeof(base));
-    if (ensure_dir_cached(dir) != 0) { log_op_error(dir, errno); return; }
+    if (ensure_dir_cached_mode(dir, copy_dir_mode((mode_t)parent_mode)) != 0) {
+        log_op_error(dir, errno);
+        return;
+    }
 
     int inplace = (flags & ECOPY_OPEN_INPLACE) ? 1 : 0;
 
@@ -708,19 +899,17 @@ static void handle_unlink(const uint8_t *payload, uint32_t plen)
 /* -------------------- apply pool -------------------- */
 
 /*
- * A pool of worker threads that apply the fire-and-forget operations (PUTFILE
- * and MKDIR) in parallel. Over NFS every one of these blocks on synchronous
- * RPC latency, so a single-threaded server sat ~90% idle in D-state; issuing
- * many in flight at once hides that latency.
+ * A pool of worker threads that applies fire-and-forget PUTFILE, MKDIR, and
+ * SETMETA operations in parallel. Over NFS every one of these blocks on
+ * synchronous RPC latency, so issuing many in flight at once hides it.
  *
- * The reader thread (server_main) only ever *submits* PUTFILE/MKDIR jobs. Any
- * other frame (SETMETA, STAT, OPEN/WRITE/COMMIT, BARRIER, ...) first drains the
- * pool, then runs inline, so ordering that matters is preserved:
- *   - a directory's final SETMETA lands after its files were written;
+ * The reader thread submits those three message types. Other frames
+ * (STAT, OPEN/WRITE/COMMIT, BARRIER, ...) drain the pool, then run inline:
  *   - a streamed OPEN sees its parent directory created;
  *   - a BARRIER's error aggregate and flush cover all prior work.
- * PUTFILE self-creates its parent dirs and MKDIR is idempotent, so those two
- * need no ordering relative to each other.
+ * The client sends a barrier before directory finalization and between depth
+ * levels, so pooled SETMETAs cannot overtake file writes or let a child update
+ * its parent after the parent's final timestamp was applied.
  */
 typedef struct pool_job {
     uint8_t type;
@@ -737,6 +926,8 @@ static void pool_run_job(pool_job_t *j)
         handle_putfile(j->payload, j->plen);
     } else if (j->type == MSG_MKDIR) {
         handle_mkdir(j->payload, j->plen);
+    } else if (j->type == MSG_SETMETA) {
+        handle_setmeta(j->payload, j->plen);
     }
     free(j->payload);
     free(j);
@@ -774,7 +965,7 @@ static void *pool_worker(void *arg)
     return NULL;
 }
 
-/* Hand a PUTFILE/MKDIR frame to the pool; takes ownership of payload. Blocks
+/* Hand a PUTFILE/MKDIR/SETMETA frame to the pool; takes ownership of payload. Blocks
  * (back-pressuring the reader, hence the SSH channel) when too many are in
  * flight, bounding memory to roughly g_pool_limit whole small files. */
 static void pool_submit(uint8_t type, uint8_t *payload, uint32_t plen)
@@ -783,6 +974,7 @@ static void pool_submit(uint8_t type, uint8_t *payload, uint32_t plen)
     if (!j) {                           /* out of memory: just run it inline */
         if (type == MSG_PUTFILE) handle_putfile(payload, plen);
         else if (type == MSG_MKDIR) handle_mkdir(payload, plen);
+        else if (type == MSG_SETMETA) handle_setmeta(payload, plen);
         free(payload);
         return;
     }
@@ -888,11 +1080,13 @@ int server_main(const char *root)
         }
 
         /*
-         * PUTFILE/MKDIR go to the apply pool (parallel, order-independent).
+         * PUTFILE/MKDIR/SETMETA go to the apply pool. The client brackets
+         * directory SETMETA depth groups with barriers to preserve ordering.
          * Everything else is an ordering/consistency point: drain the pool so
          * all prior fire-and-forget work is on disk, then handle inline.
          */
-        if ((type == MSG_PUTFILE || type == MSG_MKDIR) && g_pool_n > 0) {
+        if ((type == MSG_PUTFILE || type == MSG_MKDIR || type == MSG_SETMETA) &&
+            g_pool_n > 0) {
             pool_submit(type, payload, plen);   /* takes ownership of payload */
             continue;
         }
@@ -915,7 +1109,11 @@ int server_main(const char *root)
         case MSG_SETMETA:   handle_setmeta(payload, plen); break;
         case MSG_BARRIER:   rc = handle_barrier(id, payload, plen); break;
         case MSG_UNLINK:    handle_unlink(payload, plen); break;
-        case MSG_BYE:       free(payload); pool_shutdown(); return 0;
+        case MSG_BYE:
+            free(payload);
+            pool_shutdown();
+            dir_cache_destroy();
+            return 0;
         default:            break; /* ignore unknown */
         }
         free(payload);
@@ -926,6 +1124,7 @@ int server_main(const char *root)
     }
 
     pool_shutdown();
+    dir_cache_destroy();
 
     /* Clean up any dangling temp files from an interrupted transfer. */
     while (g_files) {

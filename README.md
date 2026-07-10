@@ -57,18 +57,25 @@ The target may be an `ssh://` URL to push a local tree to another host:
   metadata + data); larger files stream in pipelined chunks. Many files stream concurrently. Sparse files send
   only their data extents so holes are recreated remotely.
 - **Directories are created lazily by their contents:** the first file written into a directory creates it (and any
-  missing parents), so no separate `MKDIR` round-trip is spent on directories that hold files. An explicit `MKDIR`
-  is sent only for directories that end up with no files (empty leaves and directory-only nodes).
+  missing parents), so no separate `MKDIR` round-trip is spent on directories that hold files. A shared
+  single-flight cache guarantees that only one server worker creates a path; the others reuse the result instead of
+  duplicating NFS LOOKUP/MKDIR RPCs. Missing parents are walked only after an optimistic leaf `mkdir` returns
+  `ENOENT`. An explicit `MKDIR` is sent only for directories that end up with no files.
 - **Batched durability:** each file is written and (incrementally) atomically renamed into place, but there is no
   per-file `fsync`. A periodic and a final *barrier* drain the server, flush to stable storage, and report any
   errors as a batch (with the first offending path); a nonzero count fails the run. Tune the barrier cadence with
   `DIRECT_COPY_SSH_BARRIER_OPS`.
 - **Parallel remote apply:** over NFS each remote metadata op (mkdir, create, chown, chmod, times, rename) is a
   separate synchronous RPC, so a single-threaded peer sits idle waiting on latency. The remote runs an apply pool
-  (`DIRECT_COPY_SSH_SERVER_THREADS`, default 16) so many files land concurrently; ordering that matters (a
-  directory's metadata, barriers, streamed files) is still preserved.
+  (`DIRECT_COPY_SSH_SERVER_THREADS`, default 16) so file writes and final directory metadata run concurrently.
+  Barriers before finalization and between directory-depth groups preserve ordering for restrictive parent modes.
+- **Batched client scheduling:** remote traversal appends each bulk-stat group to the local file queue under one
+  lock instead of locking and signaling once per file, reducing client futex/spinlock contention on large flat
+  directories.
 - **Fewer RPCs per file:** the peer creates files with their final mode (no extra `fchmod`) and skips `chown` when
-  the owner already matches, so a fresh small file costs about a create + write + one time-stamp RPC. Add
+  the owner already matches. File-bearing directories are also created with their source mode when it remains
+  owner-writable, allowing finalization to skip a redundant `fchmod`. A fresh small file costs about a create +
+  write + one time-stamp RPC. Add
   `--no-preserve-times` to drop the time-stamp SETATTR too (atime/mtime are not carried over), leaving roughly a
   create + write per file.
 - **Fresh vs. incremental:** on the first copy into a non-existent destination root, per-directory bulk stats are
