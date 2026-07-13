@@ -722,6 +722,165 @@ case_transfer_verification() {
     fi
 }
 
+case_verify_only() {
+    case_begin "verify-only"
+    local s="$work/verify_only_src" d="$work/verify_only_dst"
+    local out rc before after content_before content_after
+    local missing="$work/verify_only_missing"
+    mkdir -p "$s/sub/deep"
+    : > "$s/empty"
+    printf 'unaligned-data' > "$s/sub/unaligned"
+    dd if=/dev/urandom of="$s/data.bin" bs=4096 count=64 status=none
+    truncate -s 1M "$s/sparse"
+    printf sparse | dd of="$s/sparse" bs=1 seek=524288 conv=notrunc status=none
+    chmod 0640 "$s/data.bin"
+    cp -a "$s" "$d"
+    local -a verify_paths=()
+    mapfile -t verify_paths < <(cd "$s" && find . -print | sort)
+    content_before="$(for rel in "${verify_paths[@]}"; do
+        [[ -f "$d/$rel" ]] && sha256sum "$d/$rel"
+    done)"
+    for rel in "${verify_paths[@]}"; do
+        touch -a -m -d @1700000000 "$s/$rel" "$d/$rel"
+    done
+    before="$(for rel in "${verify_paths[@]}"; do
+        stat -c '%n|%f|%u|%g|%s|%X|%Y' "$d/$rel"
+    done)"
+    out="$("$bin" --verify-only --verify-workers=4 --verify-seed=77 \
+              "$s" "$d" 2>&1)"; rc=$?
+    after="$(for rel in "${verify_paths[@]}"; do
+        stat -c '%n|%f|%u|%g|%s|%X|%Y' "$d/$rel"
+    done)"
+    content_after="$(for rel in "${verify_paths[@]}"; do
+        [[ -f "$d/$rel" ]] && sha256sum "$d/$rel"
+    done)"
+    if [[ "$rc" -eq 0 ]] &&
+       grep -q 'Verify failures   : 0' <<<"$out" &&
+       grep -q 'Verify seed       : 77' <<<"$out" &&
+       ! grep -q 'Files copied' <<<"$out" &&
+       [[ "$before" == "$after" ]] &&
+       [[ "$content_before" == "$content_after" ]]; then
+        ok "default verify-only succeeds and leaves target unchanged"
+    else
+        fail "default verify-only/read-only guarantee: $(tr '\n' ' ' <<<"$out")"
+    fi
+
+    out="$("$bin" --verify-only --no-preserve-times --verify-data=0 \
+              "$s" "$d" 2>&1)"; rc=$?
+    if [[ "$rc" -eq 0 ]] && grep -Eq 'Verify blocks[[:space:]]*: [1-9]' <<<"$out"; then
+        ok "verify-only 0% keeps endpoint checks"
+    else
+        fail "verify-only endpoint coverage: $(tr '\n' ' ' <<<"$out")"
+    fi
+    for pct in 1 100; do
+        if "$bin" --verify-only --no-preserve-times --verify-data="$pct" \
+             --verify-seed=88 "$s" "$d" >/dev/null 2>&1; then
+            ok "verify-only ${pct}% coverage succeeds"
+        else
+            fail "verify-only ${pct}% coverage failed"
+        fi
+    done
+
+    if "$bin" --verify-only "$s" "$missing" >/dev/null 2>&1 ||
+       [[ -e "$missing" ]]; then
+        fail "verify-only created a missing local target"
+    else
+        ok "verify-only rejects and does not create a missing local target"
+    fi
+
+    cp -a "$d" "$work/verify_only_mode"
+    chmod 0600 "$work/verify_only_mode/data.bin"
+    if "$bin" --verify-only --no-preserve-times --verify-metadata \
+         "$s" "$work/verify_only_mode" >/dev/null 2>&1; then
+        fail "verify-only missed a mode mismatch"
+    else
+        ok "verify-only detects mode mismatch"
+    fi
+
+    cp -a "$d" "$work/verify_only_content"
+    printf X | dd of="$work/verify_only_content/data.bin" bs=1 seek=4096 \
+                  conv=notrunc status=none
+    if "$bin" --verify-only --no-preserve-times --verify-data=100 \
+         "$s" "$work/verify_only_content" >/dev/null 2>&1; then
+        fail "verify-only missed data corruption"
+    else
+        ok "verify-only detects data mismatch"
+    fi
+
+    cp -a "$d" "$work/verify_only_wrong"
+    rm "$work/verify_only_wrong/sub/unaligned"
+    mkdir "$work/verify_only_wrong/sub/unaligned"
+    if "$bin" --verify-only --no-preserve-times --verify-metadata \
+         "$s" "$work/verify_only_wrong" >/dev/null 2>&1; then
+        fail "verify-only missed wrong target type"
+    else
+        ok "verify-only detects wrong-type objects"
+    fi
+    rm -rf "$work/verify_only_wrong/sub/unaligned"
+    if "$bin" --verify-only --no-preserve-times --verify-metadata \
+         "$s" "$work/verify_only_wrong" >/dev/null 2>&1; then
+        fail "verify-only missed a missing target object"
+    else
+        ok "verify-only detects missing target objects"
+    fi
+
+    printf extra > "$d/target-only-extra"
+    if "$bin" --verify-only --no-preserve-times "$s" "$d" >/dev/null 2>&1; then
+        ok "verify-only ignores target-only extras"
+    else
+        fail "verify-only rejected a target-only extra"
+    fi
+
+    local sf="$work/verify_one" tf="$work/verify_one_target"
+    printf single-file > "$sf"
+    cp -a "$sf" "$tf"
+    touch -a -m -d @1700000000 "$sf" "$tf"
+    if "$bin" --verify-only "$sf" "$tf" >/dev/null 2>&1; then
+        ok "local single-file verify-only succeeds"
+    else
+        fail "local single-file verify-only failed"
+    fi
+
+    local many_s="$work/verify_many_src" many_d="$work/verify_many_dst"
+    mkdir "$many_s"
+    for i in $(seq 1 64); do
+        dd if=/dev/urandom of="$many_s/f$i" bs=4096 count=32 status=none
+    done
+    cp -a "$many_s" "$many_d"
+    out="$("$bin" --verify-only --no-preserve-times --verify-data=100 \
+              --verify-workers=8 "$many_s" "$many_d" 2>&1)"; rc=$?
+    if [[ "$rc" -eq 0 ]] &&
+       grep -Eq 'Verify workers[[:space:]]*: 8 configured, ([2-9]|[1-9][0-9]+) peak active' <<<"$out"; then
+        ok "multiple local verifier workers become active"
+    else
+        fail "local verifier concurrency not observed: $(tr '\n' ' ' <<<"$out")"
+    fi
+
+    local rd="$work/verify_only_remote"
+    local rmissing="$work/verify_only_remote_missing"
+    local -a remote_env=(ECOPY_REMOTE_CMD="$bin")
+    if [[ "${ECOPY_HARNESS_REAL_SSH:-0}" != "1" ]]; then
+        remote_env+=(ECOPY_SSH="$repo_root/tests/fake_ssh.sh")
+    fi
+    cp -a "$s" "$rd"
+    find "$s" "$rd" -exec touch -a -m -d @1700000000 {} +
+    out="$(env "${remote_env[@]}" "$bin" --verify-only --verify-workers=4 \
+              "$s" "ssh://localhost${rd}" 2>&1)"; rc=$?
+    if [[ "$rc" -eq 0 ]] &&
+       grep -Eq 'Verify workers[[:space:]]*: 4 configured, ([2-9]|[1-9][0-9]+) peak active' <<<"$out"; then
+        ok "remote verify-only uses parallel client/server verification"
+    else
+        fail "remote verify-only/concurrency: $(tr '\n' ' ' <<<"$out")"
+    fi
+    if env "${remote_env[@]}" "$bin" --verify-only "$s" \
+         "ssh://localhost${rmissing}" >/dev/null 2>&1 ||
+       [[ -e "$rmissing" ]]; then
+        fail "remote verify-only created a missing target root"
+    else
+        ok "remote verify-only does not create missing target roots"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
@@ -745,6 +904,7 @@ case_ssh_batch_failure
 case_ssh_empty_dir_collision
 case_ssh_no_preserve_times
 case_transfer_verification
+case_verify_only
 
 echo
 echo "ecopy harness results: $pass_count passed, $fail_count failed"

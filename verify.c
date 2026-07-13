@@ -15,9 +15,11 @@
 #include "third_party/blake3/blake3.h"
 
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,6 +34,7 @@ typedef struct verify_item {
     char *dst;
     struct stat src_st;
     int skipped;
+    int is_dir;
     struct verify_item *next;
 } verify_item_t;
 
@@ -41,12 +44,16 @@ typedef struct {
     int include_skipped;
     double percent;
     uint64_t seed;
+    int workers;
 } verify_config_t;
 
 static verify_config_t g_cfg;
 static verify_item_t *g_head;
 static verify_item_t *g_tail;
 static pthread_mutex_t g_queue_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic uint64_t g_run_queue_depth;
+static _Atomic uint64_t g_run_active;
+static atomic_flag g_atime_warning = ATOMIC_FLAG_INIT;
 
 static uint64_t mix64(uint64_t x)
 {
@@ -82,7 +89,8 @@ static uint64_t random_seed(void)
 }
 
 void verify_configure(int metadata, int data, double percent,
-                      int include_skipped, uint64_t seed, int seed_set)
+                      int include_skipped, uint64_t seed, int seed_set,
+                      int workers)
 {
     g_cfg.metadata = metadata ? 1 : 0;
     g_cfg.data = data ? 1 : 0;
@@ -91,6 +99,9 @@ void verify_configure(int metadata, int data, double percent,
     if (percent > 100.0) percent = 100.0;
     g_cfg.percent = percent;
     g_cfg.seed = seed_set ? seed : random_seed();
+    if (workers < 1) workers = 1;
+    if (workers > 128) workers = 128;
+    g_cfg.workers = workers;
     stats_set_verify_config(g_cfg.metadata, g_cfg.data, g_cfg.percent, g_cfg.seed);
 }
 
@@ -100,25 +111,54 @@ int verify_data_enabled(void) { return g_cfg.data; }
 int verify_include_skipped(void) { return g_cfg.include_skipped; }
 double verify_percent(void) { return g_cfg.percent; }
 uint64_t verify_seed(void) { return g_cfg.seed; }
+int verify_worker_count(void) { return g_cfg.workers; }
+uint64_t verify_queue_depth(void) { return atomic_load(&g_run_queue_depth); }
+uint64_t verify_active_count(void) { return atomic_load(&g_run_active); }
 
-int verify_queue_file(const char *src, const char *dst,
-                      const struct stat *src_st, int skipped)
+static verify_item_t *make_item(const char *src, const char *dst,
+                                const struct stat *src_st, int skipped,
+                                int is_dir)
 {
     verify_item_t *item;
-    if (!verify_enabled() || (skipped && !g_cfg.include_skipped)) return 0;
     item = calloc(1, sizeof(*item));
-    if (!item) return -1;
+    if (!item) return NULL;
     item->src = strdup(src);
     item->dst = strdup(dst);
     if (!item->src || !item->dst) {
         free(item->src);
         free(item->dst);
         free(item);
-        return -1;
+        return NULL;
     }
     item->src_st = *src_st;
     item->skipped = skipped;
+    item->is_dir = is_dir;
+    return item;
+}
 
+int verify_queue_file(const char *src, const char *dst,
+                      const struct stat *src_st, int skipped)
+{
+    verify_item_t *item;
+    if (!verify_enabled() || (skipped && !g_cfg.include_skipped)) return 0;
+    item = make_item(src, dst, src_st, skipped, 0);
+    if (!item) return -1;
+
+    pthread_mutex_lock(&g_queue_lock);
+    if (g_tail) g_tail->next = item;
+    else g_head = item;
+    g_tail = item;
+    pthread_mutex_unlock(&g_queue_lock);
+    return 0;
+}
+
+int verify_queue_directory(const char *src, const char *dst,
+                           const struct stat *src_st)
+{
+    verify_item_t *item;
+    if (!g_cfg.metadata) return 0;
+    item = make_item(src, dst, src_st, 0, 1);
+    if (!item) return -1;
     pthread_mutex_lock(&g_queue_lock);
     if (g_tail) g_tail->next = item;
     else g_head = item;
@@ -251,8 +291,8 @@ typedef struct {
     int src_fd;
     int dst_fd;
     const char *path;
-    uint8_t src_buf[VERIFY_BLOCK_SIZE];
-    uint8_t dst_buf[VERIFY_BLOCK_SIZE];
+    uint8_t src_buf[VERIFY_BLOCK_SIZE] __attribute__((aligned(VERIFY_BLOCK_SIZE)));
+    uint8_t dst_buf[VERIFY_BLOCK_SIZE] __attribute__((aligned(VERIFY_BLOCK_SIZE)));
     uint64_t bytes;
     uint64_t blocks;
     int mismatch;
@@ -289,10 +329,11 @@ typedef struct {
     int failed;
 } remote_ctx_t;
 
-static int flush_remote_batch(remote_ctx_t *ctx, int final)
+static int flush_remote_batch(remote_ctx_t *ctx, int check_metadata)
 {
     if (sshx_verify_batch(ctx->item->dst, &ctx->item->src_st,
-                          ctx->batch, ctx->count, final) != 0) {
+                          ctx->batch, ctx->count, ctx->item->is_dir,
+                          check_metadata || g_cfg.metadata) != 0) {
         ctx->failed = 1;
         return -1;
     }
@@ -303,7 +344,7 @@ static int flush_remote_batch(remote_ctx_t *ctx, int final)
 static int hash_sample(uint64_t index, off_t offset, size_t length, void *arg)
 {
     remote_ctx_t *ctx = arg;
-    uint8_t buf[VERIFY_BLOCK_SIZE];
+    uint8_t buf[VERIFY_BLOCK_SIZE] __attribute__((aligned(VERIFY_BLOCK_SIZE)));
     (void)index;
     if (pread_full(ctx->src_fd, buf, length, offset) != (ssize_t)length) {
         ctx->failed = 1;
@@ -319,15 +360,96 @@ static int hash_sample(uint64_t index, off_t offset, size_t length, void *arg)
     return 0;
 }
 
+static int open_verify_data(const char *path)
+{
+    int flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW;
+#ifdef O_NOATIME
+    if (g_cfg.metadata && copy_policy_preserve_times()) {
+        int fd = open(path, flags | O_NOATIME);
+        if (fd >= 0) return fd;
+        progress_interrupt();
+        fprintf(stderr,
+                "ecopy: verification cannot open %s with O_NOATIME: %s; "
+                "use --verify-metadata or --no-preserve-times\n",
+                path, strerror(errno));
+        return -1;
+    }
+#endif
+    if (!atomic_flag_test_and_set(&g_atime_warning)) {
+        progress_interrupt();
+        fprintf(stderr,
+                "ecopy: verification data reads may update atime because "
+                "timestamps are not being checked\n");
+    }
+    return open(path, flags);
+}
+
+static int source_still_matches(const verify_item_t *item, int fd)
+{
+    struct stat now;
+    if (fstat(fd, &now) != 0 ||
+        !S_ISREG(now.st_mode) ||
+        now.st_dev != item->src_st.st_dev ||
+        now.st_ino != item->src_st.st_ino ||
+        now.st_size != item->src_st.st_size ||
+        !timestamp_equal(&now.st_mtim, &item->src_st.st_mtim)) {
+        progress_interrupt();
+        fprintf(stderr, "ecopy: source changed during verification: %s\n",
+                item->src);
+        return -1;
+    }
+    return 0;
+}
+
 static int verify_local_item(const verify_item_t *item)
 {
     local_ctx_t ctx = { .src_fd = -1, .dst_fd = -1, .path = item->dst };
     int failed = 0;
-    if (g_cfg.data && item->src_st.st_size > 0) {
-        ctx.src_fd = open(item->src, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-        ctx.dst_fd = open(item->dst, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    int meta_bad = 0;
+    int structural_bad = 0;
+
+    /* Compare metadata before reads so verification can never hide a mismatch. */
+    if (g_cfg.metadata) {
+        struct stat actual;
+        if (lstat(item->dst, &actual) != 0) {
+            progress_interrupt();
+            fprintf(stderr, "ecopy: verification cannot stat %s: %s\n",
+                    item->dst, strerror(errno));
+            meta_bad = 1;
+            failed = 1;
+            structural_bad = 1;
+        } else if (verify_metadata_stat(&item->src_st, &actual, item->is_dir,
+                                        item->dst) != 0) {
+            meta_bad = 1;
+            failed = 1;
+            if ((actual.st_mode & S_IFMT) != (item->src_st.st_mode & S_IFMT) ||
+                (!item->is_dir && actual.st_size != item->src_st.st_size)) {
+                structural_bad = 1;
+            }
+        }
+    } else {
+        struct stat actual;
+        if (lstat(item->dst, &actual) != 0 ||
+            (item->is_dir ? !S_ISDIR(actual.st_mode) :
+                            (!S_ISREG(actual.st_mode) ||
+                             actual.st_size != item->src_st.st_size))) {
+            progress_interrupt();
+            fprintf(stderr,
+                    "ecopy: verification target missing or wrong type/size: %s\n",
+                    item->dst);
+            failed = 1;
+            structural_bad = 1;
+        }
+    }
+
+    if (!item->is_dir && !structural_bad &&
+        g_cfg.data && item->src_st.st_size > 0) {
+        ctx.src_fd = open_verify_data(item->src);
+        ctx.dst_fd = open_verify_data(item->dst);
         if (ctx.src_fd < 0 || ctx.dst_fd < 0 ||
-            for_each_sample(item, compare_sample, &ctx) != 0) {
+            source_still_matches(item, ctx.src_fd) != 0 ||
+            for_each_sample(item, compare_sample, &ctx) != 0 ||
+            source_still_matches(item, ctx.src_fd) != 0) {
             progress_interrupt();
             if (ctx.src_fd < 0) perror(item->src);
             else if (ctx.dst_fd < 0) perror(item->dst);
@@ -338,20 +460,8 @@ static int verify_local_item(const verify_item_t *item)
         if (ctx.mismatch) failed = 1;
     }
 
-    /* Verification reads must not become the final destination atime. */
-    if (copy_policy_preserve_times() && preserve_path_metadata(item->dst, &item->src_st) != 0) {
-        failed = 1;
-    }
-    int meta_bad = 0;
-    if (g_cfg.metadata) {
-        struct stat actual;
-        if (lstat(item->dst, &actual) != 0 ||
-            verify_metadata_stat(&item->src_st, &actual, 0, item->dst) != 0) {
-            meta_bad = 1;
-            failed = 1;
-        }
-    }
-    stats_record_verify(ctx.bytes, (uint64_t)item->src_st.st_size,
+    stats_record_verify(ctx.bytes,
+                        item->is_dir ? 0 : (uint64_t)item->src_st.st_size,
                         ctx.blocks, g_cfg.metadata,
                         ctx.mismatch, meta_bad, failed);
     return failed ? -1 : 0;
@@ -360,54 +470,322 @@ static int verify_local_item(const verify_item_t *item)
 static int verify_remote_item(const verify_item_t *item)
 {
     remote_ctx_t ctx = { .item = item, .src_fd = -1 };
-    if (g_cfg.data && item->src_st.st_size > 0) {
-        ctx.src_fd = open(item->src, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (!item->is_dir && g_cfg.data && item->src_st.st_size > 0) {
+        ctx.src_fd = open_verify_data(item->src);
         if (ctx.src_fd < 0) {
             perror(item->src);
             ctx.failed = 1;
-        } else if (for_each_sample(item, hash_sample, &ctx) != 0) {
+        } else if (source_still_matches(item, ctx.src_fd) != 0 ||
+                   for_each_sample(item, hash_sample, &ctx) != 0 ||
+                   source_still_matches(item, ctx.src_fd) != 0) {
             ctx.failed = 1;
         }
         if (ctx.src_fd >= 0) close(ctx.src_fd);
     }
-    if (!ctx.failed && (ctx.count || g_cfg.data || g_cfg.metadata)) {
+    if (!ctx.failed && (ctx.count || g_cfg.data || g_cfg.metadata || item->is_dir)) {
         if (flush_remote_batch(&ctx, 1) != 0) ctx.failed = 1;
     }
-    stats_record_verify(ctx.bytes, (uint64_t)item->src_st.st_size,
+    stats_record_verify(ctx.bytes,
+                        item->is_dir ? 0 : (uint64_t)item->src_st.st_size,
                         ctx.blocks, g_cfg.metadata,
                         0, 0, ctx.failed);
     return ctx.failed ? -1 : 0;
 }
 
+typedef struct {
+    pthread_mutex_t lock;
+    pthread_cond_t work_cv;
+    pthread_cond_t space_cv;
+    verify_item_t *head;
+    verify_item_t *tail;
+    size_t queued;
+    size_t limit;
+    uint64_t queue_peak;
+    uint64_t active_peak;
+    int stop;
+    int failed;
+    int remote;
+    int nthreads;
+    pthread_t *threads;
+} verify_pool_t;
+
+static void free_item(verify_item_t *item)
+{
+    if (!item) return;
+    free(item->src);
+    free(item->dst);
+    free(item);
+}
+
+static void *verify_pool_worker(void *arg)
+{
+    verify_pool_t *pool = arg;
+    for (;;) {
+        pthread_mutex_lock(&pool->lock);
+        while (!pool->head && !pool->stop) {
+            pthread_cond_wait(&pool->work_cv, &pool->lock);
+        }
+        if (!pool->head) {
+            pthread_mutex_unlock(&pool->lock);
+            break;
+        }
+        verify_item_t *item = pool->head;
+        pool->head = item->next;
+        if (!pool->head) pool->tail = NULL;
+        pool->queued--;
+        atomic_store(&g_run_queue_depth, pool->queued);
+        uint64_t active = atomic_fetch_add(&g_run_active, 1) + 1;
+        if (active > pool->active_peak) pool->active_peak = active;
+        pthread_cond_signal(&pool->space_cv);
+        pthread_mutex_unlock(&pool->lock);
+
+        item->next = NULL;
+        if ((pool->remote ? verify_remote_item(item) :
+                            verify_local_item(item)) != 0) {
+            pthread_mutex_lock(&pool->lock);
+            pool->failed = 1;
+            pthread_mutex_unlock(&pool->lock);
+        }
+        free_item(item);
+        atomic_fetch_sub(&g_run_active, 1);
+    }
+    return NULL;
+}
+
+static int verify_pool_start(verify_pool_t *pool, int remote)
+{
+    memset(pool, 0, sizeof(*pool));
+    pthread_mutex_init(&pool->lock, NULL);
+    pthread_cond_init(&pool->work_cv, NULL);
+    pthread_cond_init(&pool->space_cv, NULL);
+    pool->remote = remote;
+    pool->nthreads = g_cfg.workers;
+    pool->limit = (size_t)pool->nthreads * 4;
+    if (pool->limit < 16) pool->limit = 16;
+    pool->threads = calloc((size_t)pool->nthreads, sizeof(*pool->threads));
+    if (!pool->threads) return -1;
+    for (int i = 0; i < pool->nthreads; i++) {
+        if (pthread_create(&pool->threads[i], NULL, verify_pool_worker, pool) != 0) {
+            pthread_mutex_lock(&pool->lock);
+            pool->stop = 1;
+            pthread_cond_broadcast(&pool->work_cv);
+            pthread_mutex_unlock(&pool->lock);
+            for (int j = 0; j < i; j++) pthread_join(pool->threads[j], NULL);
+            free(pool->threads);
+            pool->threads = NULL;
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int verify_pool_submit(verify_pool_t *pool, verify_item_t *item)
+{
+    pthread_mutex_lock(&pool->lock);
+    while (pool->queued >= pool->limit && !pool->stop) {
+        pthread_cond_wait(&pool->space_cv, &pool->lock);
+    }
+    if (pool->stop) {
+        pthread_mutex_unlock(&pool->lock);
+        return -1;
+    }
+    item->next = NULL;
+    if (pool->tail) pool->tail->next = item;
+    else pool->head = item;
+    pool->tail = item;
+    pool->queued++;
+    if (pool->queued > pool->queue_peak) pool->queue_peak = pool->queued;
+    atomic_store(&g_run_queue_depth, pool->queued);
+    pthread_cond_signal(&pool->work_cv);
+    pthread_mutex_unlock(&pool->lock);
+    return 0;
+}
+
+static int verify_pool_finish(verify_pool_t *pool)
+{
+    pthread_mutex_lock(&pool->lock);
+    pool->stop = 1;
+    pthread_cond_broadcast(&pool->work_cv);
+    pthread_mutex_unlock(&pool->lock);
+    for (int i = 0; i < pool->nthreads; i++) {
+        pthread_join(pool->threads[i], NULL);
+    }
+    int failed = pool->failed;
+    stats_set_verify_runtime(-1, pool->nthreads,
+                             pool->queue_peak, pool->active_peak);
+    free(pool->threads);
+    pthread_mutex_destroy(&pool->lock);
+    pthread_cond_destroy(&pool->work_cv);
+    pthread_cond_destroy(&pool->space_cv);
+    atomic_store(&g_run_queue_depth, 0);
+    atomic_store(&g_run_active, 0);
+    return failed ? -1 : 0;
+}
+
+static int run_pool_list(verify_item_t *list, int remote)
+{
+    verify_pool_t pool;
+    int failed = 0;
+    if (verify_pool_start(&pool, remote) != 0) {
+        fprintf(stderr, "ecopy: unable to start verification workers\n");
+        while (list) {
+            verify_item_t *next = list->next;
+            free_item(list);
+            list = next;
+        }
+        return -1;
+    }
+    while (list) {
+        verify_item_t *next = list->next;
+        if (verify_pool_submit(&pool, list) != 0) {
+            free_item(list);
+            failed = 1;
+        }
+        list = next;
+    }
+    if (verify_pool_finish(&pool) != 0) failed = 1;
+    return failed ? -1 : 0;
+}
+
+static void record_elapsed(const struct timespec *start)
+{
+    struct timespec finish;
+    clock_gettime(CLOCK_MONOTONIC, &finish);
+    int64_t elapsed_ns = (int64_t)(finish.tv_sec - start->tv_sec) *
+                         INT64_C(1000000000) +
+                         (int64_t)finish.tv_nsec - (int64_t)start->tv_nsec;
+    stats_add_verify_ns(elapsed_ns > 0 ? (uint64_t)elapsed_ns : 0);
+}
+
 int verify_run_queued(int remote)
 {
     verify_item_t *item;
-    int failed = 0;
-    struct timespec start, finish;
+    int failed;
+    struct timespec start;
     clock_gettime(CLOCK_MONOTONIC, &start);
     pthread_mutex_lock(&g_queue_lock);
     item = g_head;
     g_head = g_tail = NULL;
     pthread_mutex_unlock(&g_queue_lock);
 
-    while (item) {
-        verify_item_t *next = item->next;
-        if ((remote ? verify_remote_item(item) : verify_local_item(item)) != 0) {
-            failed = 1;
-        }
-        free(item->src);
-        free(item->dst);
-        free(item);
-        item = next;
-    }
+    failed = run_pool_list(item, remote) != 0;
     if (remote && verify_enabled() && sshx_barrier(0) != 0) {
         stats_mark_verify_failure();
         failed = 1;
     }
-    clock_gettime(CLOCK_MONOTONIC, &finish);
-    int64_t elapsed_ns = (int64_t)(finish.tv_sec - start.tv_sec) * INT64_C(1000000000) +
-                         (int64_t)finish.tv_nsec - (int64_t)start.tv_nsec;
-    stats_add_verify_ns(elapsed_ns > 0 ? (uint64_t)elapsed_ns : 0);
+    record_elapsed(&start);
+    return failed ? -1 : 0;
+}
+
+static int join_child_path(const char *parent, const char *name,
+                           char *out, size_t out_sz)
+{
+    int n = snprintf(out, out_sz, "%s%s%s", parent,
+                     strcmp(parent, "/") == 0 ? "" : "/", name);
+    if (n < 0 || (size_t)n >= out_sz) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
+static int walk_submit(verify_pool_t *pool, const char *src, const char *dst,
+                       const struct stat *known)
+{
+    struct stat st;
+    if (known) st = *known;
+    else if (lstat(src, &st) != 0) {
+        progress_interrupt();
+        fprintf(stderr, "ecopy: verification cannot stat %s: %s\n",
+                src, strerror(errno));
+        return -1;
+    }
+
+    if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode)) return 0;
+    verify_item_t *item = make_item(src, dst, &st, 0, S_ISDIR(st.st_mode));
+    if (!item || verify_pool_submit(pool, item) != 0) {
+        free_item(item);
+        return -1;
+    }
+    if (S_ISREG(st.st_mode)) {
+        stats_inc_files_seen();
+        return 0;
+    }
+
+    stats_inc_dirs_seen();
+    int dir_flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW;
+#ifdef O_NOATIME
+    if (g_cfg.metadata && copy_policy_preserve_times()) dir_flags |= O_NOATIME;
+#endif
+    int dir_fd = open(src, dir_flags);
+    DIR *dir = dir_fd >= 0 ? fdopendir(dir_fd) : NULL;
+    if (!dir) {
+        if (dir_fd >= 0) close(dir_fd);
+        progress_interrupt();
+        fprintf(stderr,
+                "ecopy: verification cannot open directory %s without changing "
+                "timestamps: %s; use --no-preserve-times\n",
+                src, strerror(errno));
+        return -1;
+    }
+    int failed = 0;
+    for (;;) {
+        errno = 0;
+        struct dirent *de = readdir(dir);
+        if (!de) {
+            if (errno != 0) failed = 1;
+            break;
+        }
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) {
+            continue;
+        }
+        char child_src[PATH_MAX], child_dst[PATH_MAX];
+        if (join_child_path(src, de->d_name, child_src, sizeof(child_src)) != 0 ||
+            join_child_path(dst, de->d_name, child_dst, sizeof(child_dst)) != 0) {
+            progress_interrupt();
+            fprintf(stderr, "ecopy: verification path too long below %s\n", src);
+            failed = 1;
+            continue;
+        }
+        struct stat child_st;
+        if (lstat(child_src, &child_st) != 0) {
+            failed = 1;
+            continue;
+        }
+        if ((S_ISREG(child_st.st_mode) || S_ISDIR(child_st.st_mode)) &&
+            walk_submit(pool, child_src, child_dst, &child_st) != 0) {
+            failed = 1;
+        }
+    }
+    closedir(dir);
+    return failed ? -1 : 0;
+}
+
+int verify_run_tree(const char *src, const char *dst, int remote,
+                    int source_is_dir)
+{
+    verify_pool_t pool;
+    struct timespec start;
+    struct stat st;
+    int failed = 0;
+    (void)source_is_dir;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    if (lstat(src, &st) != 0) {
+        perror(src);
+        return -1;
+    }
+    if (verify_pool_start(&pool, remote) != 0) {
+        fprintf(stderr, "ecopy: unable to start verification workers\n");
+        return -1;
+    }
+    if (walk_submit(&pool, src, dst, &st) != 0) failed = 1;
+    if (verify_pool_finish(&pool) != 0) failed = 1;
+    stats_set_traversal_done();
+    if (remote && sshx_barrier(0) != 0) {
+        stats_mark_verify_failure();
+        failed = 1;
+    }
+    record_elapsed(&start);
     return failed ? -1 : 0;
 }
 
@@ -420,9 +798,7 @@ void verify_queue_clear(void)
     pthread_mutex_unlock(&g_queue_lock);
     while (item) {
         verify_item_t *next = item->next;
-        free(item->src);
-        free(item->dst);
-        free(item);
+        free_item(item);
         item = next;
     }
 }

@@ -129,7 +129,8 @@ static void test_verify_batch_encoding(void)
     penc_t e; penc_init(&e, buf, sizeof(buf));
     penc_str(&e, "/dst/file");
     penc_i64(&e, 8192);
-    penc_u8(&e, 3);
+    penc_u8(&e, ECOPY_VERIFY_DIRECTORY | ECOPY_VERIFY_METADATA |
+                ECOPY_VERIFY_PRESERVE_TIME);
     penc_u32(&e, 1);
     penc_i64(&e, 4096);
     penc_u32(&e, 4096);
@@ -141,13 +142,26 @@ static void test_verify_batch_encoding(void)
     CHECK(pdec_str(&d, path, sizeof(path)) == 0 &&
           strcmp(path, "/dst/file") == 0, "verify path roundtrip");
     CHECK(pdec_i64(&d) == 8192, "verify size roundtrip");
-    CHECK(pdec_u8(&d) == 3 && pdec_u32(&d) == 1,
+    CHECK(pdec_u8(&d) == 7 && pdec_u32(&d) == 1,
           "verify flags/count roundtrip");
     CHECK(pdec_i64(&d) == 4096 && pdec_u32(&d) == 4096,
           "verify offset/length roundtrip");
     CHECK(pdec_bytes(&d, decoded, sizeof(decoded)) == 0 &&
           memcmp(decoded, digest, sizeof(digest)) == 0,
           "verify digest roundtrip");
+
+    /* A digest cut short by one byte must trip the decoder bounds check. */
+    pdec_init(&d, buf, e.len - 1);
+    CHECK(pdec_str(&d, path, sizeof(path)) == 0, "truncated verify path decodes");
+    (void)pdec_i64(&d);
+    (void)pdec_u8(&d);
+    CHECK(pdec_u32(&d) == 1, "truncated verify count decodes");
+    (void)pdec_i64(&d);
+    (void)pdec_u32(&d);
+    CHECK(pdec_bytes(&d, decoded, sizeof(decoded)) != 0 && d.error,
+          "truncated verify digest is rejected");
+    CHECK((uint32_t)(VERIFY_BATCH_MAX + 1) > VERIFY_BATCH_MAX,
+          "verify batch overflow bound is representable and rejected");
 }
 
 struct frame_expect {

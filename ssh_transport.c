@@ -69,6 +69,7 @@ typedef struct {
 } conn_t;
 
 static conn_t g_conn;
+static int g_read_only;
 
 struct sshx_file {
     uint64_t file_id;
@@ -201,6 +202,11 @@ static void *rx_main(void *arg)
 int ssh_target_is_url(const char *s)
 {
     return s && strncmp(s, "ssh://", 6) == 0;
+}
+
+void sshx_set_read_only(int read_only)
+{
+    g_read_only = read_only ? 1 : 0;
 }
 
 int ssh_target_parse(const char *s, ssh_target_t *out)
@@ -364,7 +370,9 @@ static int build_server_command(const char *remote_bin, const char *path,
 {
     char qpath[PATH_MAX + 16];
     if (shell_squote(path, qpath, sizeof(qpath)) != 0) return -1;
-    if (snprintf(out, outsz, "%s --server %s", remote_bin, qpath) >= (int)outsz) {
+    if (snprintf(out, outsz, "%s %s %s", remote_bin,
+                 g_read_only ? "--server-readonly" : "--server", qpath)
+            >= (int)outsz) {
         return -1;
     }
     return 0;
@@ -810,7 +818,6 @@ int sshx_setmeta(const char *path, const struct stat *src_st, int is_dir)
     penc_str(&e, path);
     encode_meta(&e, src_st);
     penc_u8(&e, (uint8_t)(is_dir ? 1 : 0));
-    penc_u8(&e, (uint8_t)(verify_metadata_enabled() ? 1 : 0));
     if (e.overflow) { errno = ENAMETOOLONG; return -1; }
     /* Fire-and-forget: errors surface at the next barrier. */
     if (conn_send(MSG_SETMETA, next_request_id(), buf, (uint32_t)e.len) != 0) {
@@ -888,7 +895,8 @@ int sshx_flush(void)
 }
 
 int sshx_verify_batch(const char *path, const struct stat *src_st,
-                      const verify_digest_t *digests, size_t count, int final)
+                      const verify_digest_t *digests, size_t count,
+                      int is_dir, int check_metadata)
 {
     size_t cap;
     uint8_t *buf;
@@ -908,8 +916,11 @@ int sshx_verify_batch(const char *path, const struct stat *src_st,
     penc_str(&e, path);
     encode_meta(&e, src_st);
     penc_i64(&e, (int64_t)src_st->st_size);
-    penc_u8(&e, (uint8_t)((final ? 1 : 0) |
-                           (verify_metadata_enabled() ? 2 : 0)));
+    penc_u8(&e, (uint8_t)((is_dir ? ECOPY_VERIFY_DIRECTORY : 0) |
+                           (check_metadata ? ECOPY_VERIFY_METADATA : 0) |
+                           ((verify_metadata_enabled() &&
+                             copy_policy_preserve_times())
+                                ? ECOPY_VERIFY_PRESERVE_TIME : 0)));
     penc_u32(&e, (uint32_t)count);
     for (size_t i = 0; i < count; i++) {
         penc_i64(&e, digests[i].offset);

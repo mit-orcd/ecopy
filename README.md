@@ -116,6 +116,12 @@ Verification is opt-in, so ordinary copies pay no extra opens, reads, hashing, a
 
 # Also verify files skipped by the size+mtime incremental test
 ./ecopy --verify --verify-skipped /src /dst
+
+# Verify an existing tree without copying, creating, or repairing anything
+./ecopy --verify-only /src /dst
+
+# Read-only verification over SSH with explicit checker parallelism
+./ecopy --verify-only --verify-workers=8 /src ssh://host/existing/dst
 ```
 
 - `--verify-metadata` checks object type, regular-file size, permission and special bits, numeric UID/GID, and
@@ -129,15 +135,27 @@ Verification is opt-in, so ordinary copies pay no extra opens, reads, hashing, a
   requested/achieved logical-byte coverage are printed in the final report.
 - `--verify-skipped` includes files that were not copied because size+mtime matched. Without it, checks apply only
   to files copied in this invocation.
+- `--verify-only` never starts copy workers and never creates, truncates, renames, or repairs target objects. It
+  walks the source once, requires each source regular file and directory to exist at the corresponding target path,
+  and ignores target-only extras. It defaults to metadata plus 1% sampled data unless explicit
+  `--verify-metadata` or `--verify-data[=PERCENT]` selectors are supplied. `--verify-skipped` is redundant in this
+  mode. Local single-file target mapping is the same as copy mode; an SSH target is always a directory.
+- Verification uses a bounded post-copy/read-only worker pool. `--verify-workers=N` or
+  `DIRECT_COPY_VERIFY_WORKERS=N` selects 1–128 workers. Defaults are the online CPU count capped at 16 locally and
+  8 for SSH. Copy and verification remain separate phases, so the checker pool does not compete with bulk copy
+  workers.
 - Local targets compare source and destination bytes directly. SSH targets send full 32-byte BLAKE3 digests in
-  bounded batches and hash target blocks on the remote peer; sampled file data is not sent back over SSH and there
-  is no per-file verification round trip.
+  bounded batches and hash target blocks in the remote server pool; sampled file data is not sent back over SSH and
+  there is one phase barrier rather than a per-file round trip. SSH verify-only starts a read-only peer and refuses
+  to create a missing target root.
 - Sparse files are checked as logical content: sampled holes read as zero. This verifies bytes and size, not the
   target's physical extent layout.
 
 Enabled verification necessarily adds I/O. At 1%, large files add approximately 1% source reads and 1% target
 reads; mandatory endpoint reads dominate tiny-file workloads. `--no-preserve-times` excludes timestamps from the
-metadata comparison.
+metadata comparison. When timestamps are checked, data reads use `O_NOATIME`; if the caller lacks permission for
+that flag, verification fails rather than invalidating the atime it is checking. Use metadata-only verification or
+`--no-preserve-times` when `O_NOATIME` is unavailable.
 
 ## Safety
 
@@ -181,6 +199,7 @@ Best settings are workload- and environment-dependent. Key knobs (defaults in pa
 | `DIRECT_COPY_SSH_PUTFILE_MAX` | 1024 | Max size (KiB) a file may be to ship as a single `ssh://` PUTFILE frame |
 | `DIRECT_COPY_SSH_BARRIER_OPS` | 8192 | Fire-and-forget remote ops between drain/flush barriers (min 256) |
 | `DIRECT_COPY_SSH_SERVER_THREADS` | 16 | Apply threads on the `ssh://` peer; higher hides more per-op RPC latency (max 256) |
+| `DIRECT_COPY_VERIFY_WORKERS` | local: min(CPUs, 16); SSH: min(CPUs, 8) | Bounded post-copy/verify-only checker threads (1–128) |
 | `DIRECT_COPY_NO_PRESERVE_TIMES` | 0 | Skip atime/mtime on local/NFS and `ssh://` targets (same as `--no-preserve-times`) |
 
 Out-of-range numeric values are clamped with a warning. The final report prints one suggested next-run experiment;

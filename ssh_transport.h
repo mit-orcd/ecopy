@@ -39,6 +39,9 @@ int ssh_target_parse(const char *s, ssh_target_t *out);
 /* True if the argument begins with the ssh:// scheme. */
 int ssh_target_is_url(const char *s);
 
+/* Select a server mode that requires an existing root and never creates it. */
+void sshx_set_read_only(int read_only);
+
 /*
  * Connect to the remote target: spawn ssh + `ecopy --server <path>`, perform
  * the version/capability handshake, and self-bootstrap the remote binary if it
@@ -107,7 +110,8 @@ int sshx_flush(void);
 /* Queue a bounded remote verification batch. final reapplies the captured
  * metadata after data reads; metadata comparison follows --verify-metadata. */
 int sshx_verify_batch(const char *path, const struct stat *src_st,
-                      const verify_digest_t *digests, size_t count, int final);
+                      const verify_digest_t *digests, size_t count,
+                      int is_dir, int check_metadata);
 
 /* ---- per-file streaming (used by the remote copy path) ---- */
 

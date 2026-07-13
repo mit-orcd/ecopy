@@ -9,6 +9,7 @@
 #include "progress.h"
 #include "stats.h"
 #include "workers.h"
+#include "verify.h"
 #include "types.h"
 #include "config.h"
 
@@ -149,6 +150,25 @@ static void build_progress_line(char *out, size_t out_sz) {
 
     stats_get_progress_snapshot(&snap);
     format_duration(snap.elapsed_sec, elapsed_buf, sizeof(elapsed_buf));
+    if (snap.verify_enabled &&
+        (snap.verify_only || verify_queue_depth() > 0 ||
+         verify_active_count() > 0)) {
+        char verified_buf[32];
+        double coverage = snap.verify_scope_bytes
+                              ? 100.0 * (double)snap.verify_bytes /
+                                    (double)snap.verify_scope_bytes
+                              : 0.0;
+        format_bytes_adaptive(snap.verify_bytes, verified_buf,
+                              sizeof(verified_buf));
+        snprintf(out, out_sz,
+                 "verify: %" PRIu64 " objects, %s sampled, %.3f%% coverage | "
+                 "vq:%" PRIu64 " va:%" PRIu64 "/%d | el:%s",
+                 snap.verify_objects, verified_buf, coverage,
+                 verify_queue_depth(), verify_active_count(),
+                 verify_worker_count(), elapsed_buf);
+        trim_to_width(out, get_terminal_width());
+        return;
+    }
     format_bytes_adaptive(snap.bytes_completed, copied_buf, sizeof(copied_buf));
     bytes_per_sec = snap.rolling_completed_gibs * 1024.0 * 1024.0 * 1024.0;
     format_rate_adaptive(bytes_per_sec, rate_buf, sizeof(rate_buf));

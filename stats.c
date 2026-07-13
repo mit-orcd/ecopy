@@ -208,6 +208,19 @@ void stats_set_verify_config(int metadata, int data, double percent, uint64_t se
     g_stats.verify_seed = seed;
     pthread_mutex_unlock(&g_lock);
 }
+void stats_set_verify_runtime(int verify_only, int workers,
+                              uint64_t queue_peak, uint64_t active_peak) {
+    pthread_mutex_lock(&g_lock);
+    if (verify_only >= 0) g_stats.verify_only = verify_only;
+    g_stats.verify_workers = workers;
+    if (queue_peak > g_stats.verify_queue_peak) {
+        g_stats.verify_queue_peak = queue_peak;
+    }
+    if (active_peak > g_stats.verify_active_peak) {
+        g_stats.verify_active_peak = active_peak;
+    }
+    pthread_mutex_unlock(&g_lock);
+}
 void stats_record_verify(uint64_t bytes, uint64_t scope_bytes, uint64_t blocks,
                          int metadata_checked,
                          int data_mismatch, int metadata_mismatch, int failed) {
@@ -447,6 +460,12 @@ void stats_get_progress_snapshot(progress_snapshot_t *snap) {
     snap->current_file_done = current_file_done;
     snap->current_file_total = g_current_file_total;
     snap->current_file_parallel = g_current_file_parallel;
+    snap->verify_objects = g_stats.verify_objects;
+    snap->verify_bytes = g_stats.verify_bytes;
+    snap->verify_scope_bytes = g_stats.verify_scope_bytes;
+    snap->verify_enabled = g_stats.verify_metadata_enabled ||
+                           g_stats.verify_data_enabled;
+    snap->verify_only = g_stats.verify_only;
     snprintf(snap->current_file, sizeof(snap->current_file), "%s", g_current_file);
     pthread_mutex_unlock(&g_lock);
     snap->rolling_gibs = stats_rolling_gibs();
@@ -476,16 +495,20 @@ void stats_print_final(int verbose) {
     double avg = sec > 0.0 ? gib / sec : 0.0;
     printf("Done.\n");
     printf("Files seen    : %" PRIu64 "\n", s.files_seen);
-    printf("Files copied  : %" PRIu64 "\n", s.files_copied);
-    printf("Files skipped : %" PRIu64 "\n", s.files_skipped);
+    if (!s.verify_only) {
+        printf("Files copied  : %" PRIu64 "\n", s.files_copied);
+        printf("Files skipped : %" PRIu64 "\n", s.files_skipped);
+    }
     printf("Dirs seen     : %" PRIu64 "\n", s.dirs_seen);
-    printf("Dirs created  : %" PRIu64 "\n", s.dirs_created);
-    printf("GiB copied    : %.2f\n", gib);
-    if (s.bytes_skipped > 0) {
-        printf("GiB skipped   : %.2f\n", stats_bytes_to_gib(s.bytes_skipped));
+    if (!s.verify_only) {
+        printf("Dirs created  : %" PRIu64 "\n", s.dirs_created);
+        printf("GiB copied    : %.2f\n", gib);
+        if (s.bytes_skipped > 0) {
+            printf("GiB skipped   : %.2f\n", stats_bytes_to_gib(s.bytes_skipped));
+        }
     }
     printf("Elapsed       : %.2f s\n", sec);
-    printf("Avg speed     : %.2f GiB/s\n", avg);
+    if (!s.verify_only) printf("Avg speed     : %.2f GiB/s\n", avg);
     if (s.metadata_warnings > 0) {
         printf("Metadata warnings : %" PRIu64 "\n", s.metadata_warnings);
     }
@@ -505,6 +528,9 @@ void stats_print_final(int verbose) {
                s.verify_requested_percent, achieved);
         printf("Verify seed       : %" PRIu64 "\n", s.verify_seed);
         printf("Verify seconds    : %.3f\n", (double)s.verify_ns / 1e9);
+        printf("Verify workers    : %d configured, %" PRIu64 " peak active\n",
+               s.verify_workers, s.verify_active_peak);
+        printf("Verify queue peak : %" PRIu64 "\n", s.verify_queue_peak);
         printf("Verify failures   : %" PRIu64 "\n", s.verify_failures);
     }
 
@@ -512,8 +538,10 @@ void stats_print_final(int verbose) {
         return;
     }
 
-    printf("Bytes copied  : %" PRIu64 "\n", s.bytes_copied);
-    printf("Bytes skipped : %" PRIu64 "\n", s.bytes_skipped);
+    if (!s.verify_only) {
+        printf("Bytes copied  : %" PRIu64 "\n", s.bytes_copied);
+        printf("Bytes skipped : %" PRIu64 "\n", s.bytes_skipped);
+    }
     printf("copy_file_range calls     : %" PRIu64 "\n", s.copy_file_range_calls);
     printf("copy_file_range bytes     : %" PRIu64 "\n", s.copy_file_range_bytes);
     printf("copy_file_range fallbacks : %" PRIu64 "\n", s.copy_file_range_fallbacks);

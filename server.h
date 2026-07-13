@@ -13,6 +13,6 @@
  * writes replies to stdout, performing destination filesystem operations
  * confined under root. Returns a process exit code.
  */
-int server_main(const char *root);
+int server_main(const char *root, int read_only);
 
 #endif

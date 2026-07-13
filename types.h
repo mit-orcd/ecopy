@@ -71,6 +71,10 @@ typedef struct {
     uint64_t verify_metadata_mismatches;
     uint64_t verify_failures;
     uint64_t verify_ns;
+    uint64_t verify_queue_peak;
+    uint64_t verify_active_peak;
+    int verify_workers;
+    int verify_only;
     int verify_metadata_enabled;
     int verify_data_enabled;
     double verify_requested_percent;
@@ -121,6 +125,11 @@ typedef struct {
     double rolling_completed_gibs;
     double rolling_files_per_sec;
     double elapsed_sec;
+    uint64_t verify_objects;
+    uint64_t verify_bytes;
+    uint64_t verify_scope_bytes;
+    int verify_enabled;
+    int verify_only;
 } progress_snapshot_t;
 
 #endif

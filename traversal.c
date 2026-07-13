@@ -319,10 +319,11 @@ static void *finalize_batch_worker(void *arg)
         } else {
             frc = preserve_path_metadata(g_finalize_dirs[idx_local].dst,
                                          &g_finalize_dirs[idx_local].src_st);
-            if (frc == 0 && verify_metadata_enabled()) {
-                frc = verify_metadata_path(g_finalize_dirs[idx_local].dst,
-                                           &g_finalize_dirs[idx_local].src_st, 1);
-            }
+        }
+        if (frc == 0 && verify_metadata_enabled()) {
+            frc = verify_queue_directory(g_finalize_dirs[idx_local].src,
+                                         g_finalize_dirs[idx_local].dst,
+                                         &g_finalize_dirs[idx_local].src_st);
         }
         if (frc != 0) {
             pthread_mutex_lock(&ctx->lock);

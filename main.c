@@ -40,7 +40,9 @@ static void usage(const char *prog) {
             "       --verify-metadata checks type/size/mode/uid/gid/timestamps.\n"
             "       --verify-data[=PERCENT] checks sampled 4 KiB blocks (default 1%%).\n"
             "       --verify-skipped also checks files skipped as unchanged.\n"
-            "       --verify-seed=N makes block selection reproducible.\n",
+            "       --verify-seed=N makes block selection reproducible.\n"
+            "       --verify-only compares source and target without modifying either.\n"
+            "       --verify-workers=N sets checker parallelism (1-128).\n",
             prog);
 }
 
@@ -509,15 +511,32 @@ int main(int argc, char **argv) {
     double verify_pct = 1.0;
     uint64_t verify_seed_value = 0;
     int verify_seed_set = 0;
+    int verify_only = 0;
+    int verify_selector_seen = 0;
+    int verify_workers = 0;
     ssh_target_t target;
 
     /* Hidden remote peer mode: `ecopy --server <root>`. */
     if (argc == 3 && strcmp(argv[1], "--server") == 0) {
-        return server_main(argv[2]);
+        return server_main(argv[2], 0);
+    }
+    if (argc == 3 && strcmp(argv[1], "--server-readonly") == 0) {
+        return server_main(argv[2], 1);
     }
 
     int no_preserve_times = 0;
     {
+        const char *worker_env = getenv("DIRECT_COPY_VERIFY_WORKERS");
+        if (worker_env && *worker_env) {
+            char *end = NULL;
+            long value = strtol(worker_env, &end, 10);
+            if (!end || *end || value < 1 || value > 128) {
+                fprintf(stderr, "ecopy: invalid DIRECT_COPY_VERIFY_WORKERS: %s\n",
+                        worker_env);
+                return 1;
+            }
+            verify_workers = (int)value;
+        }
         const char *pos[2] = { NULL, NULL };
         int npos = 0;
         for (int i = 1; i < argc; i++) {
@@ -528,10 +547,13 @@ int main(int argc, char **argv) {
             } else if (strcmp(argv[i], "--verify") == 0) {
                 verify_metadata = 1;
                 verify_data = 1;
+                verify_selector_seen = 1;
             } else if (strcmp(argv[i], "--verify-metadata") == 0) {
                 verify_metadata = 1;
+                verify_selector_seen = 1;
             } else if (strcmp(argv[i], "--verify-data") == 0) {
                 verify_data = 1;
+                verify_selector_seen = 1;
             } else if (strncmp(argv[i], "--verify-data=", 14) == 0) {
                 char *end = NULL;
                 errno = 0;
@@ -543,8 +565,21 @@ int main(int argc, char **argv) {
                     return 1;
                 }
                 verify_data = 1;
+                verify_selector_seen = 1;
             } else if (strcmp(argv[i], "--verify-skipped") == 0) {
                 verify_skipped = 1;
+            } else if (strcmp(argv[i], "--verify-only") == 0) {
+                verify_only = 1;
+            } else if (strncmp(argv[i], "--verify-workers=", 17) == 0) {
+                char *end = NULL;
+                long value = strtol(argv[i] + 17, &end, 10);
+                if (!end || end == argv[i] + 17 || *end ||
+                    value < 1 || value > 128) {
+                    fprintf(stderr, "ecopy: invalid verification worker count: %s\n",
+                            argv[i] + 17);
+                    return 1;
+                }
+                verify_workers = (int)value;
             } else if (strncmp(argv[i], "--verify-seed=", 14) == 0) {
                 char *end = NULL;
                 errno = 0;
@@ -574,6 +609,11 @@ int main(int argc, char **argv) {
         }
         src_arg = pos[0];
         dst_arg = pos[1];
+    }
+    if (verify_only && !verify_selector_seen) {
+        verify_metadata = 1;
+        verify_data = 1;
+        verify_pct = 1.0;
     }
     copy_policy_init(!no_preserve_times);
 
@@ -606,11 +646,18 @@ int main(int argc, char **argv) {
     }
 
     remote = ssh_target_is_url(dst_arg);
+    if (verify_workers == 0) {
+        long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+        if (cpus < 1) cpus = 1;
+        long cap = remote ? 8 : 16;
+        verify_workers = (int)(cpus < cap ? cpus : cap);
+    }
     if (remote) {
         if (ssh_target_parse(dst_arg, &target) != 0) {
             fprintf(stderr, "ecopy: malformed ssh target: %s\n", dst_arg);
             return 1;
         }
+        sshx_set_read_only(verify_only);
         if (sshx_connect(&target) != 0) {
             return 1;
         }
@@ -629,16 +676,23 @@ int main(int argc, char **argv) {
                 sshx_disconnect();
                 return 1;
             }
+            if (verify_only) {
+                snprintf(file_final_dst, sizeof(file_final_dst), "%s",
+                         file_enqueue_dst);
+            }
         }
     } else if (src_is_dir) {
-        if (to_canonical_requested_dir_path(dst_arg, dst_abs, sizeof(dst_abs)) != 0) {
+        if ((verify_only ? to_canonical_dir_path(dst_arg, dst_abs, sizeof(dst_abs))
+                         : to_canonical_requested_dir_path(dst_arg, dst_abs,
+                                                           sizeof(dst_abs))) != 0) {
             return 1;
         }
         if (is_same_or_child_path(src_abs, dst_abs) || is_same_or_child_path(dst_abs, src_abs)) {
             fprintf(stderr, "Source and target directories overlap: %s <-> %s\n", src_abs, dst_abs);
             return 1;
         }
-        if (ensure_destination_root(dst_abs, &destination_fresh) != 0) {
+        if (!verify_only &&
+            ensure_destination_root(dst_abs, &destination_fresh) != 0) {
             return 1;
         }
         copy_policy_set_destination(destination_fresh, 1);
@@ -675,7 +729,15 @@ int main(int argc, char **argv) {
             }
         }
 
-        if (mkdir_p_dir(dst_dir, 0777, NULL) != 0) {
+        if (verify_only) {
+            struct stat parent_st;
+            if (lstat(dst_dir, &parent_st) != 0 || !S_ISDIR(parent_st.st_mode)) {
+                fprintf(stderr,
+                        "ecopy: verify-only target parent is not an existing directory: %s\n",
+                        dst_dir);
+                return 1;
+            }
+        } else if (mkdir_p_dir(dst_dir, 0777, NULL) != 0) {
             return 1;
         }
         copy_policy_set_destination(0, 0);
@@ -696,7 +758,29 @@ int main(int argc, char **argv) {
 
     stats_init();
     verify_configure(verify_metadata, verify_data, verify_pct, verify_skipped,
-                     verify_seed_value, verify_seed_set);
+                     verify_seed_value, verify_seed_set, verify_workers);
+    stats_set_verify_runtime(verify_only, verify_workers, 0, 0);
+    if (verify_only) {
+        int verify_failed;
+        if (verbose) {
+            printf("Verification-only mode: %d workers, metadata=%s, data=%s (%.3f%%)\n",
+                   verify_workers, verify_metadata ? "yes" : "no",
+                   verify_data ? "yes" : "no", verify_pct);
+        }
+        if (progress_start() != 0) {
+            sshx_disconnect();
+            return 1;
+        }
+        verify_failed = verify_run_tree(src_abs,
+                                        src_is_dir ? dst_root : file_final_dst,
+                                        remote, src_is_dir) != 0;
+        sshx_disconnect();
+        progress_stop();
+        stats_set_shutdown_done();
+        printf("\n");
+        stats_print_final(verbose);
+        return verify_failed ? 1 : 0;
+    }
     workers_set_collect_wait_timing(verbose);
     if (workers_start() != 0) { sshx_disconnect(); return 1; }
     if (verbose) {

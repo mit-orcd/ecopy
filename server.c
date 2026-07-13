@@ -29,11 +29,13 @@
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/utsname.h>
 #include <time.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdatomic.h>
 
 #ifndef PATH_MAX
@@ -70,6 +72,7 @@ static uint64_t g_err_count;
 static int32_t  g_err_first;         /* negative errno of the first failure */
 static char     g_err_first_path[PATH_MAX];
 static pthread_mutex_t g_err_lock = PTHREAD_MUTEX_INITIALIZER;  /* pool workers log here */
+static _Atomic int g_verify_atime_warned;
 
 static void log_op_error(const char *path, int err)
 {
@@ -500,23 +503,26 @@ static void apply_meta(int fd, uint32_t uid, uint32_t gid, uint32_t mode,
     }
 }
 
-static int metadata_matches(int fd, uint32_t uid, uint32_t gid, uint32_t mode,
-                            int64_t at_s, int64_t at_ns,
-                            int64_t mt_s, int64_t mt_ns, int is_dir)
+static const char *metadata_mismatch_field(int fd, uint32_t uid, uint32_t gid,
+                                           uint32_t mode,
+                                           int64_t at_s, int64_t at_ns,
+                                           int64_t mt_s, int64_t mt_ns,
+                                           int is_dir)
 {
     struct stat st;
-    if (fstat(fd, &st) != 0) return 0;
-    if ((!is_dir && !S_ISREG(st.st_mode)) || (is_dir && !S_ISDIR(st.st_mode)) ||
-        (st.st_mode & 07777) != (mode_t)(mode & 07777) ||
-        st.st_uid != (uid_t)uid || st.st_gid != (gid_t)gid) {
-        return 0;
-    }
+    if (fstat(fd, &st) != 0) return "stat";
+    if ((!is_dir && !S_ISREG(st.st_mode)) ||
+        (is_dir && !S_ISDIR(st.st_mode))) return "type";
+    if ((st.st_mode & 07777) != (mode_t)(mode & 07777)) return "mode";
+    if (st.st_uid != (uid_t)uid) return "uid";
+    if (st.st_gid != (gid_t)gid) return "gid";
     if (g_preserve_times &&
-        ((int64_t)st.st_atim.tv_sec != at_s || (int64_t)st.st_atim.tv_nsec != at_ns ||
-         (int64_t)st.st_mtim.tv_sec != mt_s || (int64_t)st.st_mtim.tv_nsec != mt_ns)) {
-        return 0;
-    }
-    return 1;
+        ((int64_t)st.st_atim.tv_sec != at_s ||
+         (int64_t)st.st_atim.tv_nsec != at_ns)) return "atime";
+    if (g_preserve_times &&
+        ((int64_t)st.st_mtim.tv_sec != mt_s ||
+         (int64_t)st.st_mtim.tv_nsec != mt_ns)) return "mtime";
+    return NULL;
 }
 
 /* -------------------- message handlers -------------------- */
@@ -815,7 +821,6 @@ static void handle_setmeta(const uint8_t *payload, uint32_t plen)
     int64_t mt_s = pdec_i64(&d);
     int64_t mt_ns = pdec_i64(&d);
     int is_dir = pdec_u8(&d) ? 1 : 0;
-    int verify_meta = pdec_u8(&d) ? 1 : 0;
     if (d.error) return;
 
     char path[PATH_MAX];
@@ -833,10 +838,6 @@ static void handle_setmeta(const uint8_t *payload, uint32_t plen)
         mode_is_set = 0; /* chown may clear special mode bits */
     }
     apply_meta(fd, uid, gid, mode, at_s, at_ns, mt_s, mt_ns, mode_is_set);
-    if (verify_meta &&
-        !metadata_matches(fd, uid, gid, mode, at_s, at_ns, mt_s, mt_ns, is_dir)) {
-        log_op_error(path, EIO);
-    }
     close(fd);
 }
 
@@ -938,8 +939,7 @@ static int pread_exact(int fd, void *buf, size_t len, off_t offset)
     return 0;
 }
 
-/* Ordered, fire-and-forget verification. The server loop drains the apply
- * pool before dispatching this message, so all copied data is already visible. */
+/* Read-only verification job. It is safe to dispatch these concurrently. */
 static void handle_verify_path(const uint8_t *payload, uint32_t plen)
 {
     char in[PATH_MAX], path[PATH_MAX];
@@ -956,22 +956,47 @@ static void handle_verify_path(const uint8_t *payload, uint32_t plen)
     int64_t expected_size = pdec_i64(&d);
     uint8_t flags = pdec_u8(&d);
     uint32_t count = pdec_u32(&d);
+    int is_dir = (flags & ECOPY_VERIFY_DIRECTORY) != 0;
+    int check_metadata = (flags & ECOPY_VERIFY_METADATA) != 0;
+    int check_times = (flags & ECOPY_VERIFY_PRESERVE_TIME) != 0;
     if (d.error || expected_size < 0 || count > VERIFY_BATCH_MAX ||
+        (flags & ~7u) != 0 || (is_dir && count != 0) ||
         resolve_path(in, path, sizeof(path)) != 0) {
         log_op_error(in, EINVAL);
         return;
     }
 
-    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    int open_flags = O_RDONLY | O_NOFOLLOW | O_CLOEXEC;
+    if (is_dir) open_flags |= O_DIRECTORY;
+#ifdef O_NOATIME
+    if (!is_dir && check_times) open_flags |= O_NOATIME;
+#endif
+    if (!is_dir && count > 0 && !check_times &&
+        atomic_exchange(&g_verify_atime_warned, 1) == 0) {
+        fprintf(stderr,
+                "ecopy: remote verification data reads may update atime because "
+                "timestamps are not being checked\n");
+    }
+    int fd = open(path, open_flags);
     if (fd < 0) {
+        if (check_times && (errno == EPERM || errno == EACCES)) {
+            fprintf(stderr,
+                    "ecopy: remote verification cannot open %s with O_NOATIME: %s; "
+                    "use --verify-metadata or --no-preserve-times\n",
+                    path, strerror(errno));
+        }
         log_op_error(path, errno);
         return;
     }
     struct stat st;
     int failed = 0;
-    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
-        st.st_size != (off_t)expected_size) {
+    const char *field = NULL;
+    int64_t bad_offset = -1;
+    if (fstat(fd, &st) != 0 ||
+        (is_dir ? !S_ISDIR(st.st_mode) : !S_ISREG(st.st_mode)) ||
+        (!is_dir && st.st_size != (off_t)expected_size)) {
         failed = 1;
+        field = "type/size";
     }
 
     for (uint32_t i = 0; i < count && !d.error; i++) {
@@ -992,20 +1017,33 @@ static void handle_verify_path(const uint8_t *payload, uint32_t plen)
              (blake3_hash(data, length, actual),
               memcmp(actual, expected, sizeof(actual)) != 0))) {
             failed = 1;
+            bad_offset = offset;
         }
     }
     if (d.error) failed = 1;
 
-    if (flags & 1u) {
-        apply_meta(fd, uid, gid, mode, at_s, at_ns, mt_s, mt_ns, 0);
-        if ((flags & 2u) &&
-            !metadata_matches(fd, uid, gid, mode, at_s, at_ns,
-                              mt_s, mt_ns, 0)) {
+    if (check_metadata) {
+        const char *meta_field = metadata_mismatch_field(
+            fd, uid, gid, mode, at_s, at_ns, mt_s, mt_ns, is_dir);
+        if (meta_field) {
             failed = 1;
+            if (!field) field = meta_field;
         }
     }
     close(fd);
-    if (failed) log_op_error(path, EIO);
+    if (failed) {
+        char diagnostic[PATH_MAX];
+        if (bad_offset >= 0) {
+            snprintf(diagnostic, sizeof(diagnostic), "%.*s at offset %" PRId64,
+                     PATH_MAX - 48, path, bad_offset);
+        } else if (field) {
+            snprintf(diagnostic, sizeof(diagnostic), "%.*s (%s)",
+                     PATH_MAX - 32, path, field);
+        } else {
+            snprintf(diagnostic, sizeof(diagnostic), "%s", path);
+        }
+        log_op_error(diagnostic, EIO);
+    }
 }
 
 /*
@@ -1072,6 +1110,8 @@ static void pool_run_job(pool_job_t *j)
         handle_mkdir(j->payload, j->plen);
     } else if (j->type == MSG_SETMETA) {
         handle_setmeta(j->payload, j->plen);
+    } else if (j->type == MSG_VERIFY_PATH) {
+        handle_verify_path(j->payload, j->plen);
     }
     free(j->payload);
     free(j);
@@ -1119,6 +1159,7 @@ static void pool_submit(uint8_t type, uint8_t *payload, uint32_t plen)
         if (type == MSG_PUTFILE) handle_putfile(payload, plen);
         else if (type == MSG_MKDIR) handle_mkdir(payload, plen);
         else if (type == MSG_SETMETA) handle_setmeta(payload, plen);
+        else if (type == MSG_VERIFY_PATH) handle_verify_path(payload, plen);
         free(payload);
         return;
     }
@@ -1179,7 +1220,7 @@ static void pool_shutdown(void)
 
 /* -------------------- main loop -------------------- */
 
-int server_main(const char *root)
+int server_main(const char *root, int read_only)
 {
     if (!root || root[0] != '/') {
         fprintf(stderr, "ecopy --server: root must be an absolute path\n");
@@ -1194,8 +1235,16 @@ int server_main(const char *root)
         struct stat rst;
         g_root_present = (lstat(root, &rst) == 0 && S_ISDIR(rst.st_mode)) ? 1 : 0;
     }
-    if (mkdir_p(root) != 0) {
-        fprintf(stderr, "ecopy --server: cannot create root %s: %s\n", root, strerror(errno));
+    if (read_only) {
+        if (!g_root_present) {
+            fprintf(stderr,
+                    "ecopy --server-readonly: target root must already exist: %s\n",
+                    root);
+            return 1;
+        }
+    } else if (mkdir_p(root) != 0) {
+        fprintf(stderr, "ecopy --server: cannot create root %s: %s\n",
+                root, strerror(errno));
         return 1;
     }
     if (normalize_abs(root, g_root_norm, sizeof(g_root_norm)) != 0) {
@@ -1233,7 +1282,8 @@ int server_main(const char *root)
          * Everything else is an ordering/consistency point: drain the pool so
          * all prior fire-and-forget work is on disk, then handle inline.
          */
-        if ((type == MSG_PUTFILE || type == MSG_MKDIR || type == MSG_SETMETA) &&
+        if ((type == MSG_PUTFILE || type == MSG_MKDIR || type == MSG_SETMETA ||
+             type == MSG_VERIFY_PATH) &&
             g_pool_n > 0) {
             pool_submit(type, payload, plen);   /* takes ownership of payload */
             continue;

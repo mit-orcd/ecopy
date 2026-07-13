@@ -22,7 +22,8 @@ typedef struct {
 } verify_digest_t;
 
 void verify_configure(int metadata, int data, double percent,
-                      int include_skipped, uint64_t seed, int seed_set);
+                      int include_skipped, uint64_t seed, int seed_set,
+                      int workers);
 int verify_enabled(void);
 int verify_metadata_enabled(void);
 int verify_data_enabled(void);
@@ -32,9 +33,16 @@ uint64_t verify_seed(void);
 
 int verify_queue_file(const char *src, const char *dst,
                       const struct stat *src_st, int skipped);
+int verify_queue_directory(const char *src, const char *dst,
+                           const struct stat *src_st);
 int verify_retarget_path(const char *old_dst, const char *new_dst);
 int verify_run_queued(int remote);
+int verify_run_tree(const char *src, const char *dst, int remote,
+                    int source_is_dir);
 void verify_queue_clear(void);
+int verify_worker_count(void);
+uint64_t verify_queue_depth(void);
+uint64_t verify_active_count(void);
 
 int verify_metadata_stat(const struct stat *expected,
                          const struct stat *actual,
