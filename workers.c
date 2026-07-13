@@ -11,6 +11,8 @@
 #include "types.h"
 #include "stats.h"
 #include "fs_util.h"
+#include "copy_policy.h"
+#include "verify.h"
 #include "ssh_transport.h"
 #include "protocol.h"
 
@@ -113,7 +115,6 @@ static off_t g_chunk_size = 0;
 static off_t g_large_threshold = 0;
 static int g_max_queued_files = 0;
 static int g_small_worker_limit = 0;
-static int g_small_inplace = 0;
 static off_t g_ssh_putfile_max = 0;   /* max size streamed as one PUTFILE frame */
 
 #define MAX_LARGE_BUFFER_BUDGET_MB 8192
@@ -326,11 +327,6 @@ static void init_runtime_config(void)
                                              g_worker_count);
 
     {
-        const char *s = getenv("DIRECT_COPY_SMALL_INPLACE");
-        g_small_inplace = (s && *s && strcmp(s, "0") != 0) ? 1 : 0;
-    }
-
-    {
         /* Files at or below this size are shipped to an SSH target as a single
          * fire-and-forget PUTFILE frame (KiB; default 1 MiB). Capped so the
          * frame stays within the protocol limit. */
@@ -432,23 +428,6 @@ static off_t runtime_large_threshold(void)
     return g_large_threshold;
 }
 
-static int runtime_small_inplace(void)
-{
-    init_runtime_config();
-    return g_small_inplace;
-}
-
-/*
- * Whether a remote copy should write straight to the final name (no temp +
- * rename). Safe — and a round trip cheaper — when the destination root did not
- * exist before this run: every file is brand new, so there is nothing to
- * clobber non-atomically. Also honors the explicit DIRECT_COPY_SMALL_INPLACE.
- */
-static int remote_inplace(void)
-{
-    return runtime_small_inplace() || !sshx_remote_root_present();
-}
-
 /*
  * A regular file is treated as sparse when the storage actually allocated to
  * it (st_blocks, in 512-byte units) is meaningfully smaller than its logical
@@ -470,61 +449,6 @@ int workers_file_is_sparse(const struct stat *st)
 }
 
 /* -------------------- queue helpers -------------------- */
-
-static int enqueue_task(file_task_t **head,
-                        file_task_t **tail,
-                        uint64_t *depth,
-                        dir_handle_t *dir,
-                        const char *name,
-                        const char *src,
-                        const char *dst,
-                        const struct stat *src_st)
-{
-    file_task_t *t;
-
-    pthread_mutex_lock(&g_queue_lock);
-    t = g_task_freelist;
-    if (t) {
-        g_task_freelist = t->next;
-    }
-    pthread_mutex_unlock(&g_queue_lock);
-
-    if (!t) {
-        t = (file_task_t *)malloc(sizeof(*t));
-        if (!t) {
-            perror("malloc");
-            return -1;
-        }
-    }
-
-    dir_handle_retain(dir);
-    t->dir = dir;
-    copy_path_field(t->name, sizeof(t->name), name);
-    copy_path_field(t->src, sizeof(t->src), src);
-    copy_path_field(t->dst, sizeof(t->dst), dst);
-    t->src_st = *src_st;
-    t->next = NULL;
-
-    pthread_mutex_lock(&g_queue_lock);
-    while ((int)(g_small_queue_depth + g_large_queue_depth) >= g_max_queued_files) {
-        uint64_t wait_start_ns = g_collect_wait_timing ? monotonic_ns() : 0;
-        pthread_cond_wait(&g_space_cond, &g_queue_lock);
-        if (g_collect_wait_timing) {
-            stats_record_queue_wait_ns(monotonic_ns() - wait_start_ns);
-        }
-    }
-    if (*tail) {
-        (*tail)->next = t;
-    } else {
-        *head = t;
-    }
-    *tail = t;
-    (*depth)++;
-    pthread_cond_signal(&g_queue_cond);
-    pthread_mutex_unlock(&g_queue_lock);
-
-    return 0;
-}
 
 static void free_file_task(file_task_t *task)
 {
@@ -1203,7 +1127,7 @@ static int copy_file_serial_small(file_task_t *task)
     off_t pos = 0;
     int rc = -1;
     int target_created = 0;
-    int inplace = runtime_small_inplace();
+    int inplace = copy_policy_small_inplace();
     const char *write_name;
     char tmp_name[PATH_MAX] = "";
     fadvise_batch_t fadv;
@@ -1645,6 +1569,9 @@ static void finish_large_file_ctx(large_file_ctx_t *ctx)
                                            ctx->dst) != 0) {
             ctx->fd_out = -1;
             rc = -1;
+        } else if (verify_queue_file(ctx->src, ctx->dst, &ctx->src_st, 0) != 0) {
+            fprintf(stderr, "ecopy: unable to queue verification for %s\n", ctx->dst);
+            rc = -1;
         } else {
             ctx->fd_out = -1;
             stats_inc_files_copied();
@@ -1958,7 +1885,7 @@ static int copy_file_remote_putfile(file_task_t *task, off_t size)
 
     if (sshx_putfile(task->dst, &task->src_st, task->dir->src_mode,
                      buf, (size_t)pos,
-                     remote_inplace()) != 0) {
+                     copy_policy_small_inplace()) != 0) {
         return -1;
     }
     record_progress_bytes((uint64_t)pos, 1);
@@ -2009,7 +1936,8 @@ static int copy_file_remote(file_task_t *task)
     }
 
     f = sshx_file_begin(task->dst, task->src_st.st_mode & 07777,
-                        task->dir->src_mode, size, sparse, remote_inplace());
+                        task->dir->src_mode, size, sparse,
+                        copy_policy_small_inplace());
     if (!f) {
         goto out;
     }
@@ -2102,7 +2030,15 @@ static void *worker_main(void *arg)
                          ? (copy_file_remote(claim.file_task) == 0)
                          : (copy_file_serial_small(claim.file_task) == 0);
             if (ok) {
-                stats_inc_files_copied();
+                if (verify_queue_file(claim.file_task->src,
+                                      claim.file_task->dst,
+                                      &claim.file_task->src_st, 0) != 0) {
+                    fprintf(stderr, "ecopy: unable to queue verification for %s\n",
+                            claim.file_task->dst);
+                    mark_worker_error();
+                } else {
+                    stats_inc_files_copied();
+                }
             } else {
                 mark_worker_error();
             }
@@ -2248,21 +2184,20 @@ static int build_child_path(char *out, size_t outsz,
 }
 
 /*
- * Remote traversal discovers up to REMOTE_STAT_BATCH files at once. Build all
- * their task nodes first, then append as many as fit under one queue lock. This
- * replaces two queue-lock acquisitions plus one condition signal per file with
- * one operation per batch in the normal (queue has room) case.
+ * Traversal discovers a directory's files in batches. Build all task nodes
+ * first, then partition/append them under one queue lock. This keeps the SSH
+ * wakeup optimization and local large-file routing in one implementation.
  */
-int workers_enqueue_remote_batch(dir_handle_t *dir,
-                                 const workers_batch_item_t *items,
-                                 size_t count)
+int workers_enqueue_batch(dir_handle_t *dir,
+                          const workers_batch_item_t *items,
+                          size_t count)
 {
     file_task_t *spares = NULL;
     file_task_t *batch_head = NULL;
     file_task_t *batch_tail = NULL;
     size_t built = 0;
 
-    if (!dir || (!items && count != 0) || !sshx_active()) {
+    if (!dir || (!items && count != 0)) {
         errno = EINVAL;
         return -1;
     }
@@ -2333,8 +2268,6 @@ int workers_enqueue_remote_batch(dir_handle_t *dir,
     while (batch_head) {
         size_t room;
         size_t take;
-        file_task_t *chunk_tail;
-        file_task_t *rest;
 
         pthread_mutex_lock(&g_queue_lock);
         while ((int)(g_small_queue_depth + g_large_queue_depth) >=
@@ -2348,36 +2281,70 @@ int workers_enqueue_remote_batch(dir_handle_t *dir,
         room = (size_t)(g_max_queued_files -
                         (int)(g_small_queue_depth + g_large_queue_depth));
         take = built < room ? built : room;
-        chunk_tail = batch_head;
-        for (size_t i = 1; i < take; i++) {
-            chunk_tail = chunk_tail->next;
-        }
-        rest = chunk_tail->next;
-        chunk_tail->next = NULL;
 
-        if (g_small_queue_tail) {
-            g_small_queue_tail->next = batch_head;
-        } else {
-            g_small_queue_head = batch_head;
+        for (size_t i = 0; i < take; i++) {
+            file_task_t *t = batch_head;
+            int use_large;
+            batch_head = t->next;
+            t->next = NULL;
+
+            use_large = !sshx_active() &&
+                        t->src_st.st_size > runtime_large_threshold() &&
+                        !workers_file_is_sparse(&t->src_st);
+            if (use_large) {
+                if (g_large_queue_tail) {
+                    g_large_queue_tail->next = t;
+                } else {
+                    g_large_queue_head = t;
+                }
+                g_large_queue_tail = t;
+                g_large_queue_depth++;
+            } else {
+                if (g_small_queue_tail) {
+                    g_small_queue_tail->next = t;
+                } else {
+                    g_small_queue_head = t;
+                }
+                g_small_queue_tail = t;
+                g_small_queue_depth++;
+            }
         }
-        g_small_queue_tail = chunk_tail;
-        g_small_queue_depth += take;
         {
-            int wake_count = g_small_worker_limit - (int)g_small_workers_active;
             int free_slots = g_worker_count - total_worker_slots_used_locked();
-            if (wake_count > free_slots) {
-                wake_count = free_slots;
+            int large_wake = 0;
+            int small_wake = 0;
+
+            if (g_large_queue_depth > 0 &&
+                (int)g_large_workers_active < g_max_active_large_files &&
+                free_slots >= g_large_worker_count) {
+                large_wake = g_max_active_large_files -
+                             (int)g_large_workers_active;
+                if (large_wake > (int)g_large_queue_depth) {
+                    large_wake = (int)g_large_queue_depth;
+                }
+                if (large_wake > free_slots / g_large_worker_count) {
+                    large_wake = free_slots / g_large_worker_count;
+                }
+                free_slots -= large_wake * g_large_worker_count;
             }
-            if (wake_count > (int)g_small_queue_depth) {
-                wake_count = (int)g_small_queue_depth;
+
+            if (g_small_queue_depth > 0 && free_slots > 0) {
+                small_wake = g_small_worker_limit -
+                             (int)g_small_workers_active;
+                if (small_wake > (int)g_small_queue_depth) {
+                    small_wake = (int)g_small_queue_depth;
+                }
+                if (small_wake > free_slots) {
+                    small_wake = free_slots;
+                }
             }
-            for (int i = 0; i < wake_count; i++) {
+
+            for (int i = 0; i < large_wake + small_wake; i++) {
                 pthread_cond_signal(&g_queue_cond);
             }
         }
         pthread_mutex_unlock(&g_queue_lock);
 
-        batch_head = rest;
         built -= take;
     }
     return 0;
@@ -2410,35 +2377,10 @@ int workers_enqueue_small_file(dir_handle_t *dir,
                                const char *dst,
                                const struct stat *src_st)
 {
-    init_runtime_config();
-
-    /*
-     * Remote destinations do not use the local large-file pipeline (its
-     * O_DIRECT/pwrite writer is meaningless across the wire); every file is
-     * streamed through the remote copy path, so keep them all on the small
-     * queue. Multi-file concurrency over the pipelined channel provides the
-     * throughput instead.
-     */
-    if (!sshx_active() &&
-        src_st->st_size > runtime_large_threshold() && !workers_file_is_sparse(src_st)) {
-        return enqueue_task(&g_large_queue_head,
-                            &g_large_queue_tail,
-                            &g_large_queue_depth,
-                            dir,
-                            name,
-                            src,
-                            dst,
-                            src_st);
-    }
-
-    return enqueue_task(&g_small_queue_head,
-                        &g_small_queue_tail,
-                        &g_small_queue_depth,
-                        dir,
-                        name,
-                        src,
-                        dst,
-                        src_st);
+    workers_batch_item_t item = { name, src_st };
+    (void)src;
+    (void)dst;
+    return workers_enqueue_batch(dir, &item, 1);
 }
 
 int workers_enqueue_large_file(dir_handle_t *dir,
@@ -2447,30 +2389,10 @@ int workers_enqueue_large_file(dir_handle_t *dir,
                                const char *dst,
                                const struct stat *src_st)
 {
-    /*
-     * Sparse files are copied through the serial hole-skipping path regardless
-     * of their (logical) size, so route them to the small-file queue instead
-     * of spinning up a dense large-file pipeline that would read every hole.
-     */
-    if (sshx_active() || workers_file_is_sparse(src_st)) {
-        return enqueue_task(&g_small_queue_head,
-                            &g_small_queue_tail,
-                            &g_small_queue_depth,
-                            dir,
-                            name,
-                            src,
-                            dst,
-                            src_st);
-    }
-
-    return enqueue_task(&g_large_queue_head,
-                        &g_large_queue_tail,
-                        &g_large_queue_depth,
-                        dir,
-                        name,
-                        src,
-                        dst,
-                        src_st);
+    workers_batch_item_t item = { name, src_st };
+    (void)src;
+    (void)dst;
+    return workers_enqueue_batch(dir, &item, 1);
 }
 
 uint64_t workers_small_queue_depth(void)
@@ -2618,7 +2540,8 @@ void workers_print_startup_config(void)
     printf("  chunk size MiB              : %d\n", (int)(g_chunk_size / (1024 * 1024)));
     printf("  large file threshold MiB    : %d\n", (int)(g_large_threshold / (1024 * 1024)));
     printf("  max queued files            : %d\n", g_max_queued_files);
-    printf("  small in-place writes       : %s\n", g_small_inplace ? "yes" : "no");
+    printf("  small in-place writes       : %s\n",
+           copy_policy_small_inplace() ? "yes" : "no");
     printf("  read direct_io enabled      : %s\n", read_direct_io_enabled() ? "yes" : "no");
     printf("  write direct_io enabled     : %s\n", write_direct_io_enabled() ? "yes" : "no");
     printf("  copy_file_range enabled     : %s\n", copy_file_range_enabled() ? "yes" : "no");

@@ -20,6 +20,8 @@
 #define _GNU_SOURCE
 #include "server.h"
 #include "protocol.h"
+#include "verify.h"
+#include "third_party/blake3/blake3.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -498,6 +500,25 @@ static void apply_meta(int fd, uint32_t uid, uint32_t gid, uint32_t mode,
     }
 }
 
+static int metadata_matches(int fd, uint32_t uid, uint32_t gid, uint32_t mode,
+                            int64_t at_s, int64_t at_ns,
+                            int64_t mt_s, int64_t mt_ns, int is_dir)
+{
+    struct stat st;
+    if (fstat(fd, &st) != 0) return 0;
+    if ((!is_dir && !S_ISREG(st.st_mode)) || (is_dir && !S_ISDIR(st.st_mode)) ||
+        (st.st_mode & 07777) != (mode_t)(mode & 07777) ||
+        st.st_uid != (uid_t)uid || st.st_gid != (gid_t)gid) {
+        return 0;
+    }
+    if (g_preserve_times &&
+        ((int64_t)st.st_atim.tv_sec != at_s || (int64_t)st.st_atim.tv_nsec != at_ns ||
+         (int64_t)st.st_mtim.tv_sec != mt_s || (int64_t)st.st_mtim.tv_nsec != mt_ns)) {
+        return 0;
+    }
+    return 1;
+}
+
 /* -------------------- message handlers -------------------- */
 
 static int handle_hello(uint64_t id, const uint8_t *payload, uint32_t plen, const char *root)
@@ -794,6 +815,7 @@ static void handle_setmeta(const uint8_t *payload, uint32_t plen)
     int64_t mt_s = pdec_i64(&d);
     int64_t mt_ns = pdec_i64(&d);
     int is_dir = pdec_u8(&d) ? 1 : 0;
+    int verify_meta = pdec_u8(&d) ? 1 : 0;
     if (d.error) return;
 
     char path[PATH_MAX];
@@ -811,6 +833,10 @@ static void handle_setmeta(const uint8_t *payload, uint32_t plen)
         mode_is_set = 0; /* chown may clear special mode bits */
     }
     apply_meta(fd, uid, gid, mode, at_s, at_ns, mt_s, mt_ns, mode_is_set);
+    if (verify_meta &&
+        !metadata_matches(fd, uid, gid, mode, at_s, at_ns, mt_s, mt_ns, is_dir)) {
+        log_op_error(path, EIO);
+    }
     close(fd);
 }
 
@@ -894,6 +920,92 @@ static void handle_putfile(const uint8_t *payload, uint32_t plen)
         if (!inplace) (void)unlink(tmp_path);
         log_op_error(finalp, err);
     }
+}
+
+static int pread_exact(int fd, void *buf, size_t len, off_t offset)
+{
+    size_t done = 0;
+    while (done < len) {
+        ssize_t n = pread(fd, (uint8_t *)buf + done, len - done,
+                          offset + (off_t)done);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1;
+        done += (size_t)n;
+    }
+    return 0;
+}
+
+/* Ordered, fire-and-forget verification. The server loop drains the apply
+ * pool before dispatching this message, so all copied data is already visible. */
+static void handle_verify_path(const uint8_t *payload, uint32_t plen)
+{
+    char in[PATH_MAX], path[PATH_MAX];
+    pdec_t d;
+    pdec_init(&d, payload, plen);
+    if (pdec_str(&d, in, sizeof(in)) != 0) return;
+    uint32_t uid = pdec_u32(&d);
+    uint32_t gid = pdec_u32(&d);
+    uint32_t mode = pdec_u32(&d);
+    int64_t at_s = pdec_i64(&d);
+    int64_t at_ns = pdec_i64(&d);
+    int64_t mt_s = pdec_i64(&d);
+    int64_t mt_ns = pdec_i64(&d);
+    int64_t expected_size = pdec_i64(&d);
+    uint8_t flags = pdec_u8(&d);
+    uint32_t count = pdec_u32(&d);
+    if (d.error || expected_size < 0 || count > VERIFY_BATCH_MAX ||
+        resolve_path(in, path, sizeof(path)) != 0) {
+        log_op_error(in, EINVAL);
+        return;
+    }
+
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        log_op_error(path, errno);
+        return;
+    }
+    struct stat st;
+    int failed = 0;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_size != (off_t)expected_size) {
+        failed = 1;
+    }
+
+    for (uint32_t i = 0; i < count && !d.error; i++) {
+        int64_t offset = pdec_i64(&d);
+        uint32_t length = pdec_u32(&d);
+        uint8_t expected[VERIFY_DIGEST_SIZE];
+        uint8_t actual[VERIFY_DIGEST_SIZE];
+        uint8_t data[VERIFY_BLOCK_SIZE];
+        if (pdec_bytes(&d, expected, sizeof(expected)) != 0) break;
+        if (offset < 0 || length == 0 || length > VERIFY_BLOCK_SIZE ||
+            offset > expected_size ||
+            (uint64_t)length > (uint64_t)(expected_size - offset)) {
+            d.error = 1;
+            break;
+        }
+        if (!failed &&
+            (pread_exact(fd, data, length, (off_t)offset) != 0 ||
+             (blake3_hash(data, length, actual),
+              memcmp(actual, expected, sizeof(actual)) != 0))) {
+            failed = 1;
+        }
+    }
+    if (d.error) failed = 1;
+
+    if (flags & 1u) {
+        apply_meta(fd, uid, gid, mode, at_s, at_ns, mt_s, mt_ns, 0);
+        if ((flags & 2u) &&
+            !metadata_matches(fd, uid, gid, mode, at_s, at_ns,
+                              mt_s, mt_ns, 0)) {
+            failed = 1;
+        }
+    }
+    close(fd);
+    if (failed) log_op_error(path, EIO);
 }
 
 /*
@@ -1143,6 +1255,7 @@ int server_main(const char *root)
         case MSG_STAT:      rc = handle_stat(id, payload, plen); break;
         case MSG_STAT_BULK: rc = handle_stat_bulk(id, payload, plen); break;
         case MSG_SETMETA:   handle_setmeta(payload, plen); break;
+        case MSG_VERIFY_PATH: handle_verify_path(payload, plen); break;
         case MSG_BARRIER:   rc = handle_barrier(id, payload, plen); break;
         case MSG_UNLINK:    handle_unlink(payload, plen); break;
         case MSG_BYE:

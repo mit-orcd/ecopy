@@ -54,12 +54,13 @@ typedef struct {
 } workers_batch_item_t;
 
 /*
- * Enqueue remote files from one source/destination directory as one queue
- * operation. Paths are built from dir->src/dir->dst and each item name.
+ * Enqueue files from one source/destination directory as one queue operation.
+ * Paths are built from dir->src/dir->dst and each item name. Local items are
+ * partitioned into small/large queues; SSH items all use the remote small path.
  */
-int workers_enqueue_remote_batch(dir_handle_t *dir,
-                                 const workers_batch_item_t *items,
-                                 size_t count);
+int workers_enqueue_batch(dir_handle_t *dir,
+                          const workers_batch_item_t *items,
+                          size_t count);
 uint64_t workers_small_queue_depth(void);
 uint64_t workers_small_active_count(void);
 uint64_t workers_large_queue_depth(void);

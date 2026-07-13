@@ -7,6 +7,7 @@
 
 #define _GNU_SOURCE
 #include "fs_util.h"
+#include "copy_policy.h"
 #include "stats.h"
 #include "progress.h"
 
@@ -962,16 +963,18 @@ static int preserve_fd_metadata_impl(int fd,
         return -1;
     }
 
-    ts[0] = src_st->st_atim;
-    ts[1] = src_st->st_mtim;
-    if (futimens(fd, ts) != 0) {
-        progress_interrupt();
-        if (path_for_warning && *path_for_warning) {
-            fprintf(stderr, "%s: ", path_for_warning);
+    if (copy_policy_preserve_times()) {
+        ts[0] = src_st->st_atim;
+        ts[1] = src_st->st_mtim;
+        if (futimens(fd, ts) != 0) {
+            progress_interrupt();
+            if (path_for_warning && *path_for_warning) {
+                fprintf(stderr, "%s: ", path_for_warning);
+            }
+            perror("futimens");
+            stats_inc_metadata_error();
+            return -1;
         }
-        perror("futimens");
-        stats_inc_metadata_error();
-        return -1;
     }
 
     return 0;

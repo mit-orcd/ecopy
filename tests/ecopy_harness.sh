@@ -332,6 +332,99 @@ case_readonly_mode() {
     fi
 }
 
+case_local_fresh_policy() {
+    case_begin "local-fresh-policy"
+    local s="$work/fresh_src" d="$work/fresh_dst" out
+    mkdir -p "$s/sub"
+    printf 'fresh payload\n' > "$s/sub/file.txt"
+
+    out="$(env "${common_env[@]}" DIRECT_COPY_DISABLE_DIRECT_IO=1 \
+               DIRECT_COPY_SMALL_INPLACE=0 \
+               "$bin" -v "$s" "$d" 2>&1)"
+    if [[ "$?" -ne 0 ]]; then
+        fail "fresh local copy failed"
+        return
+    fi
+    if cmp -s "$s/sub/file.txt" "$d/sub/file.txt" &&
+       grep -Eq 'small in-place writes[[:space:]]*: yes' <<<"$out"; then
+        ok "new local root automatically uses in-place writes"
+    else
+        fail "fresh local root did not select in-place policy"
+    fi
+
+    out="$(env "${common_env[@]}" DIRECT_COPY_DISABLE_DIRECT_IO=1 \
+               DIRECT_COPY_SMALL_INPLACE=0 \
+               "$bin" -v "$s" "$d" 2>&1)"
+    if [[ "$?" -eq 0 ]] &&
+       grep -Eq 'small in-place writes[[:space:]]*: no' <<<"$out" &&
+       grep -q 'Files skipped : 1' <<<"$out"; then
+        ok "existing local root retains incremental skip policy"
+    else
+        fail "existing local root did not use incremental policy"
+    fi
+}
+
+case_local_batched_mixed_queue() {
+    case_begin "local-batched-mixed-queue"
+    local s="$work/lbatch_src" d="$work/lbatch_dst" i
+    mkdir -p "$s/many"
+    for i in $(seq 1 600); do
+        printf 'tiny %d\n' "$i" > "$s/many/f_$i"
+    done
+    head -c 2200000 /dev/urandom > "$s/large.bin"
+    truncate -s 16M "$s/sparse.bin"
+    dd if=/dev/urandom of="$s/sparse.bin" bs=4096 count=1 seek=1024 \
+       conv=notrunc status=none
+
+    if ! env "${common_env[@]}" \
+             DIRECT_COPY_DISABLE_DIRECT_IO=1 \
+             DIRECT_COPY_LARGE_THRESHOLD_MB=1 \
+             DIRECT_COPY_MAX_QUEUED_FILES=7 \
+             "$bin" "$s" "$d" >/dev/null 2>&1; then
+        fail "mixed local batch copy failed"
+        return
+    fi
+    if verify_regular_files "$s" "$d"; then
+        ok "local batch spans 512 entries and preserves mixed routing"
+    fi
+}
+
+case_local_no_preserve_times() {
+    case_begin "local-no-preserve-times"
+    local s="$work/lnptime_src" d="$work/lnptime_dst"
+    mkdir -p "$s/sub"
+    printf 'keep content and mode\n' > "$s/sub/file.txt"
+    chmod 0640 "$s/sub/file.txt"
+    touch -d '2001-02-03 04:05:06' "$s/sub/file.txt"
+
+    if ! env "${common_env[@]}" DIRECT_COPY_DISABLE_DIRECT_IO=1 \
+             "$bin" --no-preserve-times "$s" "$d" >/dev/null 2>&1; then
+        fail "local --no-preserve-times copy failed"
+        return
+    fi
+    if cmp -s "$s/sub/file.txt" "$d/sub/file.txt" &&
+       [[ "$(mode_bits "$d/sub/file.txt")" == "640" ]] &&
+       [[ "$(stat -c %Y "$s/sub/file.txt")" != "$(stat -c %Y "$d/sub/file.txt")" ]]; then
+        ok "local no-preserve-times keeps content/mode but skips mtime"
+    else
+        fail "local no-preserve-times behavior mismatch"
+    fi
+}
+
+case_local_type_collision() {
+    case_begin "local-type-collision"
+    local s="$work/lcollision_src" d="$work/lcollision_dst"
+    mkdir -p "$s" "$d/collide"
+    printf 'regular source\n' > "$s/collide"
+
+    if env "${common_env[@]}" DIRECT_COPY_DISABLE_DIRECT_IO=1 \
+           "$bin" "$s" "$d" >/dev/null 2>&1; then
+        fail "local copy accepted a directory where a file belongs"
+    else
+        ok "local batch rejects wrong-type destination"
+    fi
+}
+
 case_ssh_loopback() {
     case_begin "ssh-loopback"
     local s="$work/ssh_src" d="$work/ssh_dst"
@@ -560,6 +653,75 @@ case_ssh_no_preserve_times() {
     fi
 }
 
+case_transfer_verification() {
+    case_begin "transfer-verification"
+    local s="$work/verify_src" d="$work/verify_dst" out rc
+    mkdir -p "$s/sub"
+    head -c 20000 /dev/urandom > "$s/sub/data.bin"
+    : > "$s/empty"
+    chmod 0640 "$s/sub/data.bin"
+
+    out="$(env "${common_env[@]}" DIRECT_COPY_DISABLE_DIRECT_IO=1 \
+              "$bin" --verify-data=100 --verify-metadata --verify-seed=123 \
+              "$s" "$d" 2>&1)"; rc=$?
+    if [[ "$rc" -eq 0 ]] && grep -q 'Verify failures   : 0' <<<"$out" &&
+       grep -q 'Verify seed       : 123' <<<"$out"; then
+        ok "local 100% verification succeeds with reproducible seed"
+    else
+        fail "local verification success path: $(tr '\n' ' ' <<<"$out")"
+        return
+    fi
+
+    local d0="$work/verify_endpoints_dst"
+    out="$(env "${common_env[@]}" DIRECT_COPY_DISABLE_DIRECT_IO=1 \
+              "$bin" --verify-data=0 --verify-seed=123 "$s" "$d0" 2>&1)"; rc=$?
+    if [[ "$rc" -eq 0 ]] && grep -Eq 'Verify blocks[[:space:]]*: 2$' <<<"$out"; then
+        ok "0% mode still verifies unique first/last blocks"
+    else
+        fail "endpoint-only verification: $(tr '\n' ' ' <<<"$out")"
+    fi
+
+    # Keep size+mtime equal so traversal skips the corrupted destination; the
+    # optional skipped-file checker must still catch the middle-block change.
+    printf X | dd of="$d/sub/data.bin" bs=1 seek=8192 conv=notrunc status=none
+    touch -r "$s/sub/data.bin" "$d/sub/data.bin"
+    out="$(env "${common_env[@]}" DIRECT_COPY_DISABLE_DIRECT_IO=1 \
+              "$bin" --verify-data=100 --verify-skipped --verify-seed=123 \
+              "$s" "$d" 2>&1)"; rc=$?
+    if [[ "$rc" -ne 0 ]] &&
+       grep -q 'verification data mismatch' <<<"$out"; then
+        ok "local skipped-file corruption is detected"
+    else
+        fail "local skipped corruption was not detected: $(tr '\n' ' ' <<<"$out")"
+    fi
+
+    local rd="$work/verify_remote"
+    local -a remote_env=(DIRECT_COPY_LARGE_THRESHOLD_MB=1 ECOPY_REMOTE_CMD="$bin")
+    if [[ "${ECOPY_HARNESS_REAL_SSH:-0}" != "1" ]]; then
+        remote_env+=(ECOPY_SSH="$repo_root/tests/fake_ssh.sh")
+    fi
+    out="$(env "${common_env[@]}" "${remote_env[@]}" "$bin" \
+              --verify-data=1 --verify-metadata --verify-seed=456 \
+              "$s" "ssh://localhost${rd}" 2>&1)"; rc=$?
+    if [[ "$rc" -eq 0 ]] && grep -q 'Verify failures   : 0' <<<"$out"; then
+        ok "remote sampled verification succeeds"
+    else
+        fail "remote verification success path: $(tr '\n' ' ' <<<"$out")"
+        return
+    fi
+
+    printf Y | dd of="$rd/sub/data.bin" bs=1 seek=8192 conv=notrunc status=none
+    touch -r "$s/sub/data.bin" "$rd/sub/data.bin"
+    out="$(env "${common_env[@]}" "${remote_env[@]}" "$bin" \
+              --verify-data=100 --verify-skipped --verify-seed=456 \
+              "$s" "ssh://localhost${rd}" 2>&1)"; rc=$?
+    if [[ "$rc" -ne 0 ]] && grep -q 'remote reported' <<<"$out"; then
+        ok "remote skipped-file corruption is detected"
+    else
+        fail "remote skipped corruption was not detected: $(tr '\n' ' ' <<<"$out")"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
@@ -574,10 +736,15 @@ case_skip_rerun
 case_symlink_ignored
 case_readonly_mode
 case_single_file
+case_local_fresh_policy
+case_local_batched_mixed_queue
+case_local_no_preserve_times
+case_local_type_collision
 case_ssh_loopback
 case_ssh_batch_failure
 case_ssh_empty_dir_collision
 case_ssh_no_preserve_times
+case_transfer_verification
 
 echo
 echo "ecopy harness results: $pass_count passed, $fail_count failed"

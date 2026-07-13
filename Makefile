@@ -14,6 +14,9 @@ OBJS = \
 	stats.o \
 	progress.o \
 	fs_util.o \
+	copy_policy.o \
+	verify.o \
+	third_party/blake3/blake3.o \
 	suggestion.o \
 	protocol.o \
 	ssh_transport.o \
@@ -59,11 +62,11 @@ $(JEMALLOC_TARGET):
 	@false
 endif
 
-protocol_test: tests/protocol_test.c protocol.o
-	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tests/protocol_test.c protocol.o $(LDFLAGS)
+protocol_test: tests/protocol_test.c protocol.o third_party/blake3/blake3.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tests/protocol_test.c protocol.o third_party/blake3/blake3.o $(LDFLAGS)
 
 clean:
-	rm -f *.o $(TARGET) $(JEMALLOC_TARGET) direct_copy protocol_test
+	rm -f *.o third_party/blake3/*.o $(TARGET) $(JEMALLOC_TARGET) direct_copy protocol_test
 
 test: $(TARGET) protocol_test
 	@set -e; \

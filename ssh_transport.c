@@ -13,6 +13,7 @@
 
 #define _GNU_SOURCE
 #include "ssh_transport.h"
+#include "copy_policy.h"
 #include "protocol.h"
 
 #include <stdio.h>
@@ -68,14 +69,6 @@ typedef struct {
 } conn_t;
 
 static conn_t g_conn;
-
-/* -1 = unset (consult env); 0/1 = explicit override for time preservation. */
-static int g_preserve_times = -1;
-
-void sshx_set_preserve_times(int on)
-{
-    g_preserve_times = on ? 1 : 0;
-}
 
 struct sshx_file {
     uint64_t file_id;
@@ -400,16 +393,9 @@ static int handshake(const char *expect_path)
         want_threads = (int)v;
     }
 
-    /* Whether the remote should preserve atime/mtime. Explicit setter wins;
-     * otherwise DIRECT_COPY_NO_PRESERVE_TIMES; default preserve. */
-    int preserve_times;
-    if (g_preserve_times >= 0) {
-        preserve_times = g_preserve_times ? 1 : 0;
-    } else {
-        const char *s = getenv("DIRECT_COPY_NO_PRESERVE_TIMES");
-        preserve_times = (s && *s && strcmp(s, "0") != 0) ? 0 : 1;
-    }
-    uint32_t options = preserve_times ? ECOPY_OPT_PRESERVE_TIMES : 0;
+    uint32_t options = copy_policy_preserve_times()
+                           ? ECOPY_OPT_PRESERVE_TIMES
+                           : 0;
 
     penc_init(&e, buf, sizeof(buf));
     penc_u32(&e, ECOPY_PROTO_VERSION);
@@ -824,6 +810,7 @@ int sshx_setmeta(const char *path, const struct stat *src_st, int is_dir)
     penc_str(&e, path);
     encode_meta(&e, src_st);
     penc_u8(&e, (uint8_t)(is_dir ? 1 : 0));
+    penc_u8(&e, (uint8_t)(verify_metadata_enabled() ? 1 : 0));
     if (e.overflow) { errno = ENAMETOOLONG; return -1; }
     /* Fire-and-forget: errors surface at the next barrier. */
     if (conn_send(MSG_SETMETA, next_request_id(), buf, (uint32_t)e.len) != 0) {
@@ -898,6 +885,43 @@ int sshx_flush(void)
 {
     int rc = sshx_barrier(1);
     return (rc != 0 || g_conn.remote_failed) ? -1 : 0;
+}
+
+int sshx_verify_batch(const char *path, const struct stat *src_st,
+                      const verify_digest_t *digests, size_t count, int final)
+{
+    size_t cap;
+    uint8_t *buf;
+    penc_t e;
+    if (!g_conn.active || count > VERIFY_BATCH_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
+    cap = strlen(path) + 128 + count * (8 + 4 + VERIFY_DIGEST_SIZE);
+    if (cap > ECOPY_MAX_FRAME) {
+        errno = E2BIG;
+        return -1;
+    }
+    buf = malloc(cap);
+    if (!buf) return -1;
+    penc_init(&e, buf, cap);
+    penc_str(&e, path);
+    encode_meta(&e, src_st);
+    penc_i64(&e, (int64_t)src_st->st_size);
+    penc_u8(&e, (uint8_t)((final ? 1 : 0) |
+                           (verify_metadata_enabled() ? 2 : 0)));
+    penc_u32(&e, (uint32_t)count);
+    for (size_t i = 0; i < count; i++) {
+        penc_i64(&e, digests[i].offset);
+        penc_u32(&e, digests[i].length);
+        penc_bytes(&e, digests[i].digest, VERIFY_DIGEST_SIZE);
+    }
+    int rc = e.overflow
+                 ? -1
+                 : conn_send(MSG_VERIFY_PATH, next_request_id(), buf,
+                             (uint32_t)e.len);
+    free(buf);
+    return rc;
 }
 
 /* -------------------- per-file streaming -------------------- */

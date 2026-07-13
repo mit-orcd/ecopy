@@ -200,6 +200,38 @@ void stats_record_copy_file_range_fallback(void) { pthread_mutex_lock(&g_lock); 
 void stats_add_copy_file_range_usage(uint64_t calls, uint64_t bytes, uint64_t fallbacks) { pthread_mutex_lock(&g_lock); g_stats.copy_file_range_calls += calls; g_stats.copy_file_range_bytes += bytes; g_stats.copy_file_range_fallbacks += fallbacks; pthread_mutex_unlock(&g_lock); } 
 void stats_inc_metadata_warning(void) { pthread_mutex_lock(&g_lock); g_stats.metadata_warnings++; pthread_mutex_unlock(&g_lock); }
 void stats_inc_metadata_error(void) { pthread_mutex_lock(&g_lock); g_stats.metadata_errors++; pthread_mutex_unlock(&g_lock); }
+void stats_set_verify_config(int metadata, int data, double percent, uint64_t seed) {
+    pthread_mutex_lock(&g_lock);
+    g_stats.verify_metadata_enabled = metadata;
+    g_stats.verify_data_enabled = data;
+    g_stats.verify_requested_percent = percent;
+    g_stats.verify_seed = seed;
+    pthread_mutex_unlock(&g_lock);
+}
+void stats_record_verify(uint64_t bytes, uint64_t scope_bytes, uint64_t blocks,
+                         int metadata_checked,
+                         int data_mismatch, int metadata_mismatch, int failed) {
+    pthread_mutex_lock(&g_lock);
+    g_stats.verify_objects++;
+    g_stats.verify_bytes += bytes;
+    g_stats.verify_scope_bytes += scope_bytes;
+    g_stats.verify_blocks += blocks;
+    if (metadata_checked) g_stats.verify_metadata_objects++;
+    if (data_mismatch) g_stats.verify_data_mismatches++;
+    if (metadata_mismatch) g_stats.verify_metadata_mismatches++;
+    if (failed) g_stats.verify_failures++;
+    pthread_mutex_unlock(&g_lock);
+}
+void stats_mark_verify_failure(void) {
+    pthread_mutex_lock(&g_lock);
+    g_stats.verify_failures++;
+    pthread_mutex_unlock(&g_lock);
+}
+void stats_add_verify_ns(uint64_t ns) {
+    pthread_mutex_lock(&g_lock);
+    g_stats.verify_ns += ns;
+    pthread_mutex_unlock(&g_lock);
+}
 
 void stats_set_current_file(const char *path, uint64_t total, int parallel) {
     /* Plain bounded copy: snprintf("%s") here pulled in the vfprintf machinery
@@ -459,6 +491,21 @@ void stats_print_final(int verbose) {
     }
     if (s.metadata_errors > 0) {
         printf("Metadata errors   : %" PRIu64 "\n", s.metadata_errors);
+    }
+    if (s.verify_metadata_enabled || s.verify_data_enabled) {
+        double achieved = s.verify_scope_bytes
+                              ? 100.0 * (double)s.verify_bytes /
+                                    (double)s.verify_scope_bytes
+                              : 0.0;
+        printf("Verify objects    : %" PRIu64 "\n", s.verify_objects);
+        printf("Verify blocks     : %" PRIu64 "\n", s.verify_blocks);
+        printf("Verify MiB        : %.2f\n",
+               (double)s.verify_bytes / (1024.0 * 1024.0));
+        printf("Verify coverage   : %.3f%% requested, %.3f%% achieved\n",
+               s.verify_requested_percent, achieved);
+        printf("Verify seed       : %" PRIu64 "\n", s.verify_seed);
+        printf("Verify seconds    : %.3f\n", (double)s.verify_ns / 1e9);
+        printf("Verify failures   : %" PRIu64 "\n", s.verify_failures);
     }
 
     if (!verbose) {

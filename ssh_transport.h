@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <limits.h>
+#include "verify.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -37,15 +38,6 @@ int ssh_target_parse(const char *s, ssh_target_t *out);
 
 /* True if the argument begins with the ssh:// scheme. */
 int ssh_target_is_url(const char *s);
-
-/*
- * Request that the remote peer skip (0) or apply (1) atime/mtime on copied
- * items, saving one SETATTR RPC per file and directory when disabled. Must be
- * called before sshx_connect() (it is sent in the handshake). If never called,
- * the DIRECT_COPY_NO_PRESERVE_TIMES environment variable is consulted, else
- * times are preserved.
- */
-void sshx_set_preserve_times(int on);
 
 /*
  * Connect to the remote target: spawn ssh + `ecopy --server <path>`, perform
@@ -111,6 +103,11 @@ int sshx_barrier(int flush);
 
 /* Final drain + flush. Equivalent to sshx_barrier(1). */
 int sshx_flush(void);
+
+/* Queue a bounded remote verification batch. final reapplies the captured
+ * metadata after data reads; metadata comparison follows --verify-metadata. */
+int sshx_verify_batch(const char *path, const struct stat *src_st,
+                      const verify_digest_t *digests, size_t count, int final);
 
 /* ---- per-file streaming (used by the remote copy path) ---- */
 

@@ -11,6 +11,8 @@
 
 #define _GNU_SOURCE
 #include "../protocol.h"
+#include "../verify.h"
+#include "../third_party/blake3/blake3.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -78,6 +80,74 @@ static void test_overflow_guard(void)
     penc_t e; penc_init(&e, buf, sizeof(buf));
     penc_u64(&e, 1);   /* needs 8, only 4 available */
     CHECK(e.overflow, "encode overflow detected");
+}
+
+static int hex_value(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+
+static void test_blake3_vectors(void)
+{
+    static const char empty_hex[] =
+        "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
+    static const char abc_hex[] =
+        "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85";
+    uint8_t got[BLAKE3_OUT_LEN], expected[BLAKE3_OUT_LEN];
+    const char *vectors[] = { empty_hex, abc_hex };
+    const char *inputs[] = { "", "abc" };
+    size_t lengths[] = { 0, 3 };
+    for (int v = 0; v < 2; v++) {
+        for (int i = 0; i < BLAKE3_OUT_LEN; i++) {
+            expected[i] = (uint8_t)((hex_value(vectors[v][i * 2]) << 4) |
+                                    hex_value(vectors[v][i * 2 + 1]));
+        }
+        blake3_hash(inputs[v], lengths[v], got);
+        CHECK(memcmp(got, expected, sizeof(got)) == 0, "BLAKE3 known vector");
+    }
+    {
+        static const char long_hex[] =
+            "015094013f57a5277b59d8475c0501042c0b642e531b0a1c8f58d2163229e969";
+        uint8_t input[4096];
+        for (size_t i = 0; i < sizeof(input); i++) input[i] = (uint8_t)(i % 251);
+        for (int i = 0; i < BLAKE3_OUT_LEN; i++) {
+            expected[i] = (uint8_t)((hex_value(long_hex[i * 2]) << 4) |
+                                    hex_value(long_hex[i * 2 + 1]));
+        }
+        blake3_hash(input, sizeof(input), got);
+        CHECK(memcmp(got, expected, sizeof(got)) == 0,
+              "BLAKE3 multi-chunk official vector");
+    }
+}
+
+static void test_verify_batch_encoding(void)
+{
+    uint8_t buf[256], digest[VERIFY_DIGEST_SIZE];
+    memset(digest, 0xA5, sizeof(digest));
+    penc_t e; penc_init(&e, buf, sizeof(buf));
+    penc_str(&e, "/dst/file");
+    penc_i64(&e, 8192);
+    penc_u8(&e, 3);
+    penc_u32(&e, 1);
+    penc_i64(&e, 4096);
+    penc_u32(&e, 4096);
+    penc_bytes(&e, digest, sizeof(digest));
+    CHECK(!e.overflow, "verify batch encoding fits");
+
+    pdec_t d; pdec_init(&d, buf, e.len);
+    char path[64]; uint8_t decoded[VERIFY_DIGEST_SIZE];
+    CHECK(pdec_str(&d, path, sizeof(path)) == 0 &&
+          strcmp(path, "/dst/file") == 0, "verify path roundtrip");
+    CHECK(pdec_i64(&d) == 8192, "verify size roundtrip");
+    CHECK(pdec_u8(&d) == 3 && pdec_u32(&d) == 1,
+          "verify flags/count roundtrip");
+    CHECK(pdec_i64(&d) == 4096 && pdec_u32(&d) == 4096,
+          "verify offset/length roundtrip");
+    CHECK(pdec_bytes(&d, decoded, sizeof(decoded)) == 0 &&
+          memcmp(decoded, digest, sizeof(digest)) == 0,
+          "verify digest roundtrip");
 }
 
 struct frame_expect {
@@ -150,6 +220,8 @@ int main(void)
     test_str_roundtrip();
     test_str_too_long();
     test_overflow_guard();
+    test_blake3_vectors();
+    test_verify_batch_encoding();
     test_frame_pipe();
 
     if (failures == 0) {

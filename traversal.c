@@ -9,6 +9,8 @@
 #include "traversal.h"
 #include "stats.h"
 #include "fs_util.h"
+#include "copy_policy.h"
+#include "verify.h"
 #include "workers.h"
 #include "ssh_transport.h"
 
@@ -43,14 +45,6 @@ static int g_status = 0;
 static pthread_mutex_t g_status_lock = PTHREAD_MUTEX_INITIALIZER;
 static char g_src_root[PATH_MAX];
 static char g_dst_root[PATH_MAX];
-
-/* Remote fresh-destination fast path: skip per-directory bulk STAT. */
-static int g_remote_fresh = 0;
-
-void traversal_set_remote_fresh(int fresh)
-{
-    g_remote_fresh = fresh ? 1 : 0;
-}
 
 static pthread_mutex_t g_dir_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_dir_cond = PTHREAD_COND_INITIALIZER;
@@ -228,39 +222,6 @@ static int open_or_create_target_dir_path(const char *path, mode_t mode)
     return fd;
 }
 
-static int process_file(dir_handle_t *dir,
-                        const char *name,
-                        const char *src,
-                        const char *dst)
-{
-    struct stat src_st, dst_st;
-    if (fstatat(dir->src_fd, name, &src_st, AT_SYMLINK_NOFOLLOW) != 0) { perror(src); return -1; }
-    if (!S_ISREG(src_st.st_mode)) return 0;
-    stats_inc_files_seen();
-    if (fstatat(dir->dst_fd, name, &dst_st, AT_SYMLINK_NOFOLLOW) == 0) {
-        if (!S_ISREG(dst_st.st_mode)) {
-            fprintf(stderr, "Target exists but is not a regular file: %s\n", dst);
-            return -1;
-        }
-        if (S_ISREG(dst_st.st_mode) && same_size_and_mtime(&src_st, &dst_st)) {
-            if (preserve_path_metadata_at(dir->dst_fd, name, dst, &src_st, S_IFREG) != 0) {
-                return -1;
-            }
-            stats_add_skipped_bytes((uint64_t)src_st.st_size);
-            stats_inc_files_skipped();
-            return 0;
-        }
-    } else if (errno != ENOENT) {
-        perror(dst);
-        return -1;
-    }
-    stats_add_planned_copy_bytes((uint64_t)src_st.st_size);
-    if (workers_file_is_large(src_st.st_size)) {
-        return workers_enqueue_large_file(dir, name, src, dst, &src_st);
-    }
-    return workers_enqueue_small_file(dir, name, src, dst, &src_st);
-}
-
 static int push_dir_locked(const char *src,
                            const char *dst,
                            const struct stat *src_st,
@@ -358,6 +319,10 @@ static void *finalize_batch_worker(void *arg)
         } else {
             frc = preserve_path_metadata(g_finalize_dirs[idx_local].dst,
                                          &g_finalize_dirs[idx_local].src_st);
+            if (frc == 0 && verify_metadata_enabled()) {
+                frc = verify_metadata_path(g_finalize_dirs[idx_local].dst,
+                                           &g_finalize_dirs[idx_local].src_st, 1);
+            }
         }
         if (frc != 0) {
             pthread_mutex_lock(&ctx->lock);
@@ -460,52 +425,56 @@ static int finalize_directories_parallel(void)
 }
 
 /*
- * Remote destination: process one directory's entries with batched bulk STAT.
- * Regular files are gathered in chunks and their destination stats fetched in a
- * single round-trip (the main small-file latency killer), then skip/enqueue
- * decisions are made locally. Subdirectories are queued immediately.
+ * Both destination backends use the same traversal batch. SSH resolves the
+ * destination states with one protocol request; local filesystems use fstatat
+ * per entry, but still avoid duplicate source stats and per-file queue locks.
  */
-#define REMOTE_STAT_BATCH 512
+#define FILE_STAT_BATCH 512
 
 typedef struct {
     char name[256];
     struct stat st;
-} remote_entry_t;
+} file_entry_t;
 
 /*
- * Per-directory bulk-stat scratch. These arrays are ~200 KiB (batch) + ~73 KiB
- * (dst_st) each, so malloc/free per directory pushed glibc over its mmap
- * threshold and cost an mmap/munmap + page faults on every one of (potentially)
- * hundreds of thousands of directories. Instead each traversal worker keeps one
- * lazily-allocated, reused set for its lifetime. In fresh-destination mode the
- * stat-only arrays (names/present/dst_st) are never used, so they are not
- * allocated at all.
+ * Per-directory stat scratch shared by both backends. These arrays are large
+ * enough that malloc/free per directory caused mmap/munmap and page-fault
+ * churn. Each traversal worker therefore keeps one lazily allocated set.
+ * Fresh destinations need only the source batch; SSH additionally needs the
+ * names array for its bulk request.
  */
 typedef struct {
-    remote_entry_t *batch;
+    file_entry_t *batch;
     const char **names;
     int *present;
     struct stat *dst_st;
-} remote_scratch_t;
+} file_scratch_t;
 
-static __thread remote_scratch_t g_remote_scratch;
+static __thread file_scratch_t g_file_scratch;
 
-static remote_scratch_t *remote_scratch_get(void)
+static file_scratch_t *file_scratch_get(int remote)
 {
-    remote_scratch_t *s = &g_remote_scratch;
+    file_scratch_t *s = &g_file_scratch;
+    int incremental = !copy_policy_destination_fresh();
 
     if (!s->batch) {
-        s->batch = malloc(sizeof(*s->batch) * REMOTE_STAT_BATCH);
+        s->batch = malloc(sizeof(*s->batch) * FILE_STAT_BATCH);
         if (!s->batch) {
             perror("malloc");
             return NULL;
         }
     }
-    if (!g_remote_fresh && !s->names) {
-        s->names = malloc(sizeof(*s->names) * REMOTE_STAT_BATCH);
-        s->present = malloc(sizeof(*s->present) * REMOTE_STAT_BATCH);
-        s->dst_st = malloc(sizeof(*s->dst_st) * REMOTE_STAT_BATCH);
-        if (!s->names || !s->present || !s->dst_st) {
+    if (incremental && !s->present) {
+        s->present = malloc(sizeof(*s->present) * FILE_STAT_BATCH);
+        s->dst_st = malloc(sizeof(*s->dst_st) * FILE_STAT_BATCH);
+        if (!s->present || !s->dst_st) {
+            perror("malloc");
+            return NULL;
+        }
+    }
+    if (incremental && remote && !s->names) {
+        s->names = malloc(sizeof(*s->names) * FILE_STAT_BATCH);
+        if (!s->names) {
             perror("malloc");
             return NULL;
         }
@@ -513,27 +482,66 @@ static remote_scratch_t *remote_scratch_get(void)
     return s;
 }
 
-static int remote_flush_batch(dir_handle_t *handle,
-                              const dir_node_t *node,
-                              remote_scratch_t *s,
-                              int n)
+static int stat_destination_batch(dir_handle_t *handle,
+                                  const dir_node_t *node,
+                                  file_scratch_t *s,
+                                  int n,
+                                  int remote)
 {
-    remote_entry_t *batch = s->batch;
-    workers_batch_item_t enqueue_items[REMOTE_STAT_BATCH];
-    int enqueue_count = 0;
     int rc = 0;
 
-    if (n == 0) {
+    if (copy_policy_destination_fresh()) {
         return 0;
     }
-    if (!g_remote_fresh) {
+    if (remote) {
         for (int i = 0; i < n; i++) {
-            s->names[i] = batch[i].name;
+            s->names[i] = s->batch[i].name;
         }
         if (sshx_stat_bulk(node->dst, s->names, n, s->present, s->dst_st) != 0) {
             fprintf(stderr, "Bulk stat failed under %s\n", node->dst);
             return -1;
         }
+        return 0;
+    }
+
+    for (int i = 0; i < n; i++) {
+        if (fstatat(handle->dst_fd, s->batch[i].name, &s->dst_st[i],
+                    AT_SYMLINK_NOFOLLOW) == 0) {
+            s->present[i] = 1;
+        } else if (errno == ENOENT) {
+            s->present[i] = 0;
+        } else {
+            char dst_path[PATH_MAX];
+            if (join_path(dst_path, sizeof(dst_path), node->dst,
+                          s->batch[i].name) == 0) {
+                perror(dst_path);
+            } else {
+                perror(node->dst);
+            }
+            s->present[i] = -1;
+            rc = -1;
+        }
+    }
+    return rc;
+}
+
+static int flush_file_batch(dir_handle_t *handle,
+                            const dir_node_t *node,
+                            file_scratch_t *s,
+                            int n,
+                            int remote)
+{
+    file_entry_t *batch = s->batch;
+    workers_batch_item_t enqueue_items[FILE_STAT_BATCH];
+    int enqueue_count = 0;
+    int rc;
+
+    if (n == 0) {
+        return 0;
+    }
+    rc = stat_destination_batch(handle, node, s, n, remote);
+    if (rc != 0 && remote) {
+        return -1;
     }
 
     for (int i = 0; i < n; i++) {
@@ -547,19 +555,34 @@ static int remote_flush_batch(dir_handle_t *handle,
         }
 
         /* Fresh destination: everything is new; skip the existence check. */
-        if (!g_remote_fresh && s->present[i]) {
+        if (!copy_policy_destination_fresh() && s->present[i] < 0) {
+            continue;
+        }
+        if (!copy_policy_destination_fresh() && s->present[i]) {
             if (!S_ISREG(s->dst_st[i].st_mode)) {
                 fprintf(stderr, "Target exists but is not a regular file: %s\n", dst_path);
                 rc = -1;
                 continue;
             }
             if (same_size_and_mtime(&batch[i].st, &s->dst_st[i])) {
-                if (sshx_setmeta(dst_path, &batch[i].st, 0) != 0) {
+                int meta_rc = remote
+                                  ? sshx_setmeta(dst_path, &batch[i].st, 0)
+                                  : preserve_path_metadata_at(handle->dst_fd,
+                                                              batch[i].name,
+                                                              dst_path,
+                                                              &batch[i].st,
+                                                              S_IFREG);
+                if (meta_rc != 0) {
                     rc = -1;
                     continue;
                 }
                 stats_add_skipped_bytes((uint64_t)batch[i].st.st_size);
                 stats_inc_files_skipped();
+                if (verify_queue_file(src_path, dst_path, &batch[i].st, 1) != 0) {
+                    fprintf(stderr, "ecopy: unable to queue verification for %s\n",
+                            dst_path);
+                    rc = -1;
+                }
                 continue;
             }
         }
@@ -570,19 +593,20 @@ static int remote_flush_batch(dir_handle_t *handle,
         enqueue_count++;
     }
 
-    if (workers_enqueue_remote_batch(handle, enqueue_items,
-                                     (size_t)enqueue_count) != 0) {
+    if (workers_enqueue_batch(handle, enqueue_items,
+                              (size_t)enqueue_count) != 0) {
         rc = -1;
     }
     return rc;
 }
 
-static void process_dir_entries_remote(dir_handle_t *handle,
-                                       const dir_node_t *node,
-                                       DIR *dir)
+static void process_dir_entries(dir_handle_t *handle,
+                                const dir_node_t *node,
+                                DIR *dir,
+                                int remote)
 {
     struct dirent *entry;
-    remote_scratch_t *s = remote_scratch_get();
+    file_scratch_t *s = file_scratch_get(remote);
     int n = 0;
     int saw_file = 0;
 
@@ -596,6 +620,19 @@ static void process_dir_entries_remote(dir_handle_t *handle,
         char src_path[PATH_MAX], dst_path[PATH_MAX];
 
         if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+
+        if (!remote) {
+            if (join_path(src_path, sizeof(src_path), node->src,
+                          entry->d_name) != 0) {
+                fprintf(stderr, "Source path too long: %s/%s\n",
+                        node->src, entry->d_name);
+                mark_traversal_error();
+                continue;
+            }
+            if (path_is_same_or_child(g_dst_root, src_path)) {
+                continue;
+            }
+        }
 
         if (fstatat(handle->src_fd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
             perror(entry->d_name);
@@ -626,8 +663,8 @@ static void process_dir_entries_remote(dir_handle_t *handle,
             snprintf(s->batch[n].name, sizeof(s->batch[n].name), "%s", entry->d_name);
             s->batch[n].st = st;
             n++;
-            if (n == REMOTE_STAT_BATCH) {
-                if (remote_flush_batch(handle, node, s, n) != 0) {
+            if (n == FILE_STAT_BATCH) {
+                if (flush_file_batch(handle, node, s, n, remote) != 0) {
                     mark_traversal_error();
                 }
                 n = 0;
@@ -635,7 +672,7 @@ static void process_dir_entries_remote(dir_handle_t *handle,
         }
     }
 
-    if (remote_flush_batch(handle, node, s, n) != 0) {
+    if (flush_file_batch(handle, node, s, n, remote) != 0) {
         mark_traversal_error();
     }
 
@@ -647,7 +684,7 @@ static void process_dir_entries_remote(dir_handle_t *handle,
      * guarantees empty subtrees are still created. The finalize SETMETA later
      * fixes the mode/times of every directory regardless of how it was made.
      */
-    if (!saw_file) {
+    if (remote && !saw_file) {
         if (sshx_mkdir(node->dst, node->src_st.st_mode & 07777) != 0) {
             perror(node->dst);
             mark_traversal_error();
@@ -673,8 +710,6 @@ static void process_directory_node(dir_node_t *node)
 {
     struct stat st;
     DIR *dir;
-    struct dirent *entry;
-    char src_path[PATH_MAX], dst_path[PATH_MAX];
     dir_handle_t *handle;
     int src_fd;
     int dst_fd;
@@ -746,50 +781,7 @@ static void process_directory_node(dir_node_t *node)
         return;
     }
 
-    if (sshx_active()) {
-        process_dir_entries_remote(handle, node, dir);
-        closedir(dir);
-        dir_handle_release(handle);
-        return;
-    }
-
-    while ((entry = readdir(dir)) != NULL) {
-        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
-
-        if (join_path(src_path, sizeof(src_path), node->src, entry->d_name) != 0) {
-            fprintf(stderr, "Source path too long: %s/%s\n", node->src, entry->d_name);
-            mark_traversal_error();
-            continue;
-        }
-        if (join_path(dst_path, sizeof(dst_path), node->dst, entry->d_name) != 0) {
-            fprintf(stderr, "Target path too long: %s/%s\n", node->dst, entry->d_name);
-            mark_traversal_error();
-            continue;
-        }
-
-        if (path_is_same_or_child(g_dst_root, src_path)) {
-            continue;
-        }
-
-        if (fstatat(handle->src_fd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
-            perror(src_path);
-            mark_traversal_error();
-            continue;
-        }
-
-        if (S_ISDIR(st.st_mode)) {
-            pthread_mutex_lock(&g_dir_lock);
-            if (push_dir_locked(src_path, dst_path, &st, node->depth + 1) != 0) {
-                mark_traversal_error();
-            }
-            pthread_mutex_unlock(&g_dir_lock);
-        } else if (S_ISREG(st.st_mode)) {
-            if (process_file(handle, entry->d_name, src_path, dst_path) != 0) {
-                mark_traversal_error();
-            }
-        }
-    }
-
+    process_dir_entries(handle, node, dir, sshx_active());
     closedir(dir);
     dir_handle_release(handle);
 }

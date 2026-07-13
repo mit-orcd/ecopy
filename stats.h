@@ -49,6 +49,12 @@ void stats_record_copy_file_range_fallback(void);
 void stats_add_copy_file_range_usage(uint64_t calls, uint64_t bytes, uint64_t fallbacks);
 void stats_inc_metadata_warning(void);
 void stats_inc_metadata_error(void);
+void stats_set_verify_config(int metadata, int data, double percent, uint64_t seed);
+void stats_record_verify(uint64_t bytes, uint64_t scope_bytes, uint64_t blocks,
+                         int metadata_checked,
+                         int data_mismatch, int metadata_mismatch, int failed);
+void stats_mark_verify_failure(void);
+void stats_add_verify_ns(uint64_t ns);
 
 void stats_set_current_file(const char *path, uint64_t total, int parallel);
 void stats_advance_current_file(uint64_t bytes);

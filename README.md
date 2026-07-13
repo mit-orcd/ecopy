@@ -69,9 +69,8 @@ The target may be an `ssh://` URL to push a local tree to another host:
   separate synchronous RPC, so a single-threaded peer sits idle waiting on latency. The remote runs an apply pool
   (`DIRECT_COPY_SSH_SERVER_THREADS`, default 16) so file writes and final directory metadata run concurrently.
   Barriers before finalization and between directory-depth groups preserve ordering for restrictive parent modes.
-- **Batched client scheduling:** remote traversal appends each bulk-stat group to the local file queue under one
-  lock instead of locking and signaling once per file, reducing client futex/spinlock contention on large flat
-  directories.
+- **Batched client scheduling:** traversal appends each stat group to the file queues under one lock instead of
+  locking and signaling once per file. The same scheduler path is used for local/NFS and SSH destinations.
 - **Fewer RPCs per file:** the peer creates files with their final mode (no extra `fchmod`) and skips `chown` when
   the owner already matches. File-bearing directories are also created with their source mode when it remains
   owner-writable, allowing finalization to skip a redundant `fchmod`. A fresh small file costs about a create +
@@ -94,24 +93,65 @@ The target may be an `ssh://` URL to push a local tree to another host:
 - Walks the source tree and recreates it on the target. Copies regular files only.
 - Skips unchanged files based on `size + mtime`.
 - Detects sparse files and copies only their data, preserving holes instead of moving zeros.
-- Copies through same-directory temp files and renames into place after data + metadata are complete (crash-atomic).
+- On a newly created destination tree, writes small files directly to their final names to avoid destination stats
+  and rename RPCs. Interrupted runs can therefore leave partial files in that new tree.
+- On an existing destination, copies through same-directory temp files and renames into place after data + metadata
+  are complete (crash-atomic).
 - Opens entries relative to open directory handles, so symlink swaps are rejected during traversal and copy.
 - Preserves `uid`/`gid` (when permitted), permission bits, `atime`, and `mtime`.
 
 Not preserved: xattrs, ACLs, SELinux labels, file capabilities. Non-regular entries (symlinks, devices, FIFOs,
 sockets) are ignored on the source and rejected on the target rather than reconciled.
 
+## Transfer Verification
+
+Verification is opt-in, so ordinary copies pay no extra opens, reads, hashing, allocations, or protocol traffic:
+
+```bash
+# Exact preserved-metadata checks plus the default 1% data sample
+./ecopy --verify /src /dst
+
+# Check every logical 4 KiB block
+./ecopy --verify-data=100 --verify-metadata /src /dst
+
+# Also verify files skipped by the size+mtime incremental test
+./ecopy --verify --verify-skipped /src /dst
+```
+
+- `--verify-metadata` checks object type, regular-file size, permission and special bits, numeric UID/GID, and
+  atime/mtime when time preservation is enabled. It does not check metadata ecopy does not copy (ctime/birth time,
+  ACLs, xattrs, labels, or capabilities). An ownership change that was not permitted therefore becomes a hard
+  verification failure.
+- `--verify-data[=PERCENT]` samples aligned logical 4 KiB blocks. The first and final block are always checked,
+  including a short final block; empty files receive size/metadata checks only. The percentage sets the total target
+  block count including those endpoints, so small files can have higher achieved coverage than requested.
+- Sampling uses one random per-run seed. `--verify-seed=N` reproduces the same offsets, and the effective seed plus
+  requested/achieved logical-byte coverage are printed in the final report.
+- `--verify-skipped` includes files that were not copied because size+mtime matched. Without it, checks apply only
+  to files copied in this invocation.
+- Local targets compare source and destination bytes directly. SSH targets send full 32-byte BLAKE3 digests in
+  bounded batches and hash target blocks on the remote peer; sampled file data is not sent back over SSH and there
+  is no per-file verification round trip.
+- Sparse files are checked as logical content: sampled holes read as zero. This verifies bytes and size, not the
+  target's physical extent layout.
+
+Enabled verification necessarily adds I/O. At 1%, large files add approximately 1% source reads and 1% target
+reads; mandatory endpoint reads dominate tiny-file workloads. `--no-preserve-times` excludes timestamps from the
+metadata comparison.
+
 ## Safety
 
 Use at your own risk and test on your storage stack first. This is not `rsync` and not a full replication tool;
-verifying a run with `rsync` or another trusted tool before relying on the copy is good practice. Prefer an empty or
+for independent full-tree assurance, checking a run with `rsync` or another trusted tool is still good practice. Prefer an empty or
 trusted target tree: existing regular files may be skipped or atomically replaced, and existing non-regular target
-entries are rejected.
+entries are rejected. Do not let another writer populate a destination root while its first copy is running: a root
+created by this invocation uses the faster non-atomic final-name path.
 
 ## How It Copies
 
 - **Small files** use a simple copy path. With buffered I/O they can also use streaming `posix_fadvise()` hints and
-  opportunistic `copy_file_range()`.
+  opportunistic `copy_file_range()`. Local/NFS and SSH traversal share 512-entry stat/queue batches; a fresh target
+  skips destination existence stats, while an incremental target keeps `size + mtime` skip checks.
 - **Large files** (size > `DIRECT_COPY_LARGE_THRESHOLD_MB`, default 128) run a bounded reader→queue→writer pipeline
   with preallocated aligned chunk buffers. The destination is preallocated up front with `fallocate()` (falling back
   to `ftruncate()`), which keeps block allocation off the write path and avoids late-run throughput collapse.
@@ -132,7 +172,7 @@ Best settings are workload- and environment-dependent. Key knobs (defaults in pa
 | `DIRECT_COPY_LARGE_THRESHOLD_MB` | 128 | Size at which a file enters the large-file pipeline |
 | `DIRECT_COPY_TRAVERSAL_WORKERS` | 8 | Parallel directory-walker threads |
 | `DIRECT_COPY_MAX_QUEUED_FILES` | 262144 | Backpressure cap on queued file tasks |
-| `DIRECT_COPY_SMALL_INPLACE` | 0 | Write small files directly to the final name (faster, not crash-atomic) |
+| `DIRECT_COPY_SMALL_INPLACE` | 0 | Force final-name writes even on existing targets (fresh trees do this automatically; not crash-atomic) |
 | `DIRECT_COPY_DISABLE_DIRECT_IO` | 0 | Disable `O_DIRECT` on both sides (buffered I/O) |
 | `DIRECT_COPY_DISABLE_READ_DIRECT_IO` / `DIRECT_COPY_DISABLE_WRITE_DIRECT_IO` | 0 / 0 | Per-side direct-I/O switches |
 | `DIRECT_COPY_DISABLE_COPY_FILE_RANGE` | 0 | Skip `copy_file_range()` on buffered paths |
@@ -141,7 +181,7 @@ Best settings are workload- and environment-dependent. Key knobs (defaults in pa
 | `DIRECT_COPY_SSH_PUTFILE_MAX` | 1024 | Max size (KiB) a file may be to ship as a single `ssh://` PUTFILE frame |
 | `DIRECT_COPY_SSH_BARRIER_OPS` | 8192 | Fire-and-forget remote ops between drain/flush barriers (min 256) |
 | `DIRECT_COPY_SSH_SERVER_THREADS` | 16 | Apply threads on the `ssh://` peer; higher hides more per-op RPC latency (max 256) |
-| `DIRECT_COPY_NO_PRESERVE_TIMES` | 0 | Skip atime/mtime on `ssh://` targets (same as `--no-preserve-times`) |
+| `DIRECT_COPY_NO_PRESERVE_TIMES` | 0 | Skip atime/mtime on local/NFS and `ssh://` targets (same as `--no-preserve-times`) |
 
 Out-of-range numeric values are clamped with a warning. The final report prints one suggested next-run experiment;
 `-v` adds the full diagnostic counters (per-phase seconds, read/write opens, queue/buffer waits, etc.) to help you

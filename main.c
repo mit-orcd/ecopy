@@ -14,6 +14,8 @@
 #include "ssh_transport.h"
 #include "server.h"
 #include "fs_util.h"
+#include "copy_policy.h"
+#include "verify.h"
 #include "types.h"
 
 #include <stdio.h>
@@ -28,13 +30,17 @@
 
 static void usage(const char *prog) {
     fprintf(stderr,
-            "Usage: %s [-v|--verbose] [--no-preserve-times] <source> <target>\n"
+            "Usage: %s [options] <source> <target>\n"
             "       <source> may be a directory or a single regular file\n"
             "       <target> may be a local path or ssh://[user@]host[:port]/path\n"
             "       For a file source, <target> is the destination directory (or\n"
             "       a full destination path locally); ssh:// targets are directories.\n"
-            "       --no-preserve-times skips atime/mtime on ssh:// targets (one\n"
-            "       fewer SETATTR RPC per file/dir).\n",
+            "       --no-preserve-times skips atime/mtime preservation.\n"
+            "       --verify enables metadata checks plus 1%% sampled data checks.\n"
+            "       --verify-metadata checks type/size/mode/uid/gid/timestamps.\n"
+            "       --verify-data[=PERCENT] checks sampled 4 KiB blocks (default 1%%).\n"
+            "       --verify-skipped also checks files skipped as unchanged.\n"
+            "       --verify-seed=N makes block selection reproducible.\n",
             prog);
 }
 
@@ -309,11 +315,14 @@ static int to_canonical_requested_dir_path(const char *in, char *out, size_t out
     }
 }
 
-static int mkdir_p_dir(const char *path, mode_t mode) {
+static int mkdir_p_dir(const char *path, mode_t mode, int *final_created) {
     char tmp[PATH_MAX];
     char *p;
     int dir_fd;
 
+    if (final_created) {
+        *final_created = 0;
+    }
     if (snprintf(tmp, sizeof(tmp), "%s", path) >= (int)sizeof(tmp)) {
         errno = ENAMETOOLONG;
         perror(path);
@@ -360,7 +369,11 @@ static int mkdir_p_dir(const char *path, mode_t mode) {
                     return -1;
                 }
             } else if (errno == ENOENT) {
-                if (mkdirat(dir_fd, p, mode) != 0 && errno != EEXIST) {
+                if (mkdirat(dir_fd, p, mode) == 0) {
+                    if (!slash && final_created) {
+                        *final_created = 1;
+                    }
+                } else if (errno != EEXIST) {
                     perror(path);
                     close(dir_fd);
                     if (slash) {
@@ -405,7 +418,7 @@ static int mkdir_p_dir(const char *path, mode_t mode) {
     return 0;
 }
 
-static int ensure_destination_root(const char *dst_arg) {
+static int ensure_destination_root(const char *dst_arg, int *created) {
     char dst_path[PATH_MAX];
 
     if (to_abs_path(dst_arg, dst_path, sizeof(dst_path)) != 0) {
@@ -413,7 +426,7 @@ static int ensure_destination_root(const char *dst_arg) {
         return -1;
     }
 
-    return mkdir_p_dir(dst_path, 0777);
+    return mkdir_p_dir(dst_path, 0777, created);
 }
 
 static int is_same_or_child_path(const char *base, const char *path) {
@@ -462,10 +475,10 @@ static int enqueue_single_file(const char *src_parent, const char *src_name,
 
     int dst_fd = -1;
     char dst_dir[PATH_MAX];
-    dst_dir[0] = '\0';
+    char dst_name[PATH_MAX];
+    split_parent_name(dst_full, dst_dir, sizeof(dst_dir),
+                      dst_name, sizeof(dst_name));
     if (!remote) {
-        char tmp_name[PATH_MAX];
-        split_parent_name(dst_full, dst_dir, sizeof(dst_dir), tmp_name, sizeof(tmp_name));
         dst_fd = open(dst_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
         if (dst_fd < 0) { perror(dst_dir); close(src_fd); return -1; }
     }
@@ -489,6 +502,13 @@ int main(int argc, char **argv) {
     const char *dst_root = NULL;
     int verbose = 0;
     int remote = 0;
+    int destination_fresh = 0;
+    int verify_metadata = 0;
+    int verify_data = 0;
+    int verify_skipped = 0;
+    double verify_pct = 1.0;
+    uint64_t verify_seed_value = 0;
+    int verify_seed_set = 0;
     ssh_target_t target;
 
     /* Hidden remote peer mode: `ecopy --server <root>`. */
@@ -505,6 +525,37 @@ int main(int argc, char **argv) {
                 verbose = 1;
             } else if (strcmp(argv[i], "--no-preserve-times") == 0) {
                 no_preserve_times = 1;
+            } else if (strcmp(argv[i], "--verify") == 0) {
+                verify_metadata = 1;
+                verify_data = 1;
+            } else if (strcmp(argv[i], "--verify-metadata") == 0) {
+                verify_metadata = 1;
+            } else if (strcmp(argv[i], "--verify-data") == 0) {
+                verify_data = 1;
+            } else if (strncmp(argv[i], "--verify-data=", 14) == 0) {
+                char *end = NULL;
+                errno = 0;
+                verify_pct = strtod(argv[i] + 14, &end);
+                if (errno || end == argv[i] + 14 || *end || verify_pct < 0.0 ||
+                    verify_pct > 100.0) {
+                    fprintf(stderr, "ecopy: invalid verification percentage: %s\n",
+                            argv[i] + 14);
+                    return 1;
+                }
+                verify_data = 1;
+            } else if (strcmp(argv[i], "--verify-skipped") == 0) {
+                verify_skipped = 1;
+            } else if (strncmp(argv[i], "--verify-seed=", 14) == 0) {
+                char *end = NULL;
+                errno = 0;
+                unsigned long long value = strtoull(argv[i] + 14, &end, 0);
+                if (errno || end == argv[i] + 14 || *end) {
+                    fprintf(stderr, "ecopy: invalid verification seed: %s\n",
+                            argv[i] + 14);
+                    return 1;
+                }
+                verify_seed_value = (uint64_t)value;
+                verify_seed_set = 1;
             } else if (argv[i][0] == '-' && argv[i][1] != '\0' &&
                        strcmp(argv[i], "-") != 0) {
                 fprintf(stderr, "ecopy: unknown option: %s\n", argv[i]);
@@ -524,6 +575,7 @@ int main(int argc, char **argv) {
         src_arg = pos[0];
         dst_arg = pos[1];
     }
+    copy_policy_init(!no_preserve_times);
 
     if (ssh_target_is_url(src_arg)) {
         fprintf(stderr, "ecopy: ssh:// sources are not supported yet (push only)\n");
@@ -559,17 +611,15 @@ int main(int argc, char **argv) {
             fprintf(stderr, "ecopy: malformed ssh target: %s\n", dst_arg);
             return 1;
         }
-        if (no_preserve_times) {
-            sshx_set_preserve_times(0);
-        }
         if (sshx_connect(&target) != 0) {
             return 1;
         }
         dst_root = sshx_remote_root();
+        destination_fresh = !sshx_remote_root_present();
+        copy_policy_set_destination(destination_fresh, 1);
         /* Pick the scan mode from the handshake: absent root -> fresh (skip
          * per-dir bulk STAT); present -> incremental (keep bulk STAT so re-runs
          * skip unchanged files). */
-        traversal_set_remote_fresh(!sshx_remote_root_present());
         if (!src_is_dir) {
             /* The ssh:// path is always the destination directory; the file
              * keeps its source name inside it. */
@@ -588,9 +638,10 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Source and target directories overlap: %s <-> %s\n", src_abs, dst_abs);
             return 1;
         }
-        if (ensure_destination_root(dst_abs) != 0) {
+        if (ensure_destination_root(dst_abs, &destination_fresh) != 0) {
             return 1;
         }
+        copy_policy_set_destination(destination_fresh, 1);
         dst_root = dst_abs;
     } else {
         /* Local single-file destination. If it names an existing directory or
@@ -624,9 +675,10 @@ int main(int argc, char **argv) {
             }
         }
 
-        if (mkdir_p_dir(dst_dir, 0777) != 0) {
+        if (mkdir_p_dir(dst_dir, 0777, NULL) != 0) {
             return 1;
         }
+        copy_policy_set_destination(0, 0);
         if (snprintf(file_enqueue_dst, sizeof(file_enqueue_dst), "%s/%s", dst_dir, src_name)
                 >= (int)sizeof(file_enqueue_dst) ||
             snprintf(file_final_dst, sizeof(file_final_dst), "%s/%s", dst_dir, final_name)
@@ -643,6 +695,8 @@ int main(int argc, char **argv) {
     raise_open_file_limit(verbose);
 
     stats_init();
+    verify_configure(verify_metadata, verify_data, verify_pct, verify_skipped,
+                     verify_seed_value, verify_seed_set);
     workers_set_collect_wait_timing(verbose);
     if (workers_start() != 0) { sshx_disconnect(); return 1; }
     if (verbose) {
@@ -674,6 +728,9 @@ int main(int argc, char **argv) {
         if (rename(file_enqueue_dst, file_final_dst) != 0) {
             perror(file_final_dst);
             finalize_failed = 1;
+        } else if (verify_retarget_path(file_enqueue_dst, file_final_dst) != 0) {
+            fprintf(stderr, "ecopy: unable to update verification target path\n");
+            finalize_failed = 1;
         }
     }
 
@@ -685,6 +742,12 @@ int main(int argc, char **argv) {
     int remote_failed = 0;
     if (remote) {
         remote_failed = (sshx_flush() != 0);
+    }
+    int verify_failed = 0;
+    if (!finalize_failed && !remote_failed && verify_enabled()) {
+        verify_failed = (verify_run_queued(remote) != 0);
+    } else {
+        verify_queue_clear();
     }
     if (finalize_failed) {
         sshx_disconnect();
@@ -709,7 +772,8 @@ int main(int argc, char **argv) {
     }
     suggestion_print_next_run();
 
-    if (traversal_status() != 0 || workers_status() != 0 || remote_failed) {
+    if (traversal_status() != 0 || workers_status() != 0 || remote_failed ||
+        verify_failed) {
         return 1;
     }
     return 0;
