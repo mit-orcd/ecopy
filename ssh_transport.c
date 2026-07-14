@@ -880,6 +880,8 @@ int sshx_barrier(int flush)
     for (size_t i = 0; i < 6 && !d.error; i++) {
         verify_counts[i] = pdec_u64(&d);
     }
+    uint64_t drain_bytes = pdec_u64(&d);
+    uint64_t drain_ns = pdec_u64(&d);
     uint64_t delta[6] = {0};
     if (!d.error) {
         for (size_t i = 0; i < 6; i++) {
@@ -887,6 +889,9 @@ int sshx_barrier(int flush)
                            ? verify_counts[i] - g_conn.verify_counts[i] : 0;
             g_conn.verify_counts[i] = verify_counts[i];
         }
+        /* Cumulative server-side totals; keep the latest so the final barrier
+         * leaves the whole-run figures for the report. */
+        stats_set_remote_drain(drain_bytes, drain_ns);
     }
     pending_remove(p);
 

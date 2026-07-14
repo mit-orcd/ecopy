@@ -22,7 +22,7 @@
 #include <string.h>
 #include <sys/types.h>
 
-#define ECOPY_PROTO_VERSION 7u
+#define ECOPY_PROTO_VERSION 8u
 
 /* Upper bound on a single control-frame payload we are willing to read. Data
  * frames (WRITE) carry their own length and are streamed, so this only bounds

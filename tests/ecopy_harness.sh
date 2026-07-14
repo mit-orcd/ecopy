@@ -727,7 +727,8 @@ case_transfer_verification() {
     out="$(env "${common_env[@]}" "${remote_env[@]}" "$bin" \
               --verify-data=1 --verify-metadata --verify-seed=456 \
               "$s" "ssh://localhost${rd}" 2>&1)"; rc=$?
-    if [[ "$rc" -eq 0 ]] && grep -q 'Verify failures   : 0' <<<"$out"; then
+    if [[ "$rc" -eq 0 ]] && grep -q 'Verify failures   : 0' <<<"$out" &&
+       grep -q 'Remote drain rate' <<<"$out"; then
         ok "remote sampled verification succeeds"
     else
         fail "remote verification success path: $(tr '\n' ' ' <<<"$out")"

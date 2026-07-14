@@ -81,6 +81,23 @@ static uint64_t g_verify_io_failures;
 static uint64_t g_verify_malformed_batches;
 static uint64_t g_verify_ownership_unpreserved;
 
+/*
+ * Remote drain telemetry: how many payload bytes we wrote and how long we spent
+ * in the write + fsync syscalls that consume the stream. Reported at the barrier
+ * so the client can show whether the remote peer's storage was the bottleneck.
+ * Updated from the reader thread (streamed writes/commits) and the apply pool
+ * (PUTFILE), hence atomic.
+ */
+static _Atomic uint64_t g_drain_bytes;
+static _Atomic uint64_t g_drain_ns;
+
+static uint64_t server_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
 static void log_op_error(const char *path, int err)
 {
     pthread_mutex_lock(&g_err_lock);
@@ -762,17 +779,20 @@ static void handle_write(const uint8_t *payload, uint32_t plen)
     if (!f) return;
     if (f->failed || f->fd < 0) return;
 
+    uint64_t t0 = server_ns();
     size_t done = 0;
     while (done < len) {
         ssize_t w = pwrite(f->fd, data + done, len - done, offset + (off_t)done);
         if (w < 0) {
             if (errno == EINTR) continue;
             f->failed = 1; f->err = -errno;
-            return;
+            break;
         }
-        if (w == 0) { f->failed = 1; f->err = -EIO; return; }
+        if (w == 0) { f->failed = 1; f->err = -EIO; break; }
         done += (size_t)w;
     }
+    atomic_fetch_add(&g_drain_bytes, (uint64_t)done);
+    atomic_fetch_add(&g_drain_ns, server_ns() - t0);
 }
 
 static void handle_ftruncate(const uint8_t *payload, uint32_t plen)
@@ -808,7 +828,9 @@ static int handle_commit(uint64_t id, const uint8_t *payload, uint32_t plen)
     } else if (f->fd < 0) {
         status = -EBADF;
     } else {
+        uint64_t t0 = server_ns();
         if (fsync(f->fd) != 0) status = -errno;
+        atomic_fetch_add(&g_drain_ns, server_ns() - t0);
         if (status == 0) {
             status = apply_meta(f->fd, uid, gid, mode,
                                 at_s, at_ns, mt_s, mt_ns, 0, NULL);
@@ -1023,12 +1045,15 @@ static void handle_putfile(const uint8_t *payload, uint32_t plen)
     int err = 0;
     const char *failed_op = NULL;
     size_t done = 0;
+    uint64_t t0 = server_ns();
     while (done < data_len) {
         ssize_t w = write(fd, data + done, data_len - done);
         if (w < 0) { if (errno == EINTR) continue; err = errno; break; }
         if (w == 0) { err = EIO; break; }
         done += (size_t)w;
     }
+    atomic_fetch_add(&g_drain_bytes, (uint64_t)done);
+    atomic_fetch_add(&g_drain_ns, server_ns() - t0);
     if (err == 0) {
         int status = apply_meta(fd, uid, gid, mode,
                                 at_s, at_ns, mt_s, mt_ns, mode_is_set,
@@ -1273,6 +1298,8 @@ static int handle_barrier(uint64_t id, const uint8_t *payload, uint32_t plen)
     penc_u64(&e, g_verify_io_failures);
     penc_u64(&e, g_verify_malformed_batches);
     penc_u64(&e, g_verify_ownership_unpreserved);
+    penc_u64(&e, atomic_load(&g_drain_bytes));
+    penc_u64(&e, atomic_load(&g_drain_ns));
     return frame_write(STDOUT_FILENO, MSG_STATUS, id, buf, (uint32_t)e.len);
 }
 

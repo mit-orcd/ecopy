@@ -70,6 +70,12 @@ void stats_record_verify_holes(uint64_t blocks, uint64_t bytes);
  * could not chown the destination.
  */
 void stats_record_verify_ownership(uint64_t n);
+/*
+ * Cumulative server-side drain totals (bytes written and time spent in
+ * write + fsync), reported by the SSH peer at each barrier. The latest values
+ * win so the final barrier leaves whole-run figures.
+ */
+void stats_set_remote_drain(uint64_t bytes, uint64_t ns);
 void stats_record_verify_categories(uint64_t metadata, uint64_t data,
                                     uint64_t expected_zero, uint64_t io,
                                     uint64_t malformed, uint64_t ownership);

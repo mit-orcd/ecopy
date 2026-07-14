@@ -174,6 +174,10 @@ The final report separates phases so verification time never depresses the repor
   complete elapsed/rate** also includes directory finalization and the remote flush immediately before verification.
   **Payload bytes** are bytes actually moved; **logical bytes** are selected source file sizes. Their difference is
   reported as sparse savings.
+- For SSH targets, **Remote drain rate / busy** report how many payload bytes the remote peer wrote and how long it
+  spent in the `write`/`fsync` syscalls that consume the stream (summed server-side service time, reported at each
+  barrier). A drain busy time close to the copy elapsed time, or a drain rate far below your link speed, means the
+  bottleneck is the remote peer's storage or a loaded remote host rather than the client or the network.
 - **Transfer distribution** values are worker-service metrics measured from task claim through successful
   finalization. Small dense, large dense (the configured large threshold), and sparse files have separate
   populations. Latency includes zero-byte files; per-file effective throughput excludes them. A remote PUTFILE

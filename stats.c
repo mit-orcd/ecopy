@@ -361,6 +361,12 @@ void stats_record_verify_ownership(uint64_t n) {
     g_stats.verify_ownership_unpreserved += n;
     pthread_mutex_unlock(&g_lock);
 }
+void stats_set_remote_drain(uint64_t bytes, uint64_t ns) {
+    pthread_mutex_lock(&g_lock);
+    g_stats.remote_drain_bytes = bytes;
+    g_stats.remote_drain_ns = ns;
+    pthread_mutex_unlock(&g_lock);
+}
 void stats_record_verify_categories(uint64_t metadata, uint64_t data,
                                     uint64_t expected_zero, uint64_t io,
                                     uint64_t malformed, uint64_t ownership) {
@@ -681,6 +687,15 @@ void stats_print_final(int verbose) {
                data_sec > 0.0 ? (double)s.files_copied / data_sec : 0.0);
         printf("Copy complete sec : %.2f s\n", complete_sec);
         printf("Copy complete rate: %s\n", complete_rate);
+        if (s.remote_drain_ns > 0) {
+            char drain_rate[32];
+            double drain_sec = (double)s.remote_drain_ns / 1e9;
+            stats_format_rate(s.remote_drain_bytes, drain_sec,
+                              drain_rate, sizeof(drain_rate));
+            printf("Remote drain rate : %s (server write+fsync service)\n",
+                   drain_rate);
+            printf("Remote drain busy : %.2f s\n", drain_sec);
+        }
         if (s.bytes_skipped > 0) {
             printf("GiB skipped   : %.2f\n", stats_bytes_to_gib(s.bytes_skipped));
         }

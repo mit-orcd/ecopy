@@ -182,6 +182,8 @@ static void test_barrier_verify_summary(void)
     penc_u32(&e, 15);
     penc_str(&e, "/dst/bad");
     for (uint64_t i = 1; i <= 6; i++) penc_u64(&e, i);
+    penc_u64(&e, 4096000);   /* remote drain bytes */
+    penc_u64(&e, 250000000); /* remote drain ns */
     CHECK(!e.overflow, "extended barrier summary fits");
 
     pdec_t d; pdec_init(&d, buf, e.len);
@@ -193,6 +195,8 @@ static void test_barrier_verify_summary(void)
     for (uint64_t i = 1; i <= 6; i++) {
         CHECK(pdec_u64(&d) == i, "barrier category counter roundtrip");
     }
+    CHECK(pdec_u64(&d) == 4096000, "barrier drain bytes roundtrip");
+    CHECK(pdec_u64(&d) == 250000000, "barrier drain ns roundtrip");
     CHECK(!d.error && d.off == d.len, "barrier summary fully consumed");
 }
 
