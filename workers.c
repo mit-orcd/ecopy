@@ -13,6 +13,7 @@
 #include "fs_util.h"
 #include "copy_policy.h"
 #include "verify.h"
+#include "telemetry.h"
 #include "ssh_transport.h"
 #include "protocol.h"
 
@@ -96,6 +97,7 @@ typedef struct large_file_ctx {
     int writer_count;
     int readers_started;
     int writers_started;
+    uint64_t service_start_ns;
 } large_file_ctx_t;
 
 typedef struct {
@@ -159,7 +161,7 @@ static int g_collect_wait_timing = 0;
 
 static uint64_t monotonic_ns(void);
 static void copy_path_field(char *dst, size_t dstsz, const char *src);
-static int copy_file_remote(file_task_t *task);
+static int copy_file_remote(file_task_t *task, uint64_t *payload_bytes);
 
 /* -------------------- runtime config -------------------- */
 
@@ -911,7 +913,8 @@ static int copy_byte_range_buffered(int fd_in,
                                     off_t start,
                                     off_t end,
                                     void *buf,
-                                    size_t bufcap)
+                                    size_t bufcap,
+                                    uint64_t *payload_bytes)
 {
     off_t pos = start;
     fadvise_batch_t fadv;
@@ -957,6 +960,7 @@ static int copy_byte_range_buffered(int fd_in,
         fadvise_batch_add(&fadv, fd_in, pos, r);
         pos += r;
         record_progress_bytes((uint64_t)r, 1);
+        if (payload_bytes) *payload_bytes += (uint64_t)r;
     }
 
     fadvise_batch_flush(&fadv);
@@ -974,7 +978,8 @@ static int copy_data_extents_buffered(int fd_in,
                                       int fd_out,
                                       off_t size,
                                       void *buf,
-                                      size_t bufcap)
+                                      size_t bufcap,
+                                      uint64_t *payload_bytes)
 {
     off_t pos = 0;
 
@@ -986,7 +991,8 @@ static int copy_data_extents_buffered(int fd_in,
                 break;
             }
             if (errno == EINVAL || errno == ENOTSUP || errno == EOPNOTSUPP) {
-                return copy_byte_range_buffered(fd_in, fd_out, pos, size, buf, bufcap);
+                return copy_byte_range_buffered(fd_in, fd_out, pos, size, buf,
+                                                bufcap, payload_bytes);
             }
             perror("lseek SEEK_DATA");
             return -1;
@@ -1004,7 +1010,8 @@ static int copy_data_extents_buffered(int fd_in,
             hole = size;
         }
 
-        if (copy_byte_range_buffered(fd_in, fd_out, data, hole, buf, bufcap) != 0) {
+        if (copy_byte_range_buffered(fd_in, fd_out, data, hole, buf, bufcap,
+                                     payload_bytes) != 0) {
             return -1;
         }
         pos = hole;
@@ -1019,7 +1026,7 @@ static int copy_data_extents_buffered(int fd_in,
  * than the in-place fast path), copies only data extents, and ftruncate()s the
  * destination to the exact source size so trailing holes are preserved.
  */
-static int copy_file_sparse(file_task_t *task)
+static int copy_file_sparse(file_task_t *task, uint64_t *payload_bytes)
 {
     int fd_in = -1;
     int fd_out = -1;
@@ -1073,7 +1080,8 @@ static int copy_file_sparse(file_task_t *task)
         goto out;
     }
 
-    if (copy_data_extents_buffered(fd_in, fd_out, size, buf, bufcap) != 0) {
+    if (copy_data_extents_buffered(fd_in, fd_out, size, buf, bufcap,
+                                   payload_bytes) != 0) {
         goto out;
     }
 
@@ -1114,7 +1122,7 @@ out:
     return rc;
 }
 
-static int copy_file_serial_small(file_task_t *task)
+static int copy_file_serial_small(file_task_t *task, uint64_t *payload_bytes)
 {
     int fd_in = -1;
     int fd_out = -1;
@@ -1136,7 +1144,7 @@ static int copy_file_serial_small(file_task_t *task)
     init_runtime_config();
 
     if (workers_file_is_sparse(&task->src_st)) {
-        return copy_file_sparse(task);
+        return copy_file_sparse(task, payload_bytes);
     }
 
     copy_range_available = copy_file_range_enabled();
@@ -1308,6 +1316,7 @@ static int copy_file_serial_small(file_task_t *task)
     }
     target_created = 0;
     rc = 0;
+    if (payload_bytes) *payload_bytes = (uint64_t)size;
 
 out:
     if (fd_in >= 0) {
@@ -1569,12 +1578,20 @@ static void finish_large_file_ctx(large_file_ctx_t *ctx)
                                            ctx->dst) != 0) {
             ctx->fd_out = -1;
             rc = -1;
-        } else if (verify_queue_file(ctx->src, ctx->dst, &ctx->src_st, 0) != 0) {
-            fprintf(stderr, "ecopy: unable to queue verification for %s\n", ctx->dst);
-            rc = -1;
         } else {
             ctx->fd_out = -1;
-            stats_inc_files_copied();
+            telemetry_note_file(TRANSFER_LARGE,
+                                (uint64_t)ctx->src_st.st_size,
+                                (uint64_t)ctx->src_st.st_size,
+                                monotonic_ns() - ctx->service_start_ns);
+            telemetry_flush_thread();
+            if (verify_queue_file(ctx->src, ctx->dst, &ctx->src_st, 0) != 0) {
+                fprintf(stderr, "ecopy: unable to queue verification for %s\n",
+                        ctx->dst);
+                rc = -1;
+            } else {
+                stats_inc_files_copied();
+            }
         }
     } else {
         rc = -1;
@@ -1635,6 +1652,7 @@ static int start_large_file_copy(file_task_t *task)
     snprintf(ctx->dst, sizeof(ctx->dst), "%s", task->dst);
     snprintf(ctx->name, sizeof(ctx->name), "%s", task->name);
     ctx->src_st = task->src_st;
+    ctx->service_start_ns = monotonic_ns();
     ctx->bulk_end = (task->src_st.st_size / ALIGNMENT) * ALIGNMENT;
     ctx->next_read_offset = 0;
     dir_handle_retain(task->dir);
@@ -1903,7 +1921,7 @@ static int copy_file_remote_putfile(file_task_t *task, off_t size)
  * pipelined channel) is what hides link latency; a single file is streamed
  * sequentially.
  */
-static int copy_file_remote(file_task_t *task)
+static int copy_file_remote(file_task_t *task, uint64_t *payload_bytes)
 {
     int fd_in = -1;
     int in_direct = 0;
@@ -1921,6 +1939,7 @@ static int copy_file_remote(file_task_t *task)
      * on the streamed path so their holes are preserved on the far side. */
     if (!sparse && size <= g_ssh_putfile_max) {
         int prc = copy_file_remote_putfile(task, size);
+        if (prc == 0 && payload_bytes) *payload_bytes = (uint64_t)size;
         stats_clear_current_file(task->src);
         return prc;
     }
@@ -1976,6 +1995,7 @@ static int copy_file_remote(file_task_t *task)
                 if (sshx_file_write(f, buf, (size_t)r, p) != 0) goto out;
                 p += r;
                 record_progress_bytes((uint64_t)r, 1);
+                if (payload_bytes) *payload_bytes += (uint64_t)r;
             }
             pos = hole;
         }
@@ -1992,6 +2012,7 @@ static int copy_file_remote(file_task_t *task)
             if (sshx_file_write(f, buf, (size_t)r, pos) != 0) goto out;
             pos += r;
             record_progress_bytes((uint64_t)r, 1);
+            if (payload_bytes) *payload_bytes += (uint64_t)r;
         }
     }
 
@@ -2026,10 +2047,20 @@ static void *worker_main(void *arg)
         }
 
         if (claim.kind == WORK_SMALL_FILE) {
+            uint64_t service_start_ns = monotonic_ns();
+            uint64_t payload_bytes = 0;
+            int sparse = workers_file_is_sparse(&claim.file_task->src_st);
             int ok = sshx_active()
-                         ? (copy_file_remote(claim.file_task) == 0)
-                         : (copy_file_serial_small(claim.file_task) == 0);
+                         ? (copy_file_remote(claim.file_task, &payload_bytes) == 0)
+                         : (copy_file_serial_small(claim.file_task, &payload_bytes) == 0);
             if (ok) {
+                transfer_class_t cls = sparse ? TRANSFER_SPARSE
+                    : (claim.file_task->src_st.st_size >= g_large_threshold
+                           ? TRANSFER_LARGE : TRANSFER_SMALL);
+                telemetry_note_file(cls,
+                                    (uint64_t)claim.file_task->src_st.st_size,
+                                    payload_bytes,
+                                    monotonic_ns() - service_start_ns);
                 if (verify_queue_file(claim.file_task->src,
                                       claim.file_task->dst,
                                       &claim.file_task->src_st, 0) != 0) {
@@ -2083,6 +2114,7 @@ static void *worker_main(void *arg)
     }
 
     thread_io_buffer_release();
+    telemetry_flush_thread();
     return NULL;
 }
 

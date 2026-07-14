@@ -665,7 +665,13 @@ case_transfer_verification() {
               "$bin" --verify-data=100 --verify-metadata --verify-seed=123 \
               "$s" "$d" 2>&1)"; rc=$?
     if [[ "$rc" -eq 0 ]] && grep -q 'Verify failures   : 0' <<<"$out" &&
-       grep -q 'Verify seed       : 123' <<<"$out"; then
+       grep -q 'Verify seed       : 123' <<<"$out" &&
+       grep -q 'Copy data rate' <<<"$out" &&
+       grep -q 'Copy complete rate' <<<"$out" &&
+       grep -q 'Verify sample rate' <<<"$out" &&
+       grep -q 'Verify readahead  : sequential' <<<"$out" &&
+       grep -q 'Verify hash backend:' <<<"$out" &&
+       ! grep -q 'Avg speed' <<<"$out"; then
         ok "local 100% verification succeeds with reproducible seed"
     else
         fail "local verification success path: $(tr '\n' ' ' <<<"$out")"
@@ -715,7 +721,8 @@ case_transfer_verification() {
     out="$(env "${common_env[@]}" "${remote_env[@]}" "$bin" \
               --verify-data=100 --verify-skipped --verify-seed=456 \
               "$s" "ssh://localhost${rd}" 2>&1)"; rc=$?
-    if [[ "$rc" -ne 0 ]] && grep -q 'remote reported' <<<"$out"; then
+    if [[ "$rc" -ne 0 ]] && grep -q 'remote reported' <<<"$out" &&
+       grep -Eq 'data mismatches[[:space:]]*: [1-9]' <<<"$out"; then
         ok "remote skipped-file corruption is detected"
     else
         fail "remote skipped corruption was not detected: $(tr '\n' ' ' <<<"$out")"
@@ -757,6 +764,7 @@ case_verify_only() {
     if [[ "$rc" -eq 0 ]] &&
        grep -q 'Verify failures   : 0' <<<"$out" &&
        grep -q 'Verify seed       : 77' <<<"$out" &&
+       grep -Eq 'Verify hole blocks: [1-9]' <<<"$out" &&
        ! grep -q 'Files copied' <<<"$out" &&
        [[ "$before" == "$after" ]] &&
        [[ "$content_before" == "$content_after" ]]; then

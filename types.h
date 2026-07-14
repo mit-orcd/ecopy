@@ -66,9 +66,15 @@ typedef struct {
     uint64_t verify_blocks;
     uint64_t verify_bytes;
     uint64_t verify_scope_bytes;
+    uint64_t verify_hole_blocks;
+    uint64_t verify_hole_bytes;
+    uint64_t verify_source_reads_avoided;
     uint64_t verify_metadata_objects;
     uint64_t verify_data_mismatches;
     uint64_t verify_metadata_mismatches;
+    uint64_t verify_zero_mismatches;
+    uint64_t verify_io_failures;
+    uint64_t verify_malformed_batches;
     uint64_t verify_failures;
     uint64_t verify_ns;
     uint64_t verify_queue_peak;
@@ -82,11 +88,17 @@ typedef struct {
     int traversal_done;
     int file_work_drained;
     int finalize_done;
+    int copy_complete;
+    int verification_started;
+    int verification_done;
     int shutdown_done;
     struct timespec start_ts;
     struct timespec traversal_done_ts;
     struct timespec file_work_drained_ts;
     struct timespec finalize_done_ts;
+    struct timespec copy_complete_ts;
+    struct timespec verification_start_ts;
+    struct timespec verification_done_ts;
     struct timespec shutdown_done_ts;
 } stats_t;
 

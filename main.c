@@ -771,9 +771,11 @@ int main(int argc, char **argv) {
             sshx_disconnect();
             return 1;
         }
+        stats_set_verification_started();
         verify_failed = verify_run_tree(src_abs,
                                         src_is_dir ? dst_root : file_final_dst,
                                         remote, src_is_dir) != 0;
+        stats_set_verification_done();
         sshx_disconnect();
         progress_stop();
         stats_set_shutdown_done();
@@ -827,9 +829,12 @@ int main(int argc, char **argv) {
     if (remote) {
         remote_failed = (sshx_flush() != 0);
     }
+    stats_set_copy_complete();
     int verify_failed = 0;
     if (!finalize_failed && !remote_failed && verify_enabled()) {
+        stats_set_verification_started();
         verify_failed = (verify_run_queued(remote) != 0);
+        stats_set_verification_done();
     } else {
         verify_queue_clear();
     }

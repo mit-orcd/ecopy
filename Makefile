@@ -2,10 +2,29 @@ CC       ?= gcc
 CPPFLAGS ?=
 CFLAGS   ?= -O3 -Wall -Wextra -pthread
 LDFLAGS  ?= -pthread
+DEPFLAGS ?= -MMD -MP
 PKG_CONFIG ?= pkg-config
 
 TARGET = ecopy
 JEMALLOC_TARGET = ecopy-jemalloc
+ARCH := $(shell uname -m)
+
+BLAKE3_OBJS = \
+	third_party/blake3/blake3.o \
+	third_party/blake3/blake3_dispatch.o \
+	third_party/blake3/blake3_portable.o \
+	third_party/blake3/blake3_wrapper.o
+
+ifneq ($(filter x86_64 amd64 i386 i686,$(ARCH)),)
+BLAKE3_OBJS += \
+	third_party/blake3/blake3_sse2.o \
+	third_party/blake3/blake3_sse41.o \
+	third_party/blake3/blake3_avx2.o \
+	third_party/blake3/blake3_avx512.o
+else
+BLAKE3_CPPFLAGS = -DBLAKE3_NO_SSE2 -DBLAKE3_NO_SSE41 \
+	-DBLAKE3_NO_AVX2 -DBLAKE3_NO_AVX512 -DBLAKE3_USE_NEON=0
+endif
 
 OBJS = \
 	main.o \
@@ -13,10 +32,11 @@ OBJS = \
 	workers.o \
 	stats.o \
 	progress.o \
+	telemetry.o \
 	fs_util.o \
 	copy_policy.o \
 	verify.o \
-	third_party/blake3/blake3.o \
+	$(BLAKE3_OBJS) \
 	suggestion.o \
 	protocol.o \
 	ssh_transport.o \
@@ -43,7 +63,7 @@ ifeq ($(HAVE_JEMALLOC),yes)
 OPTIONAL_TARGETS += $(JEMALLOC_TARGET)
 endif
 
-.PHONY: all clean test protocol_test
+.PHONY: all clean test protocol_test telemetry_test blake3_bench
 
 all: $(TARGET) $(OPTIONAL_TARGETS)
 
@@ -51,7 +71,16 @@ $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS)
 
 %.o: %.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
+
+third_party/blake3/blake3.o third_party/blake3/blake3_dispatch.o \
+third_party/blake3/blake3_portable.o third_party/blake3/blake3_wrapper.o: \
+CPPFLAGS += $(BLAKE3_CPPFLAGS)
+
+third_party/blake3/blake3_sse2.o: override CFLAGS += -msse2
+third_party/blake3/blake3_sse41.o: override CFLAGS += -mssse3 -msse4.1
+third_party/blake3/blake3_avx2.o: override CFLAGS += -mavx2
+third_party/blake3/blake3_avx512.o: override CFLAGS += -mavx512f -mavx512vl
 
 ifeq ($(HAVE_JEMALLOC),yes)
 $(JEMALLOC_TARGET): $(OBJS)
@@ -62,17 +91,27 @@ $(JEMALLOC_TARGET):
 	@false
 endif
 
-protocol_test: tests/protocol_test.c protocol.o third_party/blake3/blake3.o
-	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tests/protocol_test.c protocol.o third_party/blake3/blake3.o $(LDFLAGS)
+protocol_test: tests/protocol_test.c protocol.o $(BLAKE3_OBJS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tests/protocol_test.c protocol.o $(BLAKE3_OBJS) $(LDFLAGS)
+
+telemetry_test: tests/telemetry_test.c telemetry.o stats.o $(BLAKE3_OBJS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tests/telemetry_test.c telemetry.o stats.o $(BLAKE3_OBJS) $(LDFLAGS)
+
+blake3_bench: tests/blake3_bench.c $(BLAKE3_OBJS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tests/blake3_bench.c $(BLAKE3_OBJS) $(LDFLAGS)
 
 clean:
-	rm -f *.o third_party/blake3/*.o $(TARGET) $(JEMALLOC_TARGET) direct_copy protocol_test
+	rm -f *.o *.d third_party/blake3/*.o third_party/blake3/*.d $(TARGET) $(JEMALLOC_TARGET) direct_copy protocol_test telemetry_test blake3_bench
 
-test: $(TARGET) protocol_test
+test: $(TARGET) protocol_test telemetry_test
 	@set -e; \
 	echo "==> protocol_test"; \
 	./protocol_test; \
+	echo "==> telemetry_test"; \
+	./telemetry_test; \
 	for t in tests/*.sh; do \
 		echo "==> $$t"; \
 		bash "$$t"; \
 	done
+
+-include $(OBJS:.o=.d)

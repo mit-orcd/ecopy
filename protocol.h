@@ -22,7 +22,7 @@
 #include <string.h>
 #include <sys/types.h>
 
-#define ECOPY_PROTO_VERSION 5u
+#define ECOPY_PROTO_VERSION 6u
 
 /* Upper bound on a single control-frame payload we are willing to read. Data
  * frames (WRITE) carry their own length and are streamed, so this only bounds
@@ -73,6 +73,7 @@ typedef enum {
 #define ECOPY_VERIFY_DIRECTORY     0x1u
 #define ECOPY_VERIFY_METADATA      0x2u
 #define ECOPY_VERIFY_PRESERVE_TIME 0x4u
+#define ECOPY_VERIFY_SEQUENTIAL    0x8u
 
 /* Capability bits exchanged in HELLO/HELLO_OK */
 #define ECOPY_CAP_FALLOCATE 0x1u

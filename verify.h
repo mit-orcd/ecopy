@@ -18,8 +18,11 @@
 typedef struct {
     int64_t offset;
     uint32_t length;
+    uint8_t flags;
     uint8_t digest[VERIFY_DIGEST_SIZE];
 } verify_digest_t;
+
+#define VERIFY_SAMPLE_EXPECT_ZERO 0x1u
 
 void verify_configure(int metadata, int data, double percent,
                       int include_skipped, uint64_t seed, int seed_set,

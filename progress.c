@@ -25,7 +25,9 @@
 static pthread_t g_monitor_thread;
 static int g_monitor_stop = 0;
 static int g_monitor_running = 0;
+static int g_monitor_tty = 0;
 static pthread_mutex_t g_monitor_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_monitor_cond = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t g_output_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int get_terminal_width(void) {
@@ -227,32 +229,34 @@ static void *monitor_main(void *arg) {
     (void)arg;
 
     for (;;) {
+        stats_record_speed_sample();
+        if (g_monitor_tty) print_progress();
+
         pthread_mutex_lock(&g_monitor_lock);
+        if (!g_monitor_stop) {
+            struct timespec deadline;
+            clock_gettime(CLOCK_REALTIME, &deadline);
+            deadline.tv_nsec += MONITOR_INTERVAL_MS * 1000000L;
+            deadline.tv_sec += deadline.tv_nsec / 1000000000L;
+            deadline.tv_nsec %= 1000000000L;
+            pthread_cond_timedwait(&g_monitor_cond, &g_monitor_lock, &deadline);
+        }
         int stop = g_monitor_stop;
         pthread_mutex_unlock(&g_monitor_lock);
-
-        if (stop) {
-            break;
-        }
-
-        stats_record_speed_sample();
-        print_progress();
-        usleep(MONITOR_INTERVAL_MS * 1000);
+        if (stop) break;
     }
 
-    print_progress();
+    stats_record_speed_sample();
+    if (g_monitor_tty) print_progress();
     return NULL;
 }
 
 int progress_start(void) {
     pthread_mutex_lock(&g_monitor_lock);
     g_monitor_stop = 0;
-    g_monitor_running = isatty(STDOUT_FILENO);
+    g_monitor_tty = isatty(STDOUT_FILENO);
+    g_monitor_running = 1;
     pthread_mutex_unlock(&g_monitor_lock);
-
-    if (!g_monitor_running) {
-        return 0;
-    }
 
     if (pthread_create(&g_monitor_thread, NULL, monitor_main, NULL) != 0) {
         perror("pthread_create");
@@ -270,6 +274,7 @@ void progress_stop(void) {
 
     pthread_mutex_lock(&g_monitor_lock);
     g_monitor_stop = 1;
+    pthread_cond_signal(&g_monitor_cond);
     running = g_monitor_running;
     pthread_mutex_unlock(&g_monitor_lock);
 
@@ -284,7 +289,7 @@ void progress_stop(void) {
 
 void progress_interrupt(void) {
     pthread_mutex_lock(&g_monitor_lock);
-    int active = g_monitor_running && !g_monitor_stop;
+    int active = g_monitor_running && g_monitor_tty && !g_monitor_stop;
     pthread_mutex_unlock(&g_monitor_lock);
 
     if (active) {

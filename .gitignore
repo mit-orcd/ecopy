@@ -1,7 +1,10 @@
 *.o
+*.d
 /direct_copy
 /ecopy
 /ecopy-jemalloc
 /protocol_test
+/telemetry_test
+/blake3_bench
 /logs/
 /notes.txt

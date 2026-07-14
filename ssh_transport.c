@@ -15,6 +15,7 @@
 #include "ssh_transport.h"
 #include "copy_policy.h"
 #include "protocol.h"
+#include "stats.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,6 +63,7 @@ typedef struct {
     _Atomic uint64_t ops_since_barrier;  /* fire-and-forget ops awaiting a drain */
     uint64_t barrier_ops;                /* periodic-barrier threshold */
     int remote_failed;                   /* a barrier reported remote errors */
+    uint64_t verify_counts[5];           /* cumulative server checker counters */
     pthread_mutex_t barrier_lock;        /* only one periodic barrier in flight */
 
     char remote_root[PATH_MAX];
@@ -874,7 +876,22 @@ int sshx_barrier(int flush)
     uint32_t err_count = pdec_u32(&d);
     char first[PATH_MAX];
     if (pdec_str(&d, first, sizeof(first)) != 0) first[0] = '\0';
+    uint64_t verify_counts[5] = {0};
+    for (size_t i = 0; i < 5 && !d.error; i++) {
+        verify_counts[i] = pdec_u64(&d);
+    }
+    uint64_t delta[5] = {0};
+    if (!d.error) {
+        for (size_t i = 0; i < 5; i++) {
+            delta[i] = verify_counts[i] >= g_conn.verify_counts[i]
+                           ? verify_counts[i] - g_conn.verify_counts[i] : 0;
+            g_conn.verify_counts[i] = verify_counts[i];
+        }
+    }
     pending_remove(p);
+
+    stats_record_verify_categories(delta[0], delta[1], delta[2],
+                                   delta[3], delta[4]);
 
     if (err_count > 0) {
         if (!g_conn.remote_failed) {
@@ -905,7 +922,7 @@ int sshx_verify_batch(const char *path, const struct stat *src_st,
         errno = EINVAL;
         return -1;
     }
-    cap = strlen(path) + 128 + count * (8 + 4 + VERIFY_DIGEST_SIZE);
+    cap = strlen(path) + 128 + count * (8 + 4 + 1 + VERIFY_DIGEST_SIZE);
     if (cap > ECOPY_MAX_FRAME) {
         errno = E2BIG;
         return -1;
@@ -916,15 +933,19 @@ int sshx_verify_batch(const char *path, const struct stat *src_st,
     penc_str(&e, path);
     encode_meta(&e, src_st);
     penc_i64(&e, (int64_t)src_st->st_size);
-    penc_u8(&e, (uint8_t)((is_dir ? ECOPY_VERIFY_DIRECTORY : 0) |
-                           (check_metadata ? ECOPY_VERIFY_METADATA : 0) |
-                           ((verify_metadata_enabled() &&
-                             copy_policy_preserve_times())
-                                ? ECOPY_VERIFY_PRESERVE_TIME : 0)));
+    uint8_t flags = (uint8_t)((is_dir ? ECOPY_VERIFY_DIRECTORY : 0) |
+                              (check_metadata ? ECOPY_VERIFY_METADATA : 0) |
+                              ((verify_metadata_enabled() &&
+                                copy_policy_preserve_times())
+                                   ? ECOPY_VERIFY_PRESERVE_TIME : 0) |
+                              (verify_percent() >= 100.0
+                                   ? ECOPY_VERIFY_SEQUENTIAL : 0));
+    penc_u8(&e, flags);
     penc_u32(&e, (uint32_t)count);
     for (size_t i = 0; i < count; i++) {
         penc_i64(&e, digests[i].offset);
         penc_u32(&e, digests[i].length);
+        penc_u8(&e, digests[i].flags);
         penc_bytes(&e, digests[i].digest, VERIFY_DIGEST_SIZE);
     }
     int rc = e.overflow

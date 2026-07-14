@@ -134,6 +134,7 @@ static void test_verify_batch_encoding(void)
     penc_u32(&e, 1);
     penc_i64(&e, 4096);
     penc_u32(&e, 4096);
+    penc_u8(&e, VERIFY_SAMPLE_EXPECT_ZERO);
     penc_bytes(&e, digest, sizeof(digest));
     CHECK(!e.overflow, "verify batch encoding fits");
 
@@ -144,7 +145,8 @@ static void test_verify_batch_encoding(void)
     CHECK(pdec_i64(&d) == 8192, "verify size roundtrip");
     CHECK(pdec_u8(&d) == 7 && pdec_u32(&d) == 1,
           "verify flags/count roundtrip");
-    CHECK(pdec_i64(&d) == 4096 && pdec_u32(&d) == 4096,
+    CHECK(pdec_i64(&d) == 4096 && pdec_u32(&d) == 4096 &&
+          pdec_u8(&d) == VERIFY_SAMPLE_EXPECT_ZERO,
           "verify offset/length roundtrip");
     CHECK(pdec_bytes(&d, decoded, sizeof(decoded)) == 0 &&
           memcmp(decoded, digest, sizeof(digest)) == 0,
@@ -158,10 +160,40 @@ static void test_verify_batch_encoding(void)
     CHECK(pdec_u32(&d) == 1, "truncated verify count decodes");
     (void)pdec_i64(&d);
     (void)pdec_u32(&d);
+    (void)pdec_u8(&d);
     CHECK(pdec_bytes(&d, decoded, sizeof(decoded)) != 0 && d.error,
           "truncated verify digest is rejected");
     CHECK((uint32_t)(VERIFY_BATCH_MAX + 1) > VERIFY_BATCH_MAX,
           "verify batch overflow bound is representable and rejected");
+    CHECK(((ECOPY_VERIFY_DIRECTORY | ECOPY_VERIFY_METADATA |
+            ECOPY_VERIFY_PRESERVE_TIME | ECOPY_VERIFY_SEQUENTIAL) & ~15u) == 0,
+          "all verify path flags are valid");
+    CHECK((0x80u & ~15u) != 0, "unknown verify path flag is rejected");
+    CHECK((VERIFY_SAMPLE_EXPECT_ZERO & ~VERIFY_SAMPLE_EXPECT_ZERO) == 0 &&
+          (0x80u & ~VERIFY_SAMPLE_EXPECT_ZERO) != 0,
+          "sample flag validation rejects unknown bits");
+}
+
+static void test_barrier_verify_summary(void)
+{
+    uint8_t buf[256];
+    penc_t e; penc_init(&e, buf, sizeof(buf));
+    penc_u32(&e, (uint32_t)-5);
+    penc_u32(&e, 15);
+    penc_str(&e, "/dst/bad");
+    for (uint64_t i = 1; i <= 5; i++) penc_u64(&e, i);
+    CHECK(!e.overflow, "extended barrier summary fits");
+
+    pdec_t d; pdec_init(&d, buf, e.len);
+    char path[64];
+    CHECK((int32_t)pdec_u32(&d) == -5 && pdec_u32(&d) == 15,
+          "barrier status/count roundtrip");
+    CHECK(pdec_str(&d, path, sizeof(path)) == 0 &&
+          strcmp(path, "/dst/bad") == 0, "barrier first diagnostic roundtrip");
+    for (uint64_t i = 1; i <= 5; i++) {
+        CHECK(pdec_u64(&d) == i, "barrier category counter roundtrip");
+    }
+    CHECK(!d.error && d.off == d.len, "barrier summary fully consumed");
 }
 
 struct frame_expect {
@@ -236,6 +268,7 @@ int main(void)
     test_overflow_guard();
     test_blake3_vectors();
     test_verify_batch_encoding();
+    test_barrier_verify_summary();
     test_frame_pipe();
 
     if (failures == 0) {

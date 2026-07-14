@@ -73,6 +73,11 @@ static int32_t  g_err_first;         /* negative errno of the first failure */
 static char     g_err_first_path[PATH_MAX];
 static pthread_mutex_t g_err_lock = PTHREAD_MUTEX_INITIALIZER;  /* pool workers log here */
 static _Atomic int g_verify_atime_warned;
+static uint64_t g_verify_metadata_mismatches;
+static uint64_t g_verify_data_mismatches;
+static uint64_t g_verify_zero_mismatches;
+static uint64_t g_verify_io_failures;
+static uint64_t g_verify_malformed_batches;
 
 static void log_op_error(const char *path, int err)
 {
@@ -80,6 +85,33 @@ static void log_op_error(const char *path, int err)
     if (g_err_count == 0) {
         g_err_first = -(err > 0 ? err : -err);
         snprintf(g_err_first_path, sizeof(g_err_first_path), "%s", path ? path : "");
+    }
+    g_err_count++;
+    pthread_mutex_unlock(&g_err_lock);
+}
+
+typedef enum {
+    VERIFY_ERR_METADATA,
+    VERIFY_ERR_DATA,
+    VERIFY_ERR_ZERO,
+    VERIFY_ERR_IO,
+    VERIFY_ERR_MALFORMED
+} verify_error_kind_t;
+
+static void log_verify_error(verify_error_kind_t kind, const char *path, int err)
+{
+    pthread_mutex_lock(&g_err_lock);
+    switch (kind) {
+    case VERIFY_ERR_METADATA: g_verify_metadata_mismatches++; break;
+    case VERIFY_ERR_DATA: g_verify_data_mismatches++; break;
+    case VERIFY_ERR_ZERO: g_verify_zero_mismatches++; break;
+    case VERIFY_ERR_IO: g_verify_io_failures++; break;
+    case VERIFY_ERR_MALFORMED: g_verify_malformed_batches++; break;
+    }
+    if (g_err_count == 0) {
+        g_err_first = -(err > 0 ? err : -err);
+        snprintf(g_err_first_path, sizeof(g_err_first_path), "%s",
+                 path ? path : "");
     }
     g_err_count++;
     pthread_mutex_unlock(&g_err_lock);
@@ -945,7 +977,10 @@ static void handle_verify_path(const uint8_t *payload, uint32_t plen)
     char in[PATH_MAX], path[PATH_MAX];
     pdec_t d;
     pdec_init(&d, payload, plen);
-    if (pdec_str(&d, in, sizeof(in)) != 0) return;
+    if (pdec_str(&d, in, sizeof(in)) != 0) {
+        log_verify_error(VERIFY_ERR_MALFORMED, "(malformed verify path)", EINVAL);
+        return;
+    }
     uint32_t uid = pdec_u32(&d);
     uint32_t gid = pdec_u32(&d);
     uint32_t mode = pdec_u32(&d);
@@ -959,10 +994,11 @@ static void handle_verify_path(const uint8_t *payload, uint32_t plen)
     int is_dir = (flags & ECOPY_VERIFY_DIRECTORY) != 0;
     int check_metadata = (flags & ECOPY_VERIFY_METADATA) != 0;
     int check_times = (flags & ECOPY_VERIFY_PRESERVE_TIME) != 0;
+    int sequential = (flags & ECOPY_VERIFY_SEQUENTIAL) != 0;
     if (d.error || expected_size < 0 || count > VERIFY_BATCH_MAX ||
-        (flags & ~7u) != 0 || (is_dir && count != 0) ||
+        (flags & ~15u) != 0 || (is_dir && count != 0) ||
         resolve_path(in, path, sizeof(path)) != 0) {
-        log_op_error(in, EINVAL);
+        log_verify_error(VERIFY_ERR_MALFORMED, in, EINVAL);
         return;
     }
 
@@ -985,48 +1021,79 @@ static void handle_verify_path(const uint8_t *payload, uint32_t plen)
                     "use --verify-metadata or --no-preserve-times\n",
                     path, strerror(errno));
         }
-        log_op_error(path, errno);
+        log_verify_error(VERIFY_ERR_IO, path, errno);
         return;
+    }
+    if (!is_dir && count > 0) {
+        (void)posix_fadvise(fd, 0, 0,
+                           sequential ? POSIX_FADV_SEQUENTIAL
+                                      : POSIX_FADV_RANDOM);
     }
     struct stat st;
     int failed = 0;
+    int metadata_bad = 0;
+    int data_bad = 0;
+    int zero_bad = 0;
+    int io_bad = 0;
     const char *field = NULL;
     int64_t bad_offset = -1;
-    if (fstat(fd, &st) != 0 ||
-        (is_dir ? !S_ISDIR(st.st_mode) : !S_ISREG(st.st_mode)) ||
-        (!is_dir && st.st_size != (off_t)expected_size)) {
+    if (fstat(fd, &st) != 0) {
         failed = 1;
+        io_bad = 1;
+        field = "stat";
+    } else if ((is_dir ? !S_ISDIR(st.st_mode) : !S_ISREG(st.st_mode)) ||
+               (!is_dir && st.st_size != (off_t)expected_size)) {
+        failed = 1;
+        metadata_bad = 1;
         field = "type/size";
     }
 
     for (uint32_t i = 0; i < count && !d.error; i++) {
         int64_t offset = pdec_i64(&d);
         uint32_t length = pdec_u32(&d);
+        uint8_t sample_flags = pdec_u8(&d);
         uint8_t expected[VERIFY_DIGEST_SIZE];
         uint8_t actual[VERIFY_DIGEST_SIZE];
         uint8_t data[VERIFY_BLOCK_SIZE];
         if (pdec_bytes(&d, expected, sizeof(expected)) != 0) break;
-        if (offset < 0 || length == 0 || length > VERIFY_BLOCK_SIZE ||
+        if ((sample_flags & ~VERIFY_SAMPLE_EXPECT_ZERO) != 0 ||
+            offset < 0 || length == 0 || length > VERIFY_BLOCK_SIZE ||
             offset > expected_size ||
             (uint64_t)length > (uint64_t)(expected_size - offset)) {
             d.error = 1;
             break;
         }
-        if (!failed &&
-            (pread_exact(fd, data, length, (off_t)offset) != 0 ||
-             (blake3_hash(data, length, actual),
-              memcmp(actual, expected, sizeof(actual)) != 0))) {
-            failed = 1;
-            bad_offset = offset;
+        if (!failed) {
+            int read_failed = pread_exact(fd, data, length, (off_t)offset) != 0;
+            int mismatch = read_failed;
+            if (!mismatch && (sample_flags & VERIFY_SAMPLE_EXPECT_ZERO)) {
+                for (uint32_t j = 0; j < length; j++) {
+                    if (data[j] != 0) { mismatch = 1; break; }
+                }
+            } else if (!mismatch) {
+                blake3_hash(data, length, actual);
+                mismatch = memcmp(actual, expected, sizeof(actual)) != 0;
+            }
+            if (mismatch) {
+                failed = 1;
+                bad_offset = offset;
+                if (read_failed) io_bad = 1;
+                else if (sample_flags & VERIFY_SAMPLE_EXPECT_ZERO) zero_bad = 1;
+                else data_bad = 1;
+            }
         }
     }
-    if (d.error) failed = 1;
+    if (d.error || d.off != d.len) {
+        failed = 1;
+        log_verify_error(VERIFY_ERR_MALFORMED, path, EINVAL);
+    }
 
     if (check_metadata) {
         const char *meta_field = metadata_mismatch_field(
             fd, uid, gid, mode, at_s, at_ns, mt_s, mt_ns, is_dir);
         if (meta_field) {
             failed = 1;
+            metadata_bad = 1;
             if (!field) field = meta_field;
         }
     }
@@ -1042,7 +1109,10 @@ static void handle_verify_path(const uint8_t *payload, uint32_t plen)
         } else {
             snprintf(diagnostic, sizeof(diagnostic), "%s", path);
         }
-        log_op_error(diagnostic, EIO);
+        if (metadata_bad) log_verify_error(VERIFY_ERR_METADATA, diagnostic, EIO);
+        if (data_bad) log_verify_error(VERIFY_ERR_DATA, diagnostic, EIO);
+        if (zero_bad) log_verify_error(VERIFY_ERR_ZERO, diagnostic, EIO);
+        if (io_bad) log_verify_error(VERIFY_ERR_IO, diagnostic, EIO);
     }
 }
 
@@ -1060,11 +1130,16 @@ static int handle_barrier(uint64_t id, const uint8_t *payload, uint32_t plen)
         sync();
     }
 
-    uint8_t buf[PATH_MAX + 32];
+    uint8_t buf[PATH_MAX + 80];
     penc_t e; penc_init(&e, buf, sizeof(buf));
     penc_u32(&e, (uint32_t)(g_err_count ? g_err_first : 0));
     penc_u32(&e, (uint32_t)(g_err_count > 0xffffffffULL ? 0xffffffffU : g_err_count));
     penc_str(&e, g_err_first_path);
+    penc_u64(&e, g_verify_metadata_mismatches);
+    penc_u64(&e, g_verify_data_mismatches);
+    penc_u64(&e, g_verify_zero_mismatches);
+    penc_u64(&e, g_verify_io_failures);
+    penc_u64(&e, g_verify_malformed_batches);
     return frame_write(STDOUT_FILENO, MSG_STATUS, id, buf, (uint32_t)e.len);
 }
 

@@ -9,6 +9,7 @@
 #define STATS_H
 
 #include <stdint.h>
+#include <stddef.h>
 #include "types.h"
 
 void stats_init(void);
@@ -18,6 +19,9 @@ void stats_add_planned_copy_bytes(uint64_t bytes);
 void stats_set_traversal_done(void);
 void stats_set_file_work_drained(void);
 void stats_set_finalize_done(void);
+void stats_set_copy_complete(void);
+void stats_set_verification_started(void);
+void stats_set_verification_done(void);
 void stats_set_shutdown_done(void);
 void stats_record_read_open(int used_direct);
 void stats_record_write_open(int used_direct);
@@ -54,9 +58,14 @@ void stats_set_verify_runtime(int verify_only, int workers,
                               uint64_t queue_peak, uint64_t active_peak);
 void stats_record_verify(uint64_t bytes, uint64_t scope_bytes, uint64_t blocks,
                          int metadata_checked,
-                         int data_mismatch, int metadata_mismatch, int failed);
+                         int data_mismatch, int metadata_mismatch,
+                         int expected_zero_mismatch, int io_failure, int failed);
 void stats_mark_verify_failure(void);
 void stats_add_verify_ns(uint64_t ns);
+void stats_record_verify_holes(uint64_t blocks, uint64_t bytes);
+void stats_record_verify_categories(uint64_t metadata, uint64_t data,
+                                    uint64_t expected_zero, uint64_t io,
+                                    uint64_t malformed);
 
 void stats_set_current_file(const char *path, uint64_t total, int parallel);
 void stats_advance_current_file(uint64_t bytes);
@@ -74,5 +83,6 @@ void stats_get_progress_snapshot(progress_snapshot_t *snap);
 void stats_get_final(stats_t *out);
 void stats_print_final(int verbose);
 double stats_bytes_to_gib(uint64_t bytes);
+void stats_format_rate(uint64_t bytes, double seconds, char *out, size_t out_sz);
 
 #endif

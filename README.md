@@ -149,13 +149,41 @@ Verification is opt-in, so ordinary copies pay no extra opens, reads, hashing, a
   there is one phase barrier rather than a per-file round trip. SSH verify-only starts a read-only peer and refuses
   to create a missing target root.
 - Sparse files are checked as logical content: sampled holes read as zero. This verifies bytes and size, not the
-  target's physical extent layout.
+  target's physical extent layout. A source extent map lets sampled source holes skip the source read and hash while
+  still reading the target and requiring zero bytes. Unsupported extent discovery falls back to ordinary reads.
+- Partial samples retain the same seed-derived block set but read each bounded batch in offset order with random-I/O
+  readahead advice. A 100% check is a sequential scan with sequential readahead. BLAKE3 1.8.2's official C
+  implementation selects AVX-512, AVX2, SSE4.1, SSE2, or the portable backend at runtime; the selected backend is
+  printed in the final verification report.
 
 Enabled verification necessarily adds I/O. At 1%, large files add approximately 1% source reads and 1% target
 reads; mandatory endpoint reads dominate tiny-file workloads. `--no-preserve-times` excludes timestamps from the
 metadata comparison. When timestamps are checked, data reads use `O_NOATIME`; if the caller lacks permission for
 that flag, verification fails rather than invalidating the atime it is checking. Use metadata-only verification or
 `--no-preserve-times` when `O_NOATIME` is unavailable.
+
+### Final report timing and percentiles
+
+The final report separates phases so verification time never depresses the reported copy rate:
+
+- **Copy data elapsed/rate** runs from process statistics initialization until all file workers drain. **Copy
+  complete elapsed/rate** also includes directory finalization and the remote flush immediately before verification.
+  **Payload bytes** are bytes actually moved; **logical bytes** are selected source file sizes. Their difference is
+  reported as sparse savings.
+- **Transfer distribution** values are worker-service metrics measured from task claim through successful
+  finalization. Small dense, large dense (the configured large threshold), and sparse files have separate
+  populations. Latency includes zero-byte files; per-file effective throughput excludes them. A remote PUTFILE
+  sample ends after client send/backpressure completion, while streamed remote files include COMMIT acknowledgement.
+- One-second payload-rate windows begin with the first payload and end when file work drains. They include zero-rate
+  stall windows and are collected even when stdout is redirected; only the live 10-second rolling display requires a
+  terminal.
+- **Verification wall time/rate** measures the checker phase and sampled bytes. Worker seconds are summed service
+  time and can exceed wall time under parallelism. Scope, achieved coverage, hole reads avoided, hash backend, and
+  categorized failures are reported independently.
+
+Percentiles use bounded integer logarithmic histograms: counts, sums, and min/max are exact, while percentile values
+are bucket approximations. Min and max are intentionally shown but are highly sensitive to single-file and
+single-window outliers.
 
 ## Safety
 

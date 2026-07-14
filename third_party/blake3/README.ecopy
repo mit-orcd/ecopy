@@ -1,0 +1,13 @@
+Official BLAKE3 C sources vendored from:
+
+  https://github.com/BLAKE3-team/BLAKE3
+  tag: 1.8.2
+
+The upstream C implementation and LICENSE_CC0 are included unchanged except
+that blake3.h declares ecopy's two compatibility helpers. blake3_wrapper.c is
+project code that supplies the existing one-shot blake3_hash() API and reports
+the runtime-selected backend for diagnostics.
+
+Architecture-specific files are compiled with isolated ISA flags. Runtime
+dispatch remains in upstream blake3_dispatch.c, and blake3_portable.c is always
+linked as the fallback.

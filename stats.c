@@ -8,6 +8,8 @@
 #define _GNU_SOURCE
 #include "stats.h"
 #include "config.h"
+#include "telemetry.h"
+#include "third_party/blake3/blake3.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -23,6 +25,10 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static char g_current_file[PATH_MAX];
 static uint64_t g_current_file_total = 0;
 static int g_current_file_parallel = 0;
+static struct timespec g_rate_window_ts;
+static uint64_t g_rate_window_bytes;
+static int g_rate_window_started;
+static int g_rate_window_finished;
 
 /*
  * Hot per-chunk counters live outside g_stats as lock-free atomics so that
@@ -43,6 +49,8 @@ static _Atomic uint64_t a_writer_data_wait_ns;
 static _Atomic uint64_t a_ready_queue_peak;
 static _Atomic uint64_t a_ready_queue_total;
 static _Atomic uint64_t a_ready_queue_samples;
+static _Atomic int a_first_payload_seen;
+static struct timespec g_first_payload_ts;
 
 static uint64_t hot_load(_Atomic uint64_t *p) {
     return atomic_load_explicit(p, memory_order_relaxed);
@@ -76,8 +84,52 @@ static double diff_sec(const struct timespec *a, const struct timespec *b) {
     return ts_to_sec(a) - ts_to_sec(b);
 }
 
+static uint64_t diff_ns(const struct timespec *a, const struct timespec *b) {
+    int64_t sec = (int64_t)a->tv_sec - (int64_t)b->tv_sec;
+    int64_t nsec = (int64_t)a->tv_nsec - (int64_t)b->tv_nsec;
+    int64_t total = sec * INT64_C(1000000000) + nsec;
+    return total > 0 ? (uint64_t)total : 0;
+}
+
 double stats_bytes_to_gib(uint64_t bytes) {
     return (double)bytes / (1024.0 * 1024.0 * 1024.0);
+}
+
+static void format_bps(uint64_t bps, char *out, size_t out_sz) {
+    double value = (double)bps;
+    const char *unit = "B/s";
+    if (value >= 1024.0) { value /= 1024.0; unit = "KiB/s"; }
+    if (value >= 1024.0) { value /= 1024.0; unit = "MiB/s"; }
+    if (value >= 1024.0) { value /= 1024.0; unit = "GiB/s"; }
+    snprintf(out, out_sz, "%.2f %s", value, unit);
+}
+
+static void format_bytes(uint64_t bytes, char *out, size_t out_sz) {
+    static const char *units[] = {"B", "KiB", "MiB", "GiB", "TiB", "PiB"};
+    double value = (double)bytes;
+    size_t unit = 0;
+    while (value >= 1024.0 && unit + 1 < sizeof(units) / sizeof(units[0])) {
+        value /= 1024.0;
+        unit++;
+    }
+    snprintf(out, out_sz, "%.2f %s", value, units[unit]);
+}
+
+void stats_format_rate(uint64_t bytes, double seconds, char *out, size_t out_sz) {
+    uint64_t bps = 0;
+    if (seconds > 0.0 && bytes > 0) {
+        long double value = (long double)bytes / seconds;
+        bps = value >= (long double)UINT64_MAX ? UINT64_MAX : (uint64_t)value;
+    }
+    format_bps(bps, out, out_sz);
+}
+
+static void format_latency(uint64_t ns, char *out, size_t out_sz) {
+    if (ns < 1000) snprintf(out, out_sz, "%" PRIu64 " ns", ns);
+    else if (ns < 1000000) snprintf(out, out_sz, "%.2f us", (double)ns / 1e3);
+    else if (ns < UINT64_C(1000000000))
+        snprintf(out, out_sz, "%.2f ms", (double)ns / 1e6);
+    else snprintf(out, out_sz, "%.2f s", (double)ns / 1e9);
 }
 
 void stats_init(void) {
@@ -88,6 +140,9 @@ void stats_init(void) {
     g_current_file_total = 0;
     g_current_file_parallel = 0;
     g_speed_index = 0;
+    g_rate_window_started = 0;
+    g_rate_window_finished = 0;
+    g_rate_window_bytes = 0;
     atomic_store_explicit(&a_bytes_copied, 0, memory_order_relaxed);
     atomic_store_explicit(&a_current_file_done, 0, memory_order_relaxed);
     atomic_store_explicit(&a_read_syscalls, 0, memory_order_relaxed);
@@ -101,11 +156,28 @@ void stats_init(void) {
     atomic_store_explicit(&a_ready_queue_peak, 0, memory_order_relaxed);
     atomic_store_explicit(&a_ready_queue_total, 0, memory_order_relaxed);
     atomic_store_explicit(&a_ready_queue_samples, 0, memory_order_relaxed);
+    atomic_store_explicit(&a_first_payload_seen, 0, memory_order_relaxed);
     clock_gettime(CLOCK_MONOTONIC, &g_stats.start_ts);
     pthread_mutex_unlock(&g_lock);
+    telemetry_init();
+}
+
+static void note_first_payload(void) {
+    int expected = 0;
+    if (atomic_compare_exchange_strong_explicit(&a_first_payload_seen, &expected, 1,
+                                                memory_order_acquire,
+                                                memory_order_relaxed)) {
+        clock_gettime(CLOCK_MONOTONIC, &g_first_payload_ts);
+        atomic_store_explicit(&a_first_payload_seen, 2, memory_order_release);
+    } else {
+        while (atomic_load_explicit(&a_first_payload_seen,
+                                    memory_order_acquire) != 2) {
+        }
+    }
 }
 
 void stats_add_bytes(uint64_t bytes) {
+    if (bytes > 0) note_first_payload();
     hot_add(&a_bytes_copied, bytes);
 }
 
@@ -139,6 +211,33 @@ void stats_set_finalize_done(void) {
     pthread_mutex_lock(&g_lock);
     g_stats.finalize_done = 1;
     clock_gettime(CLOCK_MONOTONIC, &g_stats.finalize_done_ts);
+    pthread_mutex_unlock(&g_lock);
+}
+
+void stats_set_copy_complete(void) {
+    pthread_mutex_lock(&g_lock);
+    if (!g_stats.copy_complete) {
+        g_stats.copy_complete = 1;
+        clock_gettime(CLOCK_MONOTONIC, &g_stats.copy_complete_ts);
+    }
+    pthread_mutex_unlock(&g_lock);
+}
+
+void stats_set_verification_started(void) {
+    pthread_mutex_lock(&g_lock);
+    if (!g_stats.verification_started) {
+        g_stats.verification_started = 1;
+        clock_gettime(CLOCK_MONOTONIC, &g_stats.verification_start_ts);
+    }
+    pthread_mutex_unlock(&g_lock);
+}
+
+void stats_set_verification_done(void) {
+    pthread_mutex_lock(&g_lock);
+    if (!g_stats.verification_done) {
+        g_stats.verification_done = 1;
+        clock_gettime(CLOCK_MONOTONIC, &g_stats.verification_done_ts);
+    }
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -223,7 +322,8 @@ void stats_set_verify_runtime(int verify_only, int workers,
 }
 void stats_record_verify(uint64_t bytes, uint64_t scope_bytes, uint64_t blocks,
                          int metadata_checked,
-                         int data_mismatch, int metadata_mismatch, int failed) {
+                         int data_mismatch, int metadata_mismatch,
+                         int expected_zero_mismatch, int io_failure, int failed) {
     pthread_mutex_lock(&g_lock);
     g_stats.verify_objects++;
     g_stats.verify_bytes += bytes;
@@ -232,6 +332,8 @@ void stats_record_verify(uint64_t bytes, uint64_t scope_bytes, uint64_t blocks,
     if (metadata_checked) g_stats.verify_metadata_objects++;
     if (data_mismatch) g_stats.verify_data_mismatches++;
     if (metadata_mismatch) g_stats.verify_metadata_mismatches++;
+    if (expected_zero_mismatch) g_stats.verify_zero_mismatches++;
+    if (io_failure) g_stats.verify_io_failures++;
     if (failed) g_stats.verify_failures++;
     pthread_mutex_unlock(&g_lock);
 }
@@ -243,6 +345,25 @@ void stats_mark_verify_failure(void) {
 void stats_add_verify_ns(uint64_t ns) {
     pthread_mutex_lock(&g_lock);
     g_stats.verify_ns += ns;
+    pthread_mutex_unlock(&g_lock);
+}
+void stats_record_verify_holes(uint64_t blocks, uint64_t bytes) {
+    pthread_mutex_lock(&g_lock);
+    g_stats.verify_hole_blocks += blocks;
+    g_stats.verify_hole_bytes += bytes;
+    g_stats.verify_source_reads_avoided += blocks;
+    pthread_mutex_unlock(&g_lock);
+}
+void stats_record_verify_categories(uint64_t metadata, uint64_t data,
+                                    uint64_t expected_zero, uint64_t io,
+                                    uint64_t malformed) {
+    pthread_mutex_lock(&g_lock);
+    g_stats.verify_metadata_mismatches += metadata;
+    g_stats.verify_data_mismatches += data;
+    g_stats.verify_zero_mismatches += expected_zero;
+    g_stats.verify_io_failures += io;
+    g_stats.verify_malformed_batches += malformed;
+    g_stats.verify_failures += metadata + data + expected_zero + io + malformed;
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -265,6 +386,7 @@ void stats_set_current_file(const char *path, uint64_t total, int parallel) {
 }
 
 void stats_advance_current_file(uint64_t bytes) {
+    if (bytes > 0) note_first_payload();
     hot_add(&a_current_file_done, bytes);
     hot_add(&a_bytes_copied, bytes);
 }
@@ -282,13 +404,30 @@ void stats_clear_current_file(const char *path) {
 
 void stats_record_speed_sample(void) {
     uint64_t bytes_copied = hot_load(&a_bytes_copied);
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
     pthread_mutex_lock(&g_lock);
-    clock_gettime(CLOCK_MONOTONIC, &g_speed_ring[g_speed_index].ts);
+    g_speed_ring[g_speed_index].ts = now;
     g_speed_ring[g_speed_index].bytes_copied = bytes_copied;
     g_speed_ring[g_speed_index].bytes_completed = bytes_copied + g_stats.bytes_skipped;
     g_speed_ring[g_speed_index].files_completed = g_stats.files_copied + g_stats.files_skipped;
     g_speed_ring[g_speed_index].valid = 1;
     g_speed_index = (g_speed_index + 1) % SPEED_SLOTS;
+    if (!g_rate_window_started && bytes_copied > 0) {
+        g_rate_window_started = 1;
+        g_rate_window_ts = g_first_payload_ts;
+        g_rate_window_bytes = 0;
+    } else if (g_rate_window_started && !g_rate_window_finished) {
+        uint64_t elapsed_ns = diff_ns(&now, &g_rate_window_ts);
+        int drained = g_stats.file_work_drained;
+        if (elapsed_ns >= UINT64_C(1000000000) || drained) {
+            telemetry_note_rate_window(bytes_copied - g_rate_window_bytes,
+                                       elapsed_ns);
+            g_rate_window_ts = now;
+            g_rate_window_bytes = bytes_copied;
+            if (drained) g_rate_window_finished = 1;
+        }
+    }
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -491,9 +630,27 @@ void stats_print_final(int verbose) {
     stats_load_hot(&s);
     double sec = s.shutdown_done ? ts_to_sec(&s.shutdown_done_ts) - ts_to_sec(&s.start_ts)
                                  : stats_elapsed_sec();
-    double gib = stats_bytes_to_gib(s.bytes_copied);
-    double avg = sec > 0.0 ? gib / sec : 0.0;
+    transfer_class_summary_t classes[TRANSFER_CLASS_COUNT];
+    transfer_rate_summary_t rolling;
+    char data_rate[32], complete_rate[32], verify_rate[32];
+    char logical[32], payload[32];
+    double data_sec = s.file_work_drained
+                          ? diff_sec(&s.file_work_drained_ts, &s.start_ts) : 0.0;
+    double complete_sec = s.copy_complete
+                              ? diff_sec(&s.copy_complete_ts, &s.start_ts) : 0.0;
+    double verify_wall_sec = s.verification_started && s.verification_done
+                                 ? diff_sec(&s.verification_done_ts,
+                                            &s.verification_start_ts) : 0.0;
+    telemetry_get(classes, &rolling);
+    stats_format_rate(s.bytes_copied, data_sec, data_rate, sizeof(data_rate));
+    stats_format_rate(s.bytes_copied, complete_sec, complete_rate, sizeof(complete_rate));
+    stats_format_rate(s.verify_bytes, verify_wall_sec, verify_rate, sizeof(verify_rate));
     printf("Done.\n");
+    if (!s.verify_only) {
+        format_bytes(s.planned_copy_bytes, logical, sizeof(logical));
+        format_bytes(s.bytes_copied, payload, sizeof(payload));
+        printf("\nCopy\n");
+    }
     printf("Files seen    : %" PRIu64 "\n", s.files_seen);
     if (!s.verify_only) {
         printf("Files copied  : %" PRIu64 "\n", s.files_copied);
@@ -502,37 +659,116 @@ void stats_print_final(int verbose) {
     printf("Dirs seen     : %" PRIu64 "\n", s.dirs_seen);
     if (!s.verify_only) {
         printf("Dirs created  : %" PRIu64 "\n", s.dirs_created);
-        printf("GiB copied    : %.2f\n", gib);
+        printf("Logical bytes : %" PRIu64 " (%s)\n", s.planned_copy_bytes, logical);
+        printf("Payload bytes : %" PRIu64 " (%s)\n", s.bytes_copied, payload);
+        if (s.planned_copy_bytes > s.bytes_copied) {
+            printf("Sparse savings: %" PRIu64 " bytes (%.2f%%)\n",
+                   s.planned_copy_bytes - s.bytes_copied,
+                   100.0 * (double)(s.planned_copy_bytes - s.bytes_copied) /
+                       (double)s.planned_copy_bytes);
+        }
+        printf("Copy data elapsed : %.2f s\n", data_sec);
+        printf("Copy data rate    : %s\n", data_rate);
+        printf("Copy complete sec : %.2f s\n", complete_sec);
+        printf("Copy complete rate: %s\n", complete_rate);
         if (s.bytes_skipped > 0) {
             printf("GiB skipped   : %.2f\n", stats_bytes_to_gib(s.bytes_skipped));
         }
     }
-    printf("Elapsed       : %.2f s\n", sec);
-    if (!s.verify_only) printf("Avg speed     : %.2f GiB/s\n", avg);
     if (s.metadata_warnings > 0) {
         printf("Metadata warnings : %" PRIu64 "\n", s.metadata_warnings);
     }
     if (s.metadata_errors > 0) {
         printf("Metadata errors   : %" PRIu64 "\n", s.metadata_errors);
     }
+    if (!s.verify_only) {
+        printf("\nTransfer distribution (worker service)\n");
+        if (rolling.samples > 0) {
+            char min[32], p10[32], p50[32], p90[32], p99[32], max[32];
+            format_bps(rolling.min_bps, min, sizeof(min));
+            format_bps(rolling.p10_bps, p10, sizeof(p10));
+            format_bps(rolling.p50_bps, p50, sizeof(p50));
+            format_bps(rolling.p90_bps, p90, sizeof(p90));
+            format_bps(rolling.p99_bps, p99, sizeof(p99));
+            format_bps(rolling.max_bps, max, sizeof(max));
+            printf("1s payload rate (%" PRIu64 " windows): min %s, p10 %s, p50 %s, p90 %s, p99 %s, max %s\n",
+                   rolling.samples, min, p10, p50, p90, p99, max);
+        }
+        for (int i = 0; i < TRANSFER_CLASS_COUNT; i++) {
+            transfer_class_summary_t *c = &classes[i];
+            if (c->count == 0) continue;
+            char aggregate[32], l50[24], l95[24], l99[24];
+            char rmin[32], r10[32], r50[32], r90[32], r99[32], rmax[32];
+            stats_format_rate(c->payload_bytes, (double)c->service_ns / 1e9,
+                              aggregate, sizeof(aggregate));
+            format_latency(c->latency_p50_ns, l50, sizeof(l50));
+            format_latency(c->latency_p95_ns, l95, sizeof(l95));
+            format_latency(c->latency_p99_ns, l99, sizeof(l99));
+            printf("%s: files %" PRIu64 ", logical %" PRIu64 ", payload %" PRIu64 ", aggregate %s\n",
+                   telemetry_class_name((transfer_class_t)i), c->count,
+                   c->logical_bytes, c->payload_bytes, aggregate);
+            printf("  latency p50 %s, p95 %s, p99 %s\n", l50, l95, l99);
+            if (c->rate_samples > 0) {
+                format_bps(c->rate_min_bps, rmin, sizeof(rmin));
+                format_bps(c->rate_p10_bps, r10, sizeof(r10));
+                format_bps(c->rate_p50_bps, r50, sizeof(r50));
+                format_bps(c->rate_p90_bps, r90, sizeof(r90));
+                format_bps(c->rate_p99_bps, r99, sizeof(r99));
+                format_bps(c->rate_max_bps, rmax, sizeof(rmax));
+                printf("  throughput min %s, p10 %s, p50 %s, p90 %s, p99 %s, max %s\n",
+                       rmin, r10, r50, r90, r99, rmax);
+            }
+        }
+    }
     if (s.verify_metadata_enabled || s.verify_data_enabled) {
         double achieved = s.verify_scope_bytes
                               ? 100.0 * (double)s.verify_bytes /
                                     (double)s.verify_scope_bytes
                               : 0.0;
+        printf("\nVerification\n");
         printf("Verify objects    : %" PRIu64 "\n", s.verify_objects);
         printf("Verify blocks     : %" PRIu64 "\n", s.verify_blocks);
+        char verify_scope[32], verify_sample[32];
+        format_bytes(s.verify_scope_bytes, verify_scope, sizeof(verify_scope));
+        format_bytes(s.verify_bytes, verify_sample, sizeof(verify_sample));
+        printf("Verify scope      : %" PRIu64 " (%s)\n",
+               s.verify_scope_bytes, verify_scope);
+        printf("Verify sampled    : %" PRIu64 " (%s)\n",
+               s.verify_bytes, verify_sample);
         printf("Verify MiB        : %.2f\n",
                (double)s.verify_bytes / (1024.0 * 1024.0));
         printf("Verify coverage   : %.3f%% requested, %.3f%% achieved\n",
                s.verify_requested_percent, achieved);
         printf("Verify seed       : %" PRIu64 "\n", s.verify_seed);
-        printf("Verify seconds    : %.3f\n", (double)s.verify_ns / 1e9);
+        printf("Verify wall sec   : %.3f\n", verify_wall_sec);
+        printf("Verify worker sec : %.3f\n", (double)s.verify_ns / 1e9);
+        printf("Verify sample rate: %s\n", verify_rate);
+        printf("Verify hash backend: %s\n", blake3_backend());
+        printf("Verify readahead  : %s\n",
+               s.verify_requested_percent >= 100.0 ? "sequential" : "random");
+        if (s.verify_hole_blocks > 0) {
+            printf("Verify hole blocks: %" PRIu64 " (%" PRIu64 " bytes)\n",
+                   s.verify_hole_blocks, s.verify_hole_bytes);
+            printf("Source reads saved: %" PRIu64 "\n",
+                   s.verify_source_reads_avoided);
+        }
         printf("Verify workers    : %d configured, %" PRIu64 " peak active\n",
                s.verify_workers, s.verify_active_peak);
         printf("Verify queue peak : %" PRIu64 "\n", s.verify_queue_peak);
         printf("Verify failures   : %" PRIu64 "\n", s.verify_failures);
+        if (s.verify_metadata_mismatches)
+            printf("  metadata mismatches : %" PRIu64 "\n", s.verify_metadata_mismatches);
+        if (s.verify_data_mismatches)
+            printf("  data mismatches     : %" PRIu64 "\n", s.verify_data_mismatches);
+        if (s.verify_zero_mismatches)
+            printf("  hole-zero mismatches: %" PRIu64 "\n", s.verify_zero_mismatches);
+        if (s.verify_io_failures)
+            printf("  checker I/O failures: %" PRIu64 "\n", s.verify_io_failures);
+        if (s.verify_malformed_batches)
+            printf("  malformed batches   : %" PRIu64 "\n", s.verify_malformed_batches);
     }
+    printf("\nTotal\n");
+    printf("Elapsed       : %.2f s\n", sec);
 
     if (!verbose) {
         return;
