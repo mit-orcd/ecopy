@@ -177,9 +177,8 @@ The final report separates phases so verification time never depresses the repor
 - One-second payload-rate windows begin with the first payload and end when file work drains. They include zero-rate
   stall windows and are collected even when stdout is redirected; only the live 10-second rolling display requires a
   terminal.
-- **Verification wall time/rate** measures the checker phase and sampled bytes. Worker seconds are summed service
-  time and can exceed wall time under parallelism. Scope, achieved coverage, hole reads avoided, hash backend, and
-  categorized failures are reported independently.
+- **Verification wall time/rate** measures the checker phase and sampled bytes. Scope, achieved coverage, hole reads
+  avoided, hash backend, and categorized failures are reported independently.
 
 Percentiles use bounded integer logarithmic histograms: counts, sums, and min/max are exact, while percentile values
 are bucket approximations. Min and max are intentionally shown but are highly sensitive to single-file and

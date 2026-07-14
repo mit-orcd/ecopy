@@ -880,6 +880,28 @@ case_verify_only() {
     else
         fail "remote verify-only/concurrency: $(tr '\n' ' ' <<<"$out")"
     fi
+
+    # A 1 MiB file at 100% coverage fills a complete 256-digest batch.
+    # Data-only verification must ignore metadata, while an enabled metadata
+    # mismatch must be counted once for the object rather than once per batch.
+    chmod 0600 "$rd/sparse"
+    out="$(env "${remote_env[@]}" "$bin" --verify-only --no-preserve-times \
+              --verify-data=100 "$s/sparse" "ssh://localhost${rd}" 2>&1)"; rc=$?
+    if [[ "$rc" -eq 0 ]] && grep -q 'Verify failures   : 0' <<<"$out"; then
+        ok "remote data-only verification ignores metadata mismatches"
+    else
+        fail "remote data-only verification checked metadata: $(tr '\n' ' ' <<<"$out")"
+    fi
+    out="$(env "${remote_env[@]}" "$bin" --verify-only --no-preserve-times \
+              --verify-data=100 --verify-metadata "$s/sparse" \
+              "ssh://localhost${rd}" 2>&1)"; rc=$?
+    if [[ "$rc" -ne 0 ]] &&
+       grep -Eq 'metadata mismatches[[:space:]]*: 1$' <<<"$out"; then
+        ok "remote metadata mismatch is counted once per object"
+    else
+        fail "remote metadata mismatch count was not object-scoped: $(tr '\n' ' ' <<<"$out")"
+    fi
+
     if env "${remote_env[@]}" "$bin" --verify-only "$s" \
          "ssh://localhost${rmissing}" >/dev/null 2>&1 ||
        [[ -e "$rmissing" ]]; then

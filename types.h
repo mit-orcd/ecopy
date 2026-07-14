@@ -76,7 +76,6 @@ typedef struct {
     uint64_t verify_io_failures;
     uint64_t verify_malformed_batches;
     uint64_t verify_failures;
-    uint64_t verify_ns;
     uint64_t verify_queue_peak;
     uint64_t verify_active_peak;
     int verify_workers;

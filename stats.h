@@ -61,7 +61,6 @@ void stats_record_verify(uint64_t bytes, uint64_t scope_bytes, uint64_t blocks,
                          int data_mismatch, int metadata_mismatch,
                          int expected_zero_mismatch, int io_failure, int failed);
 void stats_mark_verify_failure(void);
-void stats_add_verify_ns(uint64_t ns);
 void stats_record_verify_holes(uint64_t blocks, uint64_t bytes);
 void stats_record_verify_categories(uint64_t metadata, uint64_t data,
                                     uint64_t expected_zero, uint64_t io,

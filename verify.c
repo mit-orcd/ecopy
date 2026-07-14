@@ -464,7 +464,7 @@ static int flush_remote_batch(remote_ctx_t *ctx, int check_metadata)
 {
     if (sshx_verify_batch(ctx->item->dst, &ctx->item->src_st,
                           ctx->batch, ctx->count, ctx->item->is_dir,
-                          check_metadata || g_cfg.metadata) != 0) {
+                          check_metadata && g_cfg.metadata) != 0) {
         ctx->failed = 1;
         return -1;
     }
@@ -821,22 +821,10 @@ static int run_pool_list(verify_item_t *list, int remote)
     return failed ? -1 : 0;
 }
 
-static void record_elapsed(const struct timespec *start)
-{
-    struct timespec finish;
-    clock_gettime(CLOCK_MONOTONIC, &finish);
-    int64_t elapsed_ns = (int64_t)(finish.tv_sec - start->tv_sec) *
-                         INT64_C(1000000000) +
-                         (int64_t)finish.tv_nsec - (int64_t)start->tv_nsec;
-    stats_add_verify_ns(elapsed_ns > 0 ? (uint64_t)elapsed_ns : 0);
-}
-
 int verify_run_queued(int remote)
 {
     verify_item_t *item;
     int failed;
-    struct timespec start;
-    clock_gettime(CLOCK_MONOTONIC, &start);
     pthread_mutex_lock(&g_queue_lock);
     item = g_head;
     g_head = g_tail = NULL;
@@ -846,7 +834,6 @@ int verify_run_queued(int remote)
     if (remote && verify_enabled() && sshx_barrier(0) != 0) {
         failed = 1;
     }
-    record_elapsed(&start);
     return failed ? -1 : 0;
 }
 
@@ -938,11 +925,9 @@ int verify_run_tree(const char *src, const char *dst, int remote,
                     int source_is_dir)
 {
     verify_pool_t pool;
-    struct timespec start;
     struct stat st;
     int failed = 0;
     (void)source_is_dir;
-    clock_gettime(CLOCK_MONOTONIC, &start);
     if (lstat(src, &st) != 0) {
         perror(src);
         return -1;
@@ -957,7 +942,6 @@ int verify_run_tree(const char *src, const char *dst, int remote,
     if (remote && sshx_barrier(0) != 0) {
         failed = 1;
     }
-    record_elapsed(&start);
     return failed ? -1 : 0;
 }
 

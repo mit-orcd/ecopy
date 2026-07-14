@@ -342,11 +342,6 @@ void stats_mark_verify_failure(void) {
     g_stats.verify_failures++;
     pthread_mutex_unlock(&g_lock);
 }
-void stats_add_verify_ns(uint64_t ns) {
-    pthread_mutex_lock(&g_lock);
-    g_stats.verify_ns += ns;
-    pthread_mutex_unlock(&g_lock);
-}
 void stats_record_verify_holes(uint64_t blocks, uint64_t bytes) {
     pthread_mutex_lock(&g_lock);
     g_stats.verify_hole_blocks += blocks;
@@ -741,7 +736,6 @@ void stats_print_final(int verbose) {
                s.verify_requested_percent, achieved);
         printf("Verify seed       : %" PRIu64 "\n", s.verify_seed);
         printf("Verify wall sec   : %.3f\n", verify_wall_sec);
-        printf("Verify worker sec : %.3f\n", (double)s.verify_ns / 1e9);
         printf("Verify sample rate: %s\n", verify_rate);
         printf("Verify hash backend: %s\n", blake3_backend());
         printf("Verify readahead  : %s\n",
