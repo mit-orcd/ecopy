@@ -517,43 +517,55 @@ static void dir_cache_destroy(void)
  *     (mode_is_set); directories and re-used temps still pass 0.
  *   - skip futimens entirely when the client asked not to preserve times.
  */
-static void apply_meta(int fd, uint32_t uid, uint32_t gid, uint32_t mode,
-                       int64_t at_s, int64_t at_ns, int64_t mt_s, int64_t mt_ns,
-                       int mode_is_set)
+static int apply_meta(int fd, uint32_t uid, uint32_t gid, uint32_t mode,
+                      int64_t at_s, int64_t at_ns, int64_t mt_s, int64_t mt_ns,
+                      int mode_is_set, const char **failed_op)
 {
+    int first_err = 0;
+    const char *first_op = NULL;
     if ((uid_t)uid != g_euid || (gid_t)gid != g_egid) {
-        (void)fchown(fd, (uid_t)uid, (gid_t)gid);   /* best effort, like local path */
+        if (fchown(fd, (uid_t)uid, (gid_t)gid) != 0) {
+            first_err = errno;
+            first_op = "fchown";
+        }
     }
     if (!mode_is_set) {
-        (void)fchmod(fd, (mode_t)(mode & 07777));
+        if (fchmod(fd, (mode_t)(mode & 07777)) != 0 && first_err == 0) {
+            first_err = errno;
+            first_op = "fchmod";
+        }
     }
     if (g_preserve_times) {
         struct timespec ts[2];
         ts[0].tv_sec = (time_t)at_s; ts[0].tv_nsec = (long)at_ns;
         ts[1].tv_sec = (time_t)mt_s; ts[1].tv_nsec = (long)mt_ns;
-        (void)futimens(fd, ts);
+        if (futimens(fd, ts) != 0 && first_err == 0) {
+            first_err = errno;
+            first_op = "futimens";
+        }
     }
+    if (failed_op) *failed_op = first_op;
+    return first_err == 0 ? 0 : -first_err;
 }
 
-static const char *metadata_mismatch_field(int fd, uint32_t uid, uint32_t gid,
-                                           uint32_t mode,
-                                           int64_t at_s, int64_t at_ns,
-                                           int64_t mt_s, int64_t mt_ns,
-                                           int is_dir)
+static const char *metadata_mismatch_stat(const struct stat *st,
+                                          uint32_t uid, uint32_t gid,
+                                          uint32_t mode,
+                                          int64_t at_s, int64_t at_ns,
+                                          int64_t mt_s, int64_t mt_ns,
+                                          int is_dir, int check_times)
 {
-    struct stat st;
-    if (fstat(fd, &st) != 0) return "stat";
-    if ((!is_dir && !S_ISREG(st.st_mode)) ||
-        (is_dir && !S_ISDIR(st.st_mode))) return "type";
-    if ((st.st_mode & 07777) != (mode_t)(mode & 07777)) return "mode";
-    if (st.st_uid != (uid_t)uid) return "uid";
-    if (st.st_gid != (gid_t)gid) return "gid";
-    if (g_preserve_times &&
-        ((int64_t)st.st_atim.tv_sec != at_s ||
-         (int64_t)st.st_atim.tv_nsec != at_ns)) return "atime";
-    if (g_preserve_times &&
-        ((int64_t)st.st_mtim.tv_sec != mt_s ||
-         (int64_t)st.st_mtim.tv_nsec != mt_ns)) return "mtime";
+    if ((!is_dir && !S_ISREG(st->st_mode)) ||
+        (is_dir && !S_ISDIR(st->st_mode))) return "type";
+    if ((st->st_mode & 07777) != (mode_t)(mode & 07777)) return "mode";
+    if (st->st_uid != (uid_t)uid) return "uid";
+    if (st->st_gid != (gid_t)gid) return "gid";
+    if (check_times &&
+        ((int64_t)st->st_atim.tv_sec != at_s ||
+         (int64_t)st->st_atim.tv_nsec != at_ns)) return "atime";
+    if (check_times &&
+        ((int64_t)st->st_mtim.tv_sec != mt_s ||
+         (int64_t)st->st_mtim.tv_nsec != mt_ns)) return "mtime";
     return NULL;
 }
 
@@ -738,7 +750,10 @@ static int handle_commit(uint64_t id, const uint8_t *payload, uint32_t plen)
         status = -EBADF;
     } else {
         if (fsync(f->fd) != 0) status = -errno;
-        if (status == 0) apply_meta(f->fd, uid, gid, mode, at_s, at_ns, mt_s, mt_ns, 0);
+        if (status == 0) {
+            status = apply_meta(f->fd, uid, gid, mode,
+                                at_s, at_ns, mt_s, mt_ns, 0, NULL);
+        }
         if (close(f->fd) != 0 && status == 0) status = -errno;
         f->fd = -1;
         if (status == 0 && !f->inplace) {
@@ -869,8 +884,20 @@ static void handle_setmeta(const uint8_t *payload, uint32_t plen)
         (mode & (S_ISUID | S_ISGID))) {
         mode_is_set = 0; /* chown may clear special mode bits */
     }
-    apply_meta(fd, uid, gid, mode, at_s, at_ns, mt_s, mt_ns, mode_is_set);
-    close(fd);
+    const char *failed_op = NULL;
+    int status = apply_meta(fd, uid, gid, mode, at_s, at_ns, mt_s, mt_ns,
+                            mode_is_set, &failed_op);
+    if (close(fd) != 0 && status == 0) status = -errno;
+    if (status != 0) {
+        char diagnostic[PATH_MAX];
+        if (failed_op) {
+            snprintf(diagnostic, sizeof(diagnostic), "%.*s (%s)",
+                     PATH_MAX - 32, path, failed_op);
+        } else {
+            snprintf(diagnostic, sizeof(diagnostic), "%s", path);
+        }
+        log_op_error(diagnostic, -status);
+    }
 }
 
 /*
@@ -935,6 +962,7 @@ static void handle_putfile(const uint8_t *payload, uint32_t plen)
     if (fd < 0) { log_op_error(finalp, errno); return; }
 
     int err = 0;
+    const char *failed_op = NULL;
     size_t done = 0;
     while (done < data_len) {
         ssize_t w = write(fd, data + done, data_len - done);
@@ -943,15 +971,25 @@ static void handle_putfile(const uint8_t *payload, uint32_t plen)
         done += (size_t)w;
     }
     if (err == 0) {
-        apply_meta(fd, uid, gid, mode, at_s, at_ns, mt_s, mt_ns, mode_is_set);
+        int status = apply_meta(fd, uid, gid, mode,
+                                at_s, at_ns, mt_s, mt_ns, mode_is_set,
+                                &failed_op);
+        if (status != 0) err = -status;
     }
     if (close(fd) != 0 && err == 0) err = errno;
     if (err == 0 && !inplace) {
         if (rename(tmp_path, finalp) != 0) err = errno;
     }
     if (err != 0) {
+        char diagnostic[PATH_MAX];
         if (!inplace) (void)unlink(tmp_path);
-        log_op_error(finalp, err);
+        if (failed_op) {
+            snprintf(diagnostic, sizeof(diagnostic), "%.*s (%s)",
+                     PATH_MAX - 32, finalp, failed_op);
+        } else {
+            snprintf(diagnostic, sizeof(diagnostic), "%s", finalp);
+        }
+        log_op_error(diagnostic, err);
     }
 }
 
@@ -999,6 +1037,36 @@ static void handle_verify_path(const uint8_t *payload, uint32_t plen)
         (flags & ~15u) != 0 || (is_dir && count != 0) ||
         resolve_path(in, path, sizeof(path)) != 0) {
         log_verify_error(VERIFY_ERR_MALFORMED, in, EINVAL);
+        return;
+    }
+
+    /*
+     * Metadata-only verification needs no file descriptor. On NFS, open()
+     * commonly adds OPEN/ACCESS and lookup revalidation RPCs before fstat().
+     * A single no-following stat is sufficient for directories and for files
+     * when no data samples were requested.
+     */
+    if (count == 0) {
+        struct stat st;
+        if (fstatat(AT_FDCWD, path, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+            log_verify_error(VERIFY_ERR_IO, path, errno);
+            return;
+        }
+        const char *field = NULL;
+        if ((is_dir ? !S_ISDIR(st.st_mode) : !S_ISREG(st.st_mode)) ||
+            (!is_dir && st.st_size != (off_t)expected_size)) {
+            field = "type/size";
+        } else if (check_metadata) {
+            field = metadata_mismatch_stat(&st, uid, gid, mode,
+                                           at_s, at_ns, mt_s, mt_ns, is_dir,
+                                           check_times);
+        }
+        if (field) {
+            char diagnostic[PATH_MAX];
+            snprintf(diagnostic, sizeof(diagnostic), "%.*s (%s)",
+                     PATH_MAX - 32, path, field);
+            log_verify_error(VERIFY_ERR_METADATA, diagnostic, EIO);
+        }
         return;
     }
 
@@ -1088,9 +1156,10 @@ static void handle_verify_path(const uint8_t *payload, uint32_t plen)
         log_verify_error(VERIFY_ERR_MALFORMED, path, EINVAL);
     }
 
-    if (check_metadata) {
-        const char *meta_field = metadata_mismatch_field(
-            fd, uid, gid, mode, at_s, at_ns, mt_s, mt_ns, is_dir);
+    if (check_metadata && !io_bad) {
+        const char *meta_field = metadata_mismatch_stat(
+            &st, uid, gid, mode, at_s, at_ns, mt_s, mt_ns, is_dir,
+            check_times);
         if (meta_field) {
             failed = 1;
             metadata_bad = 1;

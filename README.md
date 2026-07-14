@@ -174,11 +174,14 @@ The final report separates phases so verification time never depresses the repor
   finalization. Small dense, large dense (the configured large threshold), and sparse files have separate
   populations. Latency includes zero-byte files; per-file effective throughput excludes them. A remote PUTFILE
   sample ends after client send/backpressure completion, while streamed remote files include COMMIT acknowledgement.
+  The **summed-service rate** divides class payload by service time summed across workers; it is a worker-equivalent
+  efficiency measure, not wall-clock transfer throughput. The report also prints copied files/s.
 - One-second payload-rate windows begin with the first payload and end when file work drains. They include zero-rate
   stall windows and are collected even when stdout is redirected; only the live 10-second rolling display requires a
   terminal.
-- **Verification wall time/rate** measures the checker phase and sampled bytes. Scope, achieved coverage, hole reads
-  avoided, hash backend, and categorized failures are reported independently.
+- **Verification wall time/rate** measures the checker phase and sampled bytes. Scope, achieved coverage, verified
+  objects/s, the compact pre-phase pending peak, bounded worker-queue peak, hole reads avoided, hash backend, and
+  categorized failures are reported independently.
 
 Percentiles use bounded integer logarithmic histograms: counts, sums, and min/max are exact, while percentile values
 are bucket approximations. Min and max are intentionally shown but are highly sensitive to single-file and

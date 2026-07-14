@@ -35,8 +35,18 @@ typedef struct verify_item {
     struct stat src_st;
     int skipped;
     int is_dir;
+    int arena_owned;
+    int dst_heap;
     struct verify_item *next;
 } verify_item_t;
+
+#define VERIFY_ARENA_CHUNK_SIZE (1024u * 1024u)
+typedef struct verify_arena_chunk {
+    struct verify_arena_chunk *next;
+    size_t used;
+    max_align_t align;
+    unsigned char data[VERIFY_ARENA_CHUNK_SIZE];
+} verify_arena_chunk_t;
 
 typedef struct {
     int metadata;
@@ -50,6 +60,10 @@ typedef struct {
 static verify_config_t g_cfg;
 static verify_item_t *g_head;
 static verify_item_t *g_tail;
+static verify_arena_chunk_t *g_arena_head;
+static verify_arena_chunk_t *g_arena_tail;
+static uint64_t g_pending_count;
+static uint64_t g_pending_peak;
 static pthread_mutex_t g_queue_lock = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic uint64_t g_run_queue_depth;
 static _Atomic uint64_t g_run_active;
@@ -136,20 +150,67 @@ static verify_item_t *make_item(const char *src, const char *dst,
     return item;
 }
 
+static verify_item_t *make_queued_item_locked(const char *src, const char *dst,
+                                              const struct stat *src_st,
+                                              int skipped, int is_dir)
+{
+    size_t src_len = strlen(src) + 1;
+    size_t dst_len = strlen(dst) + 1;
+    size_t align = _Alignof(verify_item_t);
+    size_t item_size = sizeof(verify_item_t) + src_len + dst_len;
+    size_t offset;
+
+    if (item_size > VERIFY_ARENA_CHUNK_SIZE) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    if (!g_arena_tail) {
+        g_arena_tail = calloc(1, sizeof(*g_arena_tail));
+        if (!g_arena_tail) return NULL;
+        g_arena_head = g_arena_tail;
+    }
+    offset = (g_arena_tail->used + align - 1) & ~(align - 1);
+    if (offset + item_size > VERIFY_ARENA_CHUNK_SIZE) {
+        verify_arena_chunk_t *chunk = calloc(1, sizeof(*chunk));
+        if (!chunk) return NULL;
+        g_arena_tail->next = chunk;
+        g_arena_tail = chunk;
+        offset = 0;
+    }
+
+    verify_item_t *item = (verify_item_t *)(void *)(g_arena_tail->data + offset);
+    memset(item, 0, sizeof(*item));
+    item->src = (char *)(item + 1);
+    item->dst = item->src + src_len;
+    memcpy(item->src, src, src_len);
+    memcpy(item->dst, dst, dst_len);
+    item->src_st = *src_st;
+    item->skipped = skipped;
+    item->is_dir = is_dir;
+    item->arena_owned = 1;
+    g_arena_tail->used = offset + item_size;
+    return item;
+}
+
+static void append_queued_item_locked(verify_item_t *item)
+{
+    if (g_tail) g_tail->next = item;
+    else g_head = item;
+    g_tail = item;
+    g_pending_count++;
+    if (g_pending_count > g_pending_peak) g_pending_peak = g_pending_count;
+}
+
 int verify_queue_file(const char *src, const char *dst,
                       const struct stat *src_st, int skipped)
 {
     verify_item_t *item;
     if (!verify_enabled() || (skipped && !g_cfg.include_skipped)) return 0;
-    item = make_item(src, dst, src_st, skipped, 0);
-    if (!item) return -1;
-
     pthread_mutex_lock(&g_queue_lock);
-    if (g_tail) g_tail->next = item;
-    else g_head = item;
-    g_tail = item;
+    item = make_queued_item_locked(src, dst, src_st, skipped, 0);
+    if (item) append_queued_item_locked(item);
     pthread_mutex_unlock(&g_queue_lock);
-    return 0;
+    return item ? 0 : -1;
 }
 
 int verify_queue_directory(const char *src, const char *dst,
@@ -157,14 +218,11 @@ int verify_queue_directory(const char *src, const char *dst,
 {
     verify_item_t *item;
     if (!g_cfg.metadata) return 0;
-    item = make_item(src, dst, src_st, 0, 1);
-    if (!item) return -1;
     pthread_mutex_lock(&g_queue_lock);
-    if (g_tail) g_tail->next = item;
-    else g_head = item;
-    g_tail = item;
+    item = make_queued_item_locked(src, dst, src_st, 0, 1);
+    if (item) append_queued_item_locked(item);
     pthread_mutex_unlock(&g_queue_lock);
-    return 0;
+    return item ? 0 : -1;
 }
 
 int verify_retarget_path(const char *old_dst, const char *new_dst)
@@ -178,8 +236,9 @@ int verify_retarget_path(const char *old_dst, const char *new_dst)
                 rc = -1;
                 break;
             }
-            free(item->dst);
+            if (!item->arena_owned || item->dst_heap) free(item->dst);
             item->dst = replacement;
+            item->dst_heap = 1;
         }
     }
     pthread_mutex_unlock(&g_queue_lock);
@@ -686,9 +745,22 @@ typedef struct {
 static void free_item(verify_item_t *item)
 {
     if (!item) return;
+    if (item->arena_owned) {
+        if (item->dst_heap) free(item->dst);
+        return;
+    }
     free(item->src);
     free(item->dst);
     free(item);
+}
+
+static void free_arena(verify_arena_chunk_t *arena)
+{
+    while (arena) {
+        verify_arena_chunk_t *next = arena->next;
+        free(arena);
+        arena = next;
+    }
 }
 
 static void *verify_pool_worker(void *arg)
@@ -824,13 +896,20 @@ static int run_pool_list(verify_item_t *list, int remote)
 int verify_run_queued(int remote)
 {
     verify_item_t *item;
+    verify_arena_chunk_t *arena;
     int failed;
     pthread_mutex_lock(&g_queue_lock);
     item = g_head;
+    arena = g_arena_head;
     g_head = g_tail = NULL;
+    g_arena_head = g_arena_tail = NULL;
+    stats_set_verify_pending_peak(g_pending_peak);
+    g_pending_count = 0;
+    g_pending_peak = 0;
     pthread_mutex_unlock(&g_queue_lock);
 
     failed = run_pool_list(item, remote) != 0;
+    free_arena(arena);
     if (remote && verify_enabled() && sshx_barrier(0) != 0) {
         failed = 1;
     }
@@ -948,13 +1027,19 @@ int verify_run_tree(const char *src, const char *dst, int remote,
 void verify_queue_clear(void)
 {
     verify_item_t *item;
+    verify_arena_chunk_t *arena;
     pthread_mutex_lock(&g_queue_lock);
     item = g_head;
+    arena = g_arena_head;
     g_head = g_tail = NULL;
+    g_arena_head = g_arena_tail = NULL;
+    g_pending_count = 0;
+    g_pending_peak = 0;
     pthread_mutex_unlock(&g_queue_lock);
     while (item) {
         verify_item_t *next = item->next;
         free_item(item);
         item = next;
     }
+    free_arena(arena);
 }

@@ -320,6 +320,13 @@ void stats_set_verify_runtime(int verify_only, int workers,
     }
     pthread_mutex_unlock(&g_lock);
 }
+void stats_set_verify_pending_peak(uint64_t pending_peak) {
+    pthread_mutex_lock(&g_lock);
+    if (pending_peak > g_stats.verify_pending_peak) {
+        g_stats.verify_pending_peak = pending_peak;
+    }
+    pthread_mutex_unlock(&g_lock);
+}
 void stats_record_verify(uint64_t bytes, uint64_t scope_bytes, uint64_t blocks,
                          int metadata_checked,
                          int data_mismatch, int metadata_mismatch,
@@ -664,6 +671,8 @@ void stats_print_final(int verbose) {
         }
         printf("Copy data elapsed : %.2f s\n", data_sec);
         printf("Copy data rate    : %s\n", data_rate);
+        printf("Copied files rate : %.2f files/s\n",
+               data_sec > 0.0 ? (double)s.files_copied / data_sec : 0.0);
         printf("Copy complete sec : %.2f s\n", complete_sec);
         printf("Copy complete rate: %s\n", complete_rate);
         if (s.bytes_skipped > 0) {
@@ -692,16 +701,17 @@ void stats_print_final(int verbose) {
         for (int i = 0; i < TRANSFER_CLASS_COUNT; i++) {
             transfer_class_summary_t *c = &classes[i];
             if (c->count == 0) continue;
-            char aggregate[32], l50[24], l95[24], l99[24];
+            char service_rate[32], l50[24], l95[24], l99[24];
             char rmin[32], r10[32], r50[32], r90[32], r99[32], rmax[32];
             stats_format_rate(c->payload_bytes, (double)c->service_ns / 1e9,
-                              aggregate, sizeof(aggregate));
+                              service_rate, sizeof(service_rate));
             format_latency(c->latency_p50_ns, l50, sizeof(l50));
             format_latency(c->latency_p95_ns, l95, sizeof(l95));
             format_latency(c->latency_p99_ns, l99, sizeof(l99));
-            printf("%s: files %" PRIu64 ", logical %" PRIu64 ", payload %" PRIu64 ", aggregate %s\n",
+            printf("%s: files %" PRIu64 ", logical %" PRIu64 ", payload %" PRIu64
+                   ", summed-service rate %s\n",
                    telemetry_class_name((transfer_class_t)i), c->count,
-                   c->logical_bytes, c->payload_bytes, aggregate);
+                   c->logical_bytes, c->payload_bytes, service_rate);
             printf("  latency p50 %s, p95 %s, p99 %s\n", l50, l95, l99);
             if (c->rate_samples > 0) {
                 format_bps(c->rate_min_bps, rmin, sizeof(rmin));
@@ -710,7 +720,7 @@ void stats_print_final(int verbose) {
                 format_bps(c->rate_p90_bps, r90, sizeof(r90));
                 format_bps(c->rate_p99_bps, r99, sizeof(r99));
                 format_bps(c->rate_max_bps, rmax, sizeof(rmax));
-                printf("  throughput min %s, p10 %s, p50 %s, p90 %s, p99 %s, max %s\n",
+                printf("  per-file throughput min %s, p10 %s, p50 %s, p90 %s, p99 %s, max %s\n",
                        rmin, r10, r50, r90, r99, rmax);
             }
         }
@@ -736,6 +746,10 @@ void stats_print_final(int verbose) {
                s.verify_requested_percent, achieved);
         printf("Verify seed       : %" PRIu64 "\n", s.verify_seed);
         printf("Verify wall sec   : %.3f\n", verify_wall_sec);
+        printf("Verify object rate: %.2f objects/s\n",
+               verify_wall_sec > 0.0
+                   ? (double)s.verify_objects / verify_wall_sec
+                   : 0.0);
         printf("Verify sample rate: %s\n", verify_rate);
         printf("Verify hash backend: %s\n", blake3_backend());
         printf("Verify readahead  : %s\n",
@@ -748,6 +762,10 @@ void stats_print_final(int verbose) {
         }
         printf("Verify workers    : %d configured, %" PRIu64 " peak active\n",
                s.verify_workers, s.verify_active_peak);
+        if (s.verify_pending_peak > 0) {
+            printf("Verify pending peak: %" PRIu64 "\n",
+                   s.verify_pending_peak);
+        }
         printf("Verify queue peak : %" PRIu64 "\n", s.verify_queue_peak);
         printf("Verify failures   : %" PRIu64 "\n", s.verify_failures);
         if (s.verify_metadata_mismatches)

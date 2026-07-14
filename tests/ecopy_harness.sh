@@ -667,8 +667,11 @@ case_transfer_verification() {
     if [[ "$rc" -eq 0 ]] && grep -q 'Verify failures   : 0' <<<"$out" &&
        grep -q 'Verify seed       : 123' <<<"$out" &&
        grep -q 'Copy data rate' <<<"$out" &&
+       grep -q 'Copied files rate' <<<"$out" &&
        grep -q 'Copy complete rate' <<<"$out" &&
+       grep -q 'Verify object rate' <<<"$out" &&
        grep -q 'Verify sample rate' <<<"$out" &&
+       grep -Eq 'Verify pending peak: [1-9]' <<<"$out" &&
        grep -q 'Verify readahead  : sequential' <<<"$out" &&
        grep -q 'Verify hash backend:' <<<"$out" &&
        ! grep -q 'Avg speed' <<<"$out"; then
@@ -879,6 +882,17 @@ case_verify_only() {
         ok "remote verify-only uses parallel client/server verification"
     else
         fail "remote verify-only/concurrency: $(tr '\n' ' ' <<<"$out")"
+    fi
+
+    chmod 0700 "$rd/sub"
+    out="$(env "${remote_env[@]}" "$bin" --verify-only --no-preserve-times \
+              --verify-metadata "$s/sub" "ssh://localhost${rd}/sub" 2>&1)"; rc=$?
+    if [[ "$rc" -ne 0 ]] &&
+       grep -Eq 'metadata mismatches[[:space:]]*: 1$' <<<"$out" &&
+       grep -q '(mode)' <<<"$out"; then
+        ok "remote metadata-only directory verification detects mode mismatch"
+    else
+        fail "remote directory metadata mismatch was not isolated: $(tr '\n' ' ' <<<"$out")"
     fi
 
     # A 1 MiB file at 100% coverage fills a complete 256-digest batch.
