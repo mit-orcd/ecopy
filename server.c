@@ -73,6 +73,7 @@ static int32_t  g_err_first;         /* negative errno of the first failure */
 static char     g_err_first_path[PATH_MAX];
 static pthread_mutex_t g_err_lock = PTHREAD_MUTEX_INITIALIZER;  /* pool workers log here */
 static _Atomic int g_verify_atime_warned;
+static _Atomic int g_chown_permission_warned;
 static uint64_t g_verify_metadata_mismatches;
 static uint64_t g_verify_data_mismatches;
 static uint64_t g_verify_zero_mismatches;
@@ -516,17 +517,42 @@ static void dir_cache_destroy(void)
  *   - skip fchmod when the caller created the file with the final mode already
  *     (mode_is_set); directories and re-used temps still pass 0.
  *   - skip futimens entirely when the client asked not to preserve times.
+ *
+ * fchown is best effort: an unprivileged peer cannot change ownership on most
+ * filesystems (EPERM/EACCES), exactly as the local copy path tolerates in
+ * fs_util.c. Those are warned once and not treated as hard failures; every
+ * other syscall error is reported so silent metadata loss cannot happen.
  */
+static int chown_permission_errno(int err)
+{
+    return err == EPERM || err == EACCES;
+}
+
 static int apply_meta(int fd, uint32_t uid, uint32_t gid, uint32_t mode,
                       int64_t at_s, int64_t at_ns, int64_t mt_s, int64_t mt_ns,
                       int mode_is_set, const char **failed_op)
 {
     int first_err = 0;
     const char *first_op = NULL;
-    if ((uid_t)uid != g_euid || (gid_t)gid != g_egid) {
-        if (fchown(fd, (uid_t)uid, (gid_t)gid) != 0) {
-            first_err = errno;
-            first_op = "fchown";
+    int force_eperm = getenv("ECOPY_TEST_FORCE_CHOWN_EPERM") != NULL;
+    if (force_eperm || (uid_t)uid != g_euid || (gid_t)gid != g_egid) {
+        int chown_err = 0;
+        if (force_eperm) {
+            chown_err = EPERM;   /* test hook: emulate an unprivileged target */
+        } else if (fchown(fd, (uid_t)uid, (gid_t)gid) != 0) {
+            chown_err = errno;
+        }
+        if (chown_err != 0) {
+            if (chown_permission_errno(chown_err)) {
+                if (atomic_exchange(&g_chown_permission_warned, 1) == 0) {
+                    fprintf(stderr,
+                            "ecopy: remote chown not permitted; continuing "
+                            "without preserving uid/gid ownership\n");
+                }
+            } else {
+                first_err = chown_err;
+                first_op = "fchown";
+            }
         }
     }
     if (!mode_is_set) {

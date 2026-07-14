@@ -730,6 +730,21 @@ case_transfer_verification() {
     else
         fail "remote skipped corruption was not detected: $(tr '\n' ' ' <<<"$out")"
     fi
+
+    # An unprivileged target cannot chown; that must stay best-effort so the copy
+    # still succeeds and verification runs, rather than failing at the barrier.
+    local rce="$work/verify_remote_chown_eperm"
+    out="$(env "${common_env[@]}" "${remote_env[@]}" \
+              ECOPY_TEST_FORCE_CHOWN_EPERM=1 "$bin" \
+              --verify --verify-seed=789 \
+              "$s" "ssh://localhost${rce}" 2>&1)"; rc=$?
+    if [[ "$rc" -eq 0 ]] &&
+       ! grep -q 'remote reported' <<<"$out" &&
+       grep -Eq 'Verify objects[[:space:]]*: [1-9]' <<<"$out"; then
+        ok "remote unprivileged chown is tolerated and verification still runs"
+    else
+        fail "remote chown-eperm tolerance/verify: $(tr '\n' ' ' <<<"$out")"
+    fi
 }
 
 case_verify_only() {
