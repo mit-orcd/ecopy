@@ -356,15 +356,21 @@ void stats_record_verify_holes(uint64_t blocks, uint64_t bytes) {
     g_stats.verify_source_reads_avoided += blocks;
     pthread_mutex_unlock(&g_lock);
 }
+void stats_record_verify_ownership(uint64_t n) {
+    pthread_mutex_lock(&g_lock);
+    g_stats.verify_ownership_unpreserved += n;
+    pthread_mutex_unlock(&g_lock);
+}
 void stats_record_verify_categories(uint64_t metadata, uint64_t data,
                                     uint64_t expected_zero, uint64_t io,
-                                    uint64_t malformed) {
+                                    uint64_t malformed, uint64_t ownership) {
     pthread_mutex_lock(&g_lock);
     g_stats.verify_metadata_mismatches += metadata;
     g_stats.verify_data_mismatches += data;
     g_stats.verify_zero_mismatches += expected_zero;
     g_stats.verify_io_failures += io;
     g_stats.verify_malformed_batches += malformed;
+    g_stats.verify_ownership_unpreserved += ownership;
     g_stats.verify_failures += metadata + data + expected_zero + io + malformed;
     pthread_mutex_unlock(&g_lock);
 }
@@ -767,6 +773,9 @@ void stats_print_final(int verbose) {
                    s.verify_pending_peak);
         }
         printf("Verify queue peak : %" PRIu64 "\n", s.verify_queue_peak);
+        if (s.verify_ownership_unpreserved)
+            printf("Ownership not preserved: %" PRIu64 " (uid/gid, unprivileged; not a failure)\n",
+                   s.verify_ownership_unpreserved);
         printf("Verify failures   : %" PRIu64 "\n", s.verify_failures);
         if (s.verify_metadata_mismatches)
             printf("  metadata mismatches : %" PRIu64 "\n", s.verify_metadata_mismatches);

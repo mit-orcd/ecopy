@@ -250,27 +250,76 @@ static int timestamp_equal(const struct timespec *a, const struct timespec *b)
     return a->tv_sec == b->tv_sec && a->tv_nsec == b->tv_nsec;
 }
 
-int verify_metadata_stat(const struct stat *expected,
-                         const struct stat *actual,
-                         int is_dir,
-                         const char *path)
+int verify_ownership_unpreservable(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        /* Benign race: every thread computes the same value. The test hook lets
+         * the single-user harness exercise the downgrade path deterministically. */
+        cached = (getenv("ECOPY_TEST_FORCE_OWNERSHIP_MISMATCH") != NULL ||
+                  geteuid() != 0) ? 1 : 0;
+    }
+    return cached;
+}
+
+static int force_ownership_mismatch(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+        cached = getenv("ECOPY_TEST_FORCE_OWNERSHIP_MISMATCH") != NULL ? 1 : 0;
+    return cached;
+}
+
+static _Atomic int g_ownership_warned;
+
+/*
+ * Compare source and target metadata. Genuine fields (type/size/mode/times) are
+ * checked first, so a pure uid/gid difference is only classified as ownership
+ * when everything else matches. When ownership cannot be preserved (unprivileged
+ * process) that difference is downgraded to a one-time warning and reported as a
+ * distinct category rather than a failure.
+ */
+verify_meta_class_t verify_metadata_stat(const struct stat *expected,
+                                         const struct stat *actual,
+                                         int is_dir,
+                                         const char *path)
 {
     const char *field = NULL;
     if ((actual->st_mode & S_IFMT) != (expected->st_mode & S_IFMT)) field = "type";
     else if (!is_dir && actual->st_size != expected->st_size) field = "size";
     else if ((actual->st_mode & 07777) != (expected->st_mode & 07777)) field = "mode";
-    else if (actual->st_uid != expected->st_uid) field = "uid";
-    else if (actual->st_gid != expected->st_gid) field = "gid";
     else if (copy_policy_preserve_times() &&
              !timestamp_equal(&actual->st_atim, &expected->st_atim)) field = "atime";
     else if (copy_policy_preserve_times() &&
              !timestamp_equal(&actual->st_mtim, &expected->st_mtim)) field = "mtime";
 
-    if (!field) return 0;
+    if (field) {
+        progress_interrupt();
+        fprintf(stderr, "ecopy: verification metadata mismatch: %s (%s)\n",
+                path, field);
+        return VERIFY_META_MISMATCH;
+    }
+
+    const char *owner_field = NULL;
+    if (actual->st_uid != expected->st_uid) owner_field = "uid";
+    else if (actual->st_gid != expected->st_gid) owner_field = "gid";
+    else if (force_ownership_mismatch()) owner_field = "uid";
+    if (!owner_field) return VERIFY_META_OK;
+
+    if (verify_ownership_unpreservable()) {
+        if (atomic_exchange(&g_ownership_warned, 1) == 0) {
+            progress_interrupt();
+            fprintf(stderr,
+                    "ecopy: verification: source ownership could not be preserved "
+                    "without privilege; reporting uid/gid differences as warnings, "
+                    "not failures\n");
+        }
+        return VERIFY_META_OWNERSHIP;
+    }
     progress_interrupt();
     fprintf(stderr, "ecopy: verification metadata mismatch: %s (%s)\n",
-            path, field);
-    return -1;
+            path, owner_field);
+    return VERIFY_META_MISMATCH;
 }
 
 int verify_metadata_path(const char *path, const struct stat *expected,
@@ -284,9 +333,11 @@ int verify_metadata_path(const char *path, const struct stat *expected,
         stats_record_verify(0, 0, 0, 1, 0, 0, 0, 1, 1);
         return -1;
     }
-    int rc = verify_metadata_stat(expected, &actual, is_dir, path);
-    stats_record_verify(0, 0, 0, 1, 0, rc != 0, 0, 0, rc != 0);
-    return rc;
+    verify_meta_class_t cls = verify_metadata_stat(expected, &actual, is_dir, path);
+    if (cls == VERIFY_META_OWNERSHIP) stats_record_verify_ownership(1);
+    int meta_bad = (cls == VERIFY_META_MISMATCH);
+    stats_record_verify(0, 0, 0, 1, 0, meta_bad, 0, 0, meta_bad);
+    return meta_bad ? -1 : 0;
 }
 
 static ssize_t pread_full(int fd, void *buf, size_t len, off_t off)
@@ -630,13 +681,18 @@ static int verify_local_item(const verify_item_t *item)
             meta_bad = 1;
             failed = 1;
             structural_bad = 1;
-        } else if (verify_metadata_stat(&item->src_st, &actual, item->is_dir,
-                                        item->dst) != 0) {
-            meta_bad = 1;
-            failed = 1;
-            if ((actual.st_mode & S_IFMT) != (item->src_st.st_mode & S_IFMT) ||
-                (!item->is_dir && actual.st_size != item->src_st.st_size)) {
-                structural_bad = 1;
+        } else {
+            verify_meta_class_t cls = verify_metadata_stat(
+                &item->src_st, &actual, item->is_dir, item->dst);
+            if (cls == VERIFY_META_MISMATCH) {
+                meta_bad = 1;
+                failed = 1;
+                if ((actual.st_mode & S_IFMT) != (item->src_st.st_mode & S_IFMT) ||
+                    (!item->is_dir && actual.st_size != item->src_st.st_size)) {
+                    structural_bad = 1;
+                }
+            } else if (cls == VERIFY_META_OWNERSHIP) {
+                stats_record_verify_ownership(1);
             }
         }
     } else {

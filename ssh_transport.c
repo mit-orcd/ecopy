@@ -63,7 +63,7 @@ typedef struct {
     _Atomic uint64_t ops_since_barrier;  /* fire-and-forget ops awaiting a drain */
     uint64_t barrier_ops;                /* periodic-barrier threshold */
     int remote_failed;                   /* a barrier reported remote errors */
-    uint64_t verify_counts[5];           /* cumulative server checker counters */
+    uint64_t verify_counts[6];           /* cumulative server checker counters */
     pthread_mutex_t barrier_lock;        /* only one periodic barrier in flight */
 
     char remote_root[PATH_MAX];
@@ -876,13 +876,13 @@ int sshx_barrier(int flush)
     uint32_t err_count = pdec_u32(&d);
     char first[PATH_MAX];
     if (pdec_str(&d, first, sizeof(first)) != 0) first[0] = '\0';
-    uint64_t verify_counts[5] = {0};
-    for (size_t i = 0; i < 5 && !d.error; i++) {
+    uint64_t verify_counts[6] = {0};
+    for (size_t i = 0; i < 6 && !d.error; i++) {
         verify_counts[i] = pdec_u64(&d);
     }
-    uint64_t delta[5] = {0};
+    uint64_t delta[6] = {0};
     if (!d.error) {
-        for (size_t i = 0; i < 5; i++) {
+        for (size_t i = 0; i < 6; i++) {
             delta[i] = verify_counts[i] >= g_conn.verify_counts[i]
                            ? verify_counts[i] - g_conn.verify_counts[i] : 0;
             g_conn.verify_counts[i] = verify_counts[i];
@@ -891,7 +891,7 @@ int sshx_barrier(int flush)
     pending_remove(p);
 
     stats_record_verify_categories(delta[0], delta[1], delta[2],
-                                   delta[3], delta[4]);
+                                   delta[3], delta[4], delta[5]);
 
     if (err_count > 0) {
         if (!g_conn.remote_failed) {

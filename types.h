@@ -75,6 +75,7 @@ typedef struct {
     uint64_t verify_zero_mismatches;
     uint64_t verify_io_failures;
     uint64_t verify_malformed_batches;
+    uint64_t verify_ownership_unpreserved;
     uint64_t verify_failures;
     uint64_t verify_pending_peak;
     uint64_t verify_queue_peak;

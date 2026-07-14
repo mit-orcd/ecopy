@@ -126,8 +126,12 @@ Verification is opt-in, so ordinary copies pay no extra opens, reads, hashing, a
 
 - `--verify-metadata` checks object type, regular-file size, permission and special bits, numeric UID/GID, and
   atime/mtime when time preservation is enabled. It does not check metadata ecopy does not copy (ctime/birth time,
-  ACLs, xattrs, labels, or capabilities). An ownership change that was not permitted therefore becomes a hard
-  verification failure.
+  ACLs, xattrs, labels, or capabilities).
+- Ownership that could not be preserved is not a failure. An unprivileged process cannot change a file's owner
+  uid, so when the only metadata difference is UID/GID and the copy ran unprivileged, ecopy skips the doomed
+  `chown` during copy, warns once, and reports the count on a separate `Ownership not preserved` line rather than
+  counting it under `Verify failures` (so such a run still exits 0). Genuine mode/size/time mismatches, and any
+  UID/GID mismatch when running privileged, remain hard failures.
 - `--verify-data[=PERCENT]` samples aligned logical 4 KiB blocks. The first and final block are always checked,
   including a short final block; empty files receive size/metadata checks only. The percentage sets the total target
   block count including those endpoints, so small files can have higher achieved coverage than requested.
@@ -200,9 +204,11 @@ created by this invocation uses the faster non-atomic final-name path.
 - **Small files** use a simple copy path. With buffered I/O they can also use streaming `posix_fadvise()` hints and
   opportunistic `copy_file_range()`. Local/NFS and SSH traversal share 512-entry stat/queue batches; a fresh target
   skips destination existence stats, while an incremental target keeps `size + mtime` skip checks.
-- **Large files** (size > `DIRECT_COPY_LARGE_THRESHOLD_MB`, default 128) run a bounded reader→queue→writer pipeline
+- **Large files** (size > `DIRECT_COPY_LARGE_THRESHOLD_MB`, default 10) run a bounded reader→queue→writer pipeline
   with preallocated aligned chunk buffers. The destination is preallocated up front with `fallocate()` (falling back
-  to `ftruncate()`), which keeps block allocation off the write path and avoids late-run throughput collapse.
+  to `ftruncate()`), which keeps block allocation off the write path and avoids late-run throughput collapse. Keep
+  this well below your typical medium-file size: files under the threshold use the many-way small-file pool, where a
+  large number of concurrent medium files thrash a bandwidth-limited target.
 - **Sparse files** are routed to a hole-skipping path regardless of logical size: data regions are found with
   `lseek(SEEK_DATA/SEEK_HOLE)`, only data is copied, and the destination is `ftruncate()`d to the exact source size.
 
@@ -217,7 +223,7 @@ Best settings are workload- and environment-dependent. Key knobs (defaults in pa
 | `DIRECT_COPY_LARGE_READERS` / `DIRECT_COPY_LARGE_WRITERS` | 4 / 2 | Threads per active large file |
 | `DIRECT_COPY_LARGE_FILE_INFLIGHT` | 16 | Chunk buffers in flight per large file |
 | `DIRECT_COPY_CHUNK_MB` | 1 | Aligned bulk-transfer chunk size (1–4096) |
-| `DIRECT_COPY_LARGE_THRESHOLD_MB` | 128 | Size at which a file enters the large-file pipeline |
+| `DIRECT_COPY_LARGE_THRESHOLD_MB` | 10 | Size at which a file enters the large-file pipeline |
 | `DIRECT_COPY_TRAVERSAL_WORKERS` | 8 | Parallel directory-walker threads |
 | `DIRECT_COPY_MAX_QUEUED_FILES` | 262144 | Backpressure cap on queued file tasks |
 | `DIRECT_COPY_SMALL_INPLACE` | 0 | Force final-name writes even on existing targets (fresh trees do this automatically; not crash-atomic) |

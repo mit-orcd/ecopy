@@ -63,9 +63,16 @@ void stats_record_verify(uint64_t bytes, uint64_t scope_bytes, uint64_t blocks,
                          int expected_zero_mismatch, int io_failure, int failed);
 void stats_mark_verify_failure(void);
 void stats_record_verify_holes(uint64_t blocks, uint64_t bytes);
+/*
+ * Ownership differences (uid/gid) that could not have been preserved without
+ * privilege. These are reported separately and never counted as verify
+ * failures, so an unprivileged copy does not exit nonzero merely because it
+ * could not chown the destination.
+ */
+void stats_record_verify_ownership(uint64_t n);
 void stats_record_verify_categories(uint64_t metadata, uint64_t data,
                                     uint64_t expected_zero, uint64_t io,
-                                    uint64_t malformed);
+                                    uint64_t malformed, uint64_t ownership);
 
 void stats_set_current_file(const char *path, uint64_t total, int parallel);
 void stats_advance_current_file(uint64_t bytes);

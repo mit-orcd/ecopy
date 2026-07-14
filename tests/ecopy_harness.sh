@@ -690,6 +690,21 @@ case_transfer_verification() {
         fail "endpoint-only verification: $(tr '\n' ' ' <<<"$out")"
     fi
 
+    # Ownership that an unprivileged copy could not preserve must be reported as a
+    # warning category, not a failure, so verification still exits 0.
+    local do="$work/verify_ownership_dst"
+    out="$(env "${common_env[@]}" DIRECT_COPY_DISABLE_DIRECT_IO=1 \
+              ECOPY_TEST_FORCE_OWNERSHIP_MISMATCH=1 \
+              "$bin" --verify-data=0 --verify-metadata --verify-seed=123 \
+              "$s" "$do" 2>&1)"; rc=$?
+    if [[ "$rc" -eq 0 ]] &&
+       grep -Eq 'Ownership not preserved: [1-9]' <<<"$out" &&
+       grep -q 'Verify failures   : 0' <<<"$out"; then
+        ok "local unpreservable ownership is a warning, not a failure"
+    else
+        fail "local ownership-unpreservable classification: $(tr '\n' ' ' <<<"$out")"
+    fi
+
     # Keep size+mtime equal so traversal skips the corrupted destination; the
     # optional skipped-file checker must still catch the middle-block change.
     printf X | dd of="$d/sub/data.bin" bs=1 seek=8192 conv=notrunc status=none
@@ -744,6 +759,22 @@ case_transfer_verification() {
         ok "remote unprivileged chown is tolerated and verification still runs"
     else
         fail "remote chown-eperm tolerance/verify: $(tr '\n' ' ' <<<"$out")"
+    fi
+
+    # The server classifies unpreservable ownership as a warning category, so a
+    # remote --verify-metadata run does not fail merely on uid/gid differences.
+    local roe="$work/verify_remote_ownership"
+    out="$(env "${common_env[@]}" "${remote_env[@]}" \
+              ECOPY_TEST_FORCE_OWNERSHIP_MISMATCH=1 "$bin" \
+              --verify-data=0 --verify-metadata --verify-seed=789 \
+              "$s" "ssh://localhost${roe}" 2>&1)"; rc=$?
+    if [[ "$rc" -eq 0 ]] &&
+       ! grep -q 'remote reported' <<<"$out" &&
+       grep -Eq 'Ownership not preserved: [1-9]' <<<"$out" &&
+       grep -q 'Verify failures   : 0' <<<"$out"; then
+        ok "remote unpreservable ownership is a warning, not a failure"
+    else
+        fail "remote ownership-unpreservable classification: $(tr '\n' ' ' <<<"$out")"
     fi
 }
 

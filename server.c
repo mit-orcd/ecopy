@@ -79,6 +79,7 @@ static uint64_t g_verify_data_mismatches;
 static uint64_t g_verify_zero_mismatches;
 static uint64_t g_verify_io_failures;
 static uint64_t g_verify_malformed_batches;
+static uint64_t g_verify_ownership_unpreserved;
 
 static void log_op_error(const char *path, int err)
 {
@@ -115,6 +116,18 @@ static void log_verify_error(verify_error_kind_t kind, const char *path, int err
                  path ? path : "");
     }
     g_err_count++;
+    pthread_mutex_unlock(&g_err_lock);
+}
+
+/*
+ * A uid/gid difference this unprivileged server could not have preserved. It is
+ * counted separately and, unlike log_verify_error, does NOT bump g_err_count,
+ * so it never turns the barrier (and thus the run) into a failure.
+ */
+static void note_verify_ownership_unpreserved(void)
+{
+    pthread_mutex_lock(&g_err_lock);
+    g_verify_ownership_unpreserved++;
     pthread_mutex_unlock(&g_err_lock);
 }
 
@@ -581,18 +594,38 @@ static const char *metadata_mismatch_stat(const struct stat *st,
                                           int64_t mt_s, int64_t mt_ns,
                                           int is_dir, int check_times)
 {
+    /*
+     * Check genuine fields (type/mode/times) before ownership so a pure uid/gid
+     * difference is only reported when everything else matches; that lets the
+     * caller safely downgrade an unpreservable-ownership mismatch to a warning.
+     */
     if ((!is_dir && !S_ISREG(st->st_mode)) ||
         (is_dir && !S_ISDIR(st->st_mode))) return "type";
     if ((st->st_mode & 07777) != (mode_t)(mode & 07777)) return "mode";
-    if (st->st_uid != (uid_t)uid) return "uid";
-    if (st->st_gid != (gid_t)gid) return "gid";
     if (check_times &&
         ((int64_t)st->st_atim.tv_sec != at_s ||
          (int64_t)st->st_atim.tv_nsec != at_ns)) return "atime";
     if (check_times &&
         ((int64_t)st->st_mtim.tv_sec != mt_s ||
          (int64_t)st->st_mtim.tv_nsec != mt_ns)) return "mtime";
+    if (st->st_uid != (uid_t)uid) return "uid";
+    if (st->st_gid != (gid_t)gid) return "gid";
+    if (getenv("ECOPY_TEST_FORCE_OWNERSHIP_MISMATCH")) return "uid";
     return NULL;
+}
+
+/*
+ * True when the only metadata difference is ownership (uid/gid) that this
+ * server, running unprivileged, could never have preserved. Such differences
+ * are reported as a warning category, not a failure.
+ */
+static int metadata_ownership_unpreservable(const char *field)
+{
+    if (!field) return 0;
+    int unprivileged = (g_euid != 0) ||
+                       (getenv("ECOPY_TEST_FORCE_OWNERSHIP_MISMATCH") != NULL);
+    return unprivileged &&
+           (strcmp(field, "uid") == 0 || strcmp(field, "gid") == 0);
 }
 
 /* -------------------- message handlers -------------------- */
@@ -1087,7 +1120,9 @@ static void handle_verify_path(const uint8_t *payload, uint32_t plen)
                                            at_s, at_ns, mt_s, mt_ns, is_dir,
                                            check_times);
         }
-        if (field) {
+        if (field && metadata_ownership_unpreservable(field)) {
+            note_verify_ownership_unpreserved();
+        } else if (field) {
             char diagnostic[PATH_MAX];
             snprintf(diagnostic, sizeof(diagnostic), "%.*s (%s)",
                      PATH_MAX - 32, path, field);
@@ -1186,7 +1221,9 @@ static void handle_verify_path(const uint8_t *payload, uint32_t plen)
         const char *meta_field = metadata_mismatch_stat(
             &st, uid, gid, mode, at_s, at_ns, mt_s, mt_ns, is_dir,
             check_times);
-        if (meta_field) {
+        if (meta_field && metadata_ownership_unpreservable(meta_field)) {
+            note_verify_ownership_unpreserved();
+        } else if (meta_field) {
             failed = 1;
             metadata_bad = 1;
             if (!field) field = meta_field;
@@ -1225,7 +1262,7 @@ static int handle_barrier(uint64_t id, const uint8_t *payload, uint32_t plen)
         sync();
     }
 
-    uint8_t buf[PATH_MAX + 80];
+    uint8_t buf[PATH_MAX + 96];
     penc_t e; penc_init(&e, buf, sizeof(buf));
     penc_u32(&e, (uint32_t)(g_err_count ? g_err_first : 0));
     penc_u32(&e, (uint32_t)(g_err_count > 0xffffffffULL ? 0xffffffffU : g_err_count));
@@ -1235,6 +1272,7 @@ static int handle_barrier(uint64_t id, const uint8_t *payload, uint32_t plen)
     penc_u64(&e, g_verify_zero_mismatches);
     penc_u64(&e, g_verify_io_failures);
     penc_u64(&e, g_verify_malformed_batches);
+    penc_u64(&e, g_verify_ownership_unpreserved);
     return frame_write(STDOUT_FILENO, MSG_STATUS, id, buf, (uint32_t)e.len);
 }
 

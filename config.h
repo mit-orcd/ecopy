@@ -12,7 +12,15 @@
 
 #define ALIGNMENT 4096
 #define CHUNK_SIZE ((off_t)(1ULL * 1024ULL * 1024ULL))
-#define LARGE_FILE_THRESHOLD_MB 128
+/*
+ * Files larger than this use the chunked large-file pipeline (bounded
+ * concurrency, big sequential I/O); smaller files go to the many-way small
+ * pool. Historically this was 10*CHUNK_SIZE (10 MiB); keep that default so the
+ * 10-128 MiB band is not stranded in the 32-way small pool where concurrent
+ * medium files thrash a bandwidth-limited target. Override with
+ * DIRECT_COPY_LARGE_THRESHOLD_MB.
+ */
+#define LARGE_FILE_THRESHOLD_MB 10
 
 #define MAX_WORKER_SLOTS 256
 #define SMALL_WORKER_SLOTS 32

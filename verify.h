@@ -47,10 +47,25 @@ int verify_worker_count(void);
 uint64_t verify_queue_depth(void);
 uint64_t verify_active_count(void);
 
-int verify_metadata_stat(const struct stat *expected,
-                         const struct stat *actual,
-                         int is_dir,
-                         const char *path);
+typedef enum {
+    VERIFY_META_OK = 0,        /* source and target metadata match */
+    VERIFY_META_MISMATCH = 1,  /* genuine mismatch: type/size/mode/times, or
+                                  ownership while privileged */
+    VERIFY_META_OWNERSHIP = 2  /* only uid/gid differ and this process cannot
+                                  chown; a warning, never a failure */
+} verify_meta_class_t;
+
+/*
+ * True when the running process cannot change file ownership, so a uid/gid
+ * difference could never have been preserved and must not be treated as a
+ * verification failure.
+ */
+int verify_ownership_unpreservable(void);
+
+verify_meta_class_t verify_metadata_stat(const struct stat *expected,
+                                         const struct stat *actual,
+                                         int is_dir,
+                                         const char *path);
 int verify_metadata_path(const char *path, const struct stat *expected,
                          int is_dir);
 

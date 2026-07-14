@@ -127,6 +127,34 @@ static int owner_matches_self(const struct stat *st)
     return st->st_uid == g_self_uid && st->st_gid == g_self_gid;
 }
 
+/*
+ * True when a chown to the source owner is guaranteed to fail: an unprivileged
+ * process (euid != 0) can never change a file's owner uid, so re-chowning a file
+ * we just created (owned by g_self_uid) to a different uid always returns EPERM.
+ * Detecting this up front lets us skip the doomed SETATTR round-trip, which on
+ * NFS is a synchronous RPC per object and, over a large tree, a dominant cost.
+ * A differing gid alone (uid == ours) may still succeed if we belong to the
+ * group, so we only short-circuit the unchangeable-uid case.
+ */
+static int chown_uid_unpreservable(const struct stat *st)
+{
+    pthread_once(&g_self_id_once, init_self_ids);
+    return g_self_uid != 0 && st->st_uid != g_self_uid;
+}
+
+static void note_chown_not_preserved(void)
+{
+    stats_inc_metadata_warning();
+    pthread_mutex_lock(&g_warning_lock);
+    if (!g_warned_chown_permission) {
+        progress_interrupt();
+        fprintf(stderr,
+                "Warning: chown not permitted; continuing without preserving uid/gid ownership.\n");
+        g_warned_chown_permission = 1;
+    }
+    pthread_mutex_unlock(&g_warning_lock);
+}
+
 static int open_existing_regular_for_chmod(const char *path) {
     int fd = open(path, O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0 && errno == EACCES) {
@@ -929,26 +957,22 @@ static int preserve_fd_metadata_impl(int fd,
                                      int known_mode) {
     struct timespec ts[2];
 
-    if (!owner_matches_self(src_st) &&
-        fchown(fd, src_st->st_uid, src_st->st_gid) != 0) {
-        if (chown_permission_errno(errno)) {
-            stats_inc_metadata_warning();
-            pthread_mutex_lock(&g_warning_lock);
-            if (!g_warned_chown_permission) {
+    if (!owner_matches_self(src_st)) {
+        if (chown_uid_unpreservable(src_st)) {
+            /* Skip the doomed SETATTR entirely; it would only return EPERM. */
+            note_chown_not_preserved();
+        } else if (fchown(fd, src_st->st_uid, src_st->st_gid) != 0) {
+            if (chown_permission_errno(errno)) {
+                note_chown_not_preserved();
+            } else {
                 progress_interrupt();
-                fprintf(stderr,
-                        "Warning: chown not permitted; continuing without preserving uid/gid ownership.\n");
-                g_warned_chown_permission = 1;
+                if (path_for_warning && *path_for_warning) {
+                    fprintf(stderr, "%s: ", path_for_warning);
+                }
+                perror("fchown");
+                stats_inc_metadata_error();
+                return -1;
             }
-            pthread_mutex_unlock(&g_warning_lock);
-        } else {
-            progress_interrupt();
-            if (path_for_warning && *path_for_warning) {
-                fprintf(stderr, "%s: ", path_for_warning);
-            }
-            perror("fchown");
-            stats_inc_metadata_error();
-            return -1;
         }
     }
 

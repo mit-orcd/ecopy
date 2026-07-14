@@ -181,7 +181,7 @@ static void test_barrier_verify_summary(void)
     penc_u32(&e, (uint32_t)-5);
     penc_u32(&e, 15);
     penc_str(&e, "/dst/bad");
-    for (uint64_t i = 1; i <= 5; i++) penc_u64(&e, i);
+    for (uint64_t i = 1; i <= 6; i++) penc_u64(&e, i);
     CHECK(!e.overflow, "extended barrier summary fits");
 
     pdec_t d; pdec_init(&d, buf, e.len);
@@ -190,7 +190,7 @@ static void test_barrier_verify_summary(void)
           "barrier status/count roundtrip");
     CHECK(pdec_str(&d, path, sizeof(path)) == 0 &&
           strcmp(path, "/dst/bad") == 0, "barrier first diagnostic roundtrip");
-    for (uint64_t i = 1; i <= 5; i++) {
+    for (uint64_t i = 1; i <= 6; i++) {
         CHECK(pdec_u64(&d) == i, "barrier category counter roundtrip");
     }
     CHECK(!d.error && d.off == d.len, "barrier summary fully consumed");
