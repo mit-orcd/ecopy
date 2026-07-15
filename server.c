@@ -569,6 +569,20 @@ static int chown_permission_errno(int err)
     return err == EPERM || err == EACCES;
 }
 
+/*
+ * True when a chown to the requested uid is guaranteed to fail: an unprivileged
+ * peer (euid != 0) can never change a file's owner uid, so re-chowning an object
+ * we just created (owned by g_euid) to a foreign uid always returns EPERM. On
+ * NFS each such SETATTR is a synchronous RPC, and profiling shows it dominates
+ * large metadata-heavy trees, so we skip the doomed call up front. A differing
+ * gid alone (uid == ours) may still succeed if we belong to the group, so only
+ * the unchangeable-uid case is short-circuited. Mirrors fs_util.c's local path.
+ */
+static int chown_uid_doomed(uint32_t uid)
+{
+    return g_euid != 0 && (uid_t)uid != g_euid;
+}
+
 static int apply_meta(int fd, uint32_t uid, uint32_t gid, uint32_t mode,
                       int64_t at_s, int64_t at_ns, int64_t mt_s, int64_t mt_ns,
                       int mode_is_set, const char **failed_op)
@@ -580,6 +594,8 @@ static int apply_meta(int fd, uint32_t uid, uint32_t gid, uint32_t mode,
         int chown_err = 0;
         if (force_eperm) {
             chown_err = EPERM;   /* test hook: emulate an unprivileged target */
+        } else if (chown_uid_doomed(uid)) {
+            chown_err = EPERM;   /* skip the guaranteed-EPERM SETATTR RPC */
         } else if (fchown(fd, (uid_t)uid, (gid_t)gid) != 0) {
             chown_err = errno;
         }
@@ -1476,7 +1492,14 @@ static void handle_symlink(const uint8_t *payload, uint32_t plen)
         return;
     }
     if ((uid_t)uid != g_euid || (gid_t)gid != g_egid) {
-        if (lchown(tmp, (uid_t)uid, (gid_t)gid) != 0) {
+        if (chown_uid_doomed(uid)) {
+            /* Guaranteed EPERM for an unprivileged peer: skip the SETATTR RPC. */
+            if (atomic_exchange(&g_chown_permission_warned, 1) == 0) {
+                fprintf(stderr,
+                        "ecopy: remote chown not permitted; continuing "
+                        "without preserving uid/gid ownership\n");
+            }
+        } else if (lchown(tmp, (uid_t)uid, (gid_t)gid) != 0) {
             if (chown_permission_errno(errno)) {
                 if (atomic_exchange(&g_chown_permission_warned, 1) == 0) {
                     fprintf(stderr,
