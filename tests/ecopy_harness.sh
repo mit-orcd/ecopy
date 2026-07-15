@@ -922,6 +922,67 @@ case_transfer_verification() {
     fi
 }
 
+# A large-logical, small-data sparse file must be verified in proportion to its
+# allocated data, not its logical size: coverage scope tracks the real bytes,
+# holes are never sampled (no hole digests over SSH), and corruption inside a
+# data island is still caught at full coverage.
+case_verify_sparse_data_domain() {
+    case_begin "verify-sparse-data-domain"
+    local s="$work/sparse_dd_src" d="$work/sparse_dd_dst"
+    local out rc scope
+    mkdir -p "$s"
+    # 256 MiB logical, ~6 MiB of real data in three aligned islands.
+    truncate -s 256M "$s/big.sparse"
+    dd if=/dev/urandom of="$s/big.sparse" bs=1M count=2 seek=0   conv=notrunc status=none
+    dd if=/dev/urandom of="$s/big.sparse" bs=1M count=2 seek=64  conv=notrunc status=none
+    dd if=/dev/urandom of="$s/big.sparse" bs=1M count=2 seek=192 conv=notrunc status=none
+    cp -a "$s" "$d"
+    find "$s" "$d" -exec touch -a -m -d @1700000000 {} +
+
+    out="$("$bin" --verify-only --verify-data=1 --verify-seed=101 "$s" "$d" 2>&1)"; rc=$?
+    scope="$(grep -E 'Verify scope' <<<"$out" | grep -oE '[0-9]+' | head -1)"
+    # Logical is 256 MiB (268435456); allocated is ~6 MiB. Scope must track data,
+    # so it stays far below 32 MiB, and holes must not be reported.
+    if [[ "$rc" -eq 0 ]] &&
+       grep -q 'Verify failures   : 0' <<<"$out" &&
+       ! grep -q 'Verify hole blocks:' <<<"$out" &&
+       [[ -n "$scope" && "$scope" -gt 0 && "$scope" -lt 33554432 ]]; then
+        ok "local sparse verify scope tracks allocated data ($scope bytes, logical 256 MiB)"
+    else
+        fail "local sparse data-domain scope: $(tr '\n' ' ' <<<"$out")"
+    fi
+
+    # Corruption inside a data island is caught at full (data-domain) coverage.
+    printf X | dd of="$d/big.sparse" bs=1 seek=$((64 * 1024 * 1024 + 4096)) \
+        conv=notrunc status=none
+    touch -a -m -d @1700000000 "$s/big.sparse" "$d/big.sparse"
+    out="$("$bin" --verify-only --verify-data=100 --verify-seed=101 "$s" "$d" 2>&1)"; rc=$?
+    if [[ "$rc" -ne 0 ]] && grep -q 'verification data mismatch' <<<"$out"; then
+        ok "local sparse data-island corruption is detected at 100%"
+    else
+        fail "local sparse corruption detection: $(tr '\n' ' ' <<<"$out")"
+    fi
+
+    # Remote path: clean verify, scope tracks allocated data, no hole digests.
+    local rd="$work/sparse_dd_remote"
+    local -a remote_env=(DIRECT_COPY_LARGE_THRESHOLD_MB=1 ECOPY_REMOTE_CMD="$bin")
+    if [[ "${ECOPY_HARNESS_REAL_SSH:-0}" != "1" ]]; then
+        remote_env+=(ECOPY_SSH="$repo_root/tests/fake_ssh.sh")
+    fi
+    out="$(env "${common_env[@]}" "${remote_env[@]}" "$bin" \
+              --verify --verify-data=1 --verify-seed=101 \
+              "$s" "ssh://localhost${rd}" 2>&1)"; rc=$?
+    scope="$(grep -E 'Verify scope' <<<"$out" | grep -oE '[0-9]+' | head -1)"
+    if [[ "$rc" -eq 0 ]] &&
+       grep -q 'Verify failures   : 0' <<<"$out" &&
+       ! grep -q 'Verify hole blocks:' <<<"$out" &&
+       [[ -n "$scope" && "$scope" -gt 0 && "$scope" -lt 33554432 ]]; then
+        ok "remote sparse verify scope tracks allocated data, no hole digests"
+    else
+        fail "remote sparse data-domain: $(tr '\n' ' ' <<<"$out")"
+    fi
+}
+
 case_verify_only() {
     case_begin "verify-only"
     local s="$work/verify_only_src" d="$work/verify_only_dst"
@@ -954,10 +1015,12 @@ case_verify_only() {
     content_after="$(for rel in "${verify_paths[@]}"; do
         [[ -f "$d/$rel" ]] && sha256sum "$d/$rel"
     done)"
+    # Data-domain sampling never selects holes, so a sparse tree reports no hole
+    # blocks (the source's leading/trailing holes are simply outside the domain).
     if [[ "$rc" -eq 0 ]] &&
        grep -q 'Verify failures   : 0' <<<"$out" &&
        grep -q 'Verify seed       : 77' <<<"$out" &&
-       grep -Eq 'Verify hole blocks: [1-9]' <<<"$out" &&
+       ! grep -q 'Verify hole blocks:' <<<"$out" &&
        ! grep -q 'Files copied' <<<"$out" &&
        [[ "$before" == "$after" ]] &&
        [[ "$content_before" == "$content_after" ]]; then
@@ -1142,6 +1205,7 @@ case_ssh_batch_failure
 case_ssh_empty_dir_collision
 case_ssh_no_preserve_times
 case_transfer_verification
+case_verify_sparse_data_domain
 case_verify_only
 
 echo

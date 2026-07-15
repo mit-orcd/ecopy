@@ -451,7 +451,84 @@ static int emit_sample_batch(sample_desc_t *batch, size_t *count,
     return 0;
 }
 
-static int for_each_sample(const verify_item_t *item, sample_cb cb, void *arg)
+/*
+ * The domain of sampleable blocks for one file. For a dense file (no usable
+ * extent map) this is the whole logical size, exactly as before. For a sparse
+ * file it is only the blocks that overlap an allocated data extent, so
+ * coverage is relative to real data: holes are never selected, hashed, or (over
+ * SSH) sent as digests. Blocks are ordered by "ordinal" 0..data_n-1; each
+ * ordinal maps to a file offset via the extent list (cum[] holds the running
+ * block count before each extent). Data/hole boundaries from SEEK_DATA/SEEK_HOLE
+ * are filesystem-block aligned, so per-extent block sets do not overlap.
+ */
+typedef struct {
+    const extent_map_t *map;  /* NULL/unsupported => dense (logical) domain */
+    off_t    size;
+    uint64_t *cum;            /* cum[i] = data blocks before extent i */
+    uint64_t data_n;          /* total sampleable blocks */
+    uint64_t data_bytes;      /* allocated bytes in domain (== size when dense) */
+} sample_domain_t;
+
+static int sample_domain_init(const extent_map_t *map, off_t size,
+                              sample_domain_t *d)
+{
+    memset(d, 0, sizeof(*d));
+    d->size = size;
+    if (!map || !map->supported) {
+        d->data_n = ((uint64_t)size + VERIFY_BLOCK_SIZE - 1) / VERIFY_BLOCK_SIZE;
+        d->data_bytes = (uint64_t)size;
+        return 0;
+    }
+    d->map = map;
+    if (map->count > 0) {
+        d->cum = malloc(map->count * sizeof(*d->cum));
+        if (!d->cum) return -1;
+    }
+    uint64_t total = 0, bytes = 0;
+    for (size_t i = 0; i < map->count; i++) {
+        d->cum[i] = total;
+        uint64_t fb = (uint64_t)map->extents[i].start / VERIFY_BLOCK_SIZE;
+        uint64_t lb = ((uint64_t)map->extents[i].end + VERIFY_BLOCK_SIZE - 1) /
+                      VERIFY_BLOCK_SIZE;
+        total += lb - fb;
+        bytes += (uint64_t)(map->extents[i].end - map->extents[i].start);
+    }
+    d->data_n = total;
+    d->data_bytes = bytes;
+    return 0;
+}
+
+static void sample_domain_offset(const sample_domain_t *d, uint64_t ordinal,
+                                 off_t *off, size_t *len)
+{
+    off_t o;
+    if (!d->map) {
+        o = (off_t)(ordinal * VERIFY_BLOCK_SIZE);
+    } else {
+        size_t lo = 0, hi = d->map->count;
+        while (hi - lo > 1) {  /* find extent i: cum[i] <= ordinal < cum[i+1] */
+            size_t mid = lo + (hi - lo) / 2;
+            if (d->cum[mid] <= ordinal) lo = mid;
+            else hi = mid;
+        }
+        uint64_t fb = (uint64_t)d->map->extents[lo].start / VERIFY_BLOCK_SIZE;
+        uint64_t block = fb + (ordinal - d->cum[lo]);
+        o = (off_t)(block * VERIFY_BLOCK_SIZE);
+    }
+    size_t l = (size_t)(d->size - o);
+    if (l > VERIFY_BLOCK_SIZE) l = VERIFY_BLOCK_SIZE;
+    *off = o;
+    *len = l;
+}
+
+static void sample_domain_destroy(sample_domain_t *d)
+{
+    free(d->cum);
+    d->cum = NULL;
+}
+
+static int for_each_sample(const verify_item_t *item, const sample_domain_t *dom,
+                           sample_cb cb, void *arg)
 {
     uint64_t n, target, emitted = 0;
     uint64_t seed, a, b, domain = 1;
@@ -459,7 +536,8 @@ static int for_each_sample(const verify_item_t *item, sample_cb cb, void *arg)
     size_t batch_count = 0;
     off_t size = item->src_st.st_size;
     if (size <= 0 || !g_cfg.data) return 0;
-    n = ((uint64_t)size + VERIFY_BLOCK_SIZE - 1) / VERIFY_BLOCK_SIZE;
+    n = dom->data_n;
+    if (n == 0) return 0;  /* fully-hole file: no real data to sample */
     target = (uint64_t)((g_cfg.percent * (double)n + 99.999999) / 100.0);
     if (target < (n == 1 ? 1 : 2)) target = n == 1 ? 1 : 2;
     if (target > n) target = n;
@@ -467,27 +545,24 @@ static int for_each_sample(const verify_item_t *item, sample_cb cb, void *arg)
     /* Full coverage is an ordinary sequential scan, not a random permutation. */
     if (target == n) {
         for (uint64_t idx = 0; idx < n; idx++) {
-            off_t off = (off_t)(idx * VERIFY_BLOCK_SIZE);
-            size_t len = (size_t)(size - off);
-            if (len > VERIFY_BLOCK_SIZE) len = VERIFY_BLOCK_SIZE;
+            off_t off; size_t len;
+            sample_domain_offset(dom, idx, &off, &len);
             if (cb(idx, off, len, arg) != 0) return -1;
         }
         return 0;
     }
 
-#define APPEND_SAMPLE(idx_, off_, len_) do {                                  \
-        batch[batch_count++] = (sample_desc_t){ (idx_), (off_), (len_) };      \
-        emitted++;                                                             \
-        if (batch_count == VERIFY_BATCH_MAX &&                                 \
-            emit_sample_batch(batch, &batch_count, cb, arg) != 0) return -1;  \
+#define APPEND_SAMPLE(idx_) do {                                              \
+        off_t off__; size_t len__;                                            \
+        sample_domain_offset(dom, (idx_), &off__, &len__);                    \
+        batch[batch_count++] = (sample_desc_t){ (idx_), off__, len__ };       \
+        emitted++;                                                            \
+        if (batch_count == VERIFY_BATCH_MAX &&                               \
+            emit_sample_batch(batch, &batch_count, cb, arg) != 0) return -1; \
     } while (0)
 
-    APPEND_SAMPLE(0, 0,
-                  (size_t)(size < VERIFY_BLOCK_SIZE ? size : VERIFY_BLOCK_SIZE));
-    if (n > 1) {
-        off_t off = (off_t)((n - 1) * VERIFY_BLOCK_SIZE);
-        APPEND_SAMPLE(n - 1, off, (size_t)(size - off));
-    }
+    APPEND_SAMPLE(0);                       /* first data block */
+    if (n > 1) APPEND_SAMPLE(n - 1);        /* last data block */
     if (emitted >= target || n <= 2) {
         return emit_sample_batch(batch, &batch_count, cb, arg);
     }
@@ -500,10 +575,7 @@ static int for_each_sample(const verify_item_t *item, sample_cb cb, void *arg)
         uint64_t idx = (a * j + b) & (domain - 1);
         if (idx >= n) continue;
         if (idx == 0 || idx == n - 1) continue;
-        off_t off = (off_t)(idx * VERIFY_BLOCK_SIZE);
-        size_t len = (size_t)(size - off);
-        if (len > VERIFY_BLOCK_SIZE) len = VERIFY_BLOCK_SIZE;
-        APPEND_SAMPLE(idx, off, len);
+        APPEND_SAMPLE(idx);
     }
     if (emit_sample_batch(batch, &batch_count, cb, arg) != 0) return -1;
 #undef APPEND_SAMPLE
@@ -710,6 +782,7 @@ static int verify_local_item(const verify_item_t *item)
         }
     }
 
+    uint64_t scope_bytes = item->is_dir ? 0 : (uint64_t)item->src_st.st_size;
     if (!item->is_dir && !structural_bad &&
         g_cfg.data && item->src_st.st_size > 0) {
         ctx.src_fd = open_verify_data(item->src);
@@ -721,14 +794,22 @@ static int verify_local_item(const verify_item_t *item)
                              &ctx.extents) != 0) {
             failed = 1;
         }
-        if (ctx.src_fd < 0 || ctx.dst_fd < 0 ||
-            source_still_matches(item, ctx.src_fd) != 0 ||
-            for_each_sample(item, compare_sample, &ctx) != 0 ||
-            source_still_matches(item, ctx.src_fd) != 0) {
-            progress_interrupt();
-            if (ctx.src_fd < 0) perror(item->src);
-            else if (ctx.dst_fd < 0) perror(item->dst);
+        sample_domain_t dom;
+        if (sample_domain_init(ctx.extents.supported ? &ctx.extents : NULL,
+                               item->src_st.st_size, &dom) != 0) {
             failed = 1;
+        } else {
+            scope_bytes = dom.data_bytes;  /* coverage relative to real data */
+            if (ctx.src_fd < 0 || ctx.dst_fd < 0 ||
+                source_still_matches(item, ctx.src_fd) != 0 ||
+                for_each_sample(item, &dom, compare_sample, &ctx) != 0 ||
+                source_still_matches(item, ctx.src_fd) != 0) {
+                progress_interrupt();
+                if (ctx.src_fd < 0) perror(item->src);
+                else if (ctx.dst_fd < 0) perror(item->dst);
+                failed = 1;
+            }
+            sample_domain_destroy(&dom);
         }
         if (ctx.src_fd >= 0) close(ctx.src_fd);
         if (ctx.dst_fd >= 0) close(ctx.dst_fd);
@@ -736,8 +817,7 @@ static int verify_local_item(const verify_item_t *item)
         if (ctx.mismatch) failed = 1;
     }
 
-    stats_record_verify(ctx.bytes,
-                        item->is_dir ? 0 : (uint64_t)item->src_st.st_size,
+    stats_record_verify(ctx.bytes, scope_bytes,
                         ctx.blocks, g_cfg.metadata,
                         ctx.data_mismatch, meta_bad, ctx.zero_mismatch,
                         failed && !ctx.mismatch && !meta_bad, failed);
@@ -748,6 +828,7 @@ static int verify_local_item(const verify_item_t *item)
 static int verify_remote_item(const verify_item_t *item)
 {
     remote_ctx_t ctx = { .item = item, .src_fd = -1 };
+    uint64_t scope_bytes = item->is_dir ? 0 : (uint64_t)item->src_st.st_size;
     if (!item->is_dir && g_cfg.data && item->src_st.st_size > 0) {
         ctx.src_fd = open_verify_data(item->src);
         if (ctx.src_fd < 0) {
@@ -761,11 +842,20 @@ static int verify_remote_item(const verify_item_t *item)
                 ctx.failed = 1;
             }
         }
-        if (!ctx.failed && ctx.src_fd >= 0 &&
-            (source_still_matches(item, ctx.src_fd) != 0 ||
-                   for_each_sample(item, hash_sample, &ctx) != 0 ||
-             source_still_matches(item, ctx.src_fd) != 0)) {
+        sample_domain_t dom = {0};
+        if (!ctx.failed &&
+            sample_domain_init(ctx.extents.supported ? &ctx.extents : NULL,
+                               item->src_st.st_size, &dom) != 0) {
             ctx.failed = 1;
+        } else if (!ctx.failed) {
+            scope_bytes = dom.data_bytes;  /* coverage relative to real data */
+            if (ctx.src_fd >= 0 &&
+                (source_still_matches(item, ctx.src_fd) != 0 ||
+                       for_each_sample(item, &dom, hash_sample, &ctx) != 0 ||
+                 source_still_matches(item, ctx.src_fd) != 0)) {
+                ctx.failed = 1;
+            }
+            sample_domain_destroy(&dom);
         }
         if (ctx.src_fd >= 0) close(ctx.src_fd);
         extent_map_destroy(&ctx.extents);
@@ -773,8 +863,7 @@ static int verify_remote_item(const verify_item_t *item)
     if (!ctx.failed && (ctx.count || g_cfg.data || g_cfg.metadata || item->is_dir)) {
         if (flush_remote_batch(&ctx, 1) != 0) ctx.failed = 1;
     }
-    stats_record_verify(ctx.bytes,
-                        item->is_dir ? 0 : (uint64_t)item->src_st.st_size,
+    stats_record_verify(ctx.bytes, scope_bytes,
                         ctx.blocks, g_cfg.metadata,
                         0, 0, 0, 0, ctx.failed);
     stats_record_verify_holes(ctx.hole_blocks, ctx.hole_bytes);

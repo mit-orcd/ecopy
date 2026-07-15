@@ -160,9 +160,13 @@ Verification is opt-in, so ordinary copies pay no extra opens, reads, hashing, a
   `chown` during copy, warns once, and reports the count on a separate `Ownership not preserved` line rather than
   counting it under `Verify failures` (so such a run still exits 0). Genuine mode/size/time mismatches, and any
   UID/GID mismatch when running privileged, remain hard failures.
-- `--verify-data[=PERCENT]` samples aligned logical 4 KiB blocks. The first and final block are always checked,
+- `--verify-data[=PERCENT]` samples aligned 4 KiB blocks. The first and final block are always checked,
   including a short final block; empty files receive size/metadata checks only. The percentage sets the total target
   block count including those endpoints, so small files can have higher achieved coverage than requested.
+- For sparse files, coverage is relative to *allocated* data, not logical size: the sampler works from the source's
+  data extents (`SEEK_DATA`/`SEEK_HOLE`), so holes are never read, hashed, or (over SSH) sent as digests. A mostly-hole
+  file is verified in proportion to its real data - a 1% sample of a 20 PB image with 1 TB of data reads ~10 GB, not
+  ~200 TB. `Verify scope` reports the allocated bytes the sample was drawn from. Fully dense files are unaffected.
 - Sampling uses one random per-run seed. `--verify-seed=N` reproduces the same offsets, and the effective seed plus
   requested/achieved logical-byte coverage are printed in the final report.
 - `--verify-skipped` includes files that were not copied because size+mtime matched. Without it, checks apply only
