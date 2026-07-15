@@ -967,8 +967,15 @@ static void *verify_pool_worker(void *arg)
         pthread_mutex_unlock(&pool->lock);
 
         item->next = NULL;
-        if ((pool->remote ? verify_remote_item(item) :
-                            verify_local_item(item)) != 0) {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        int item_failed = (pool->remote ? verify_remote_item(item) :
+                                          verify_local_item(item)) != 0;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        stats_add_verify_busy_ns(
+            (uint64_t)((t1.tv_sec - t0.tv_sec) * 1000000000LL +
+                       (t1.tv_nsec - t0.tv_nsec)));
+        if (item_failed) {
             pthread_mutex_lock(&pool->lock);
             pool->failed = 1;
             pthread_mutex_unlock(&pool->lock);

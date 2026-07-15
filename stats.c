@@ -325,6 +325,11 @@ void stats_set_verify_runtime(int verify_only, int workers,
     }
     pthread_mutex_unlock(&g_lock);
 }
+void stats_add_verify_busy_ns(uint64_t ns) {
+    pthread_mutex_lock(&g_lock);
+    g_stats.verify_busy_ns += ns;
+    pthread_mutex_unlock(&g_lock);
+}
 void stats_set_verify_pending_peak(uint64_t pending_peak) {
     pthread_mutex_lock(&g_lock);
     if (pending_peak > g_stats.verify_pending_peak) {
@@ -660,10 +665,19 @@ void stats_print_final(int verbose) {
     double verify_wall_sec = s.verification_started && s.verification_done
                                  ? diff_sec(&s.verification_done_ts,
                                             &s.verification_start_ts) : 0.0;
+    /* Summed worker service time; parallel checkers can exceed wall. Rates use
+     * this so an overlapped (pipelined) verify phase is not diluted by the copy
+     * window it hides behind. */
+    double verify_busy_sec = (double)s.verify_busy_ns / 1e9;
+    /* Pipelined dir copies start verification before copy completes. */
+    int verify_overlapped = !s.verify_only && s.verification_started &&
+                            s.copy_complete &&
+                            diff_sec(&s.verification_start_ts,
+                                     &s.copy_complete_ts) < 0.0;
     telemetry_get(classes, &rolling);
     stats_format_rate(s.bytes_copied, data_sec, data_rate, sizeof(data_rate));
     stats_format_rate(s.bytes_copied, complete_sec, complete_rate, sizeof(complete_rate));
-    stats_format_rate(s.verify_bytes, verify_wall_sec, verify_rate, sizeof(verify_rate));
+    stats_format_rate(s.verify_bytes, verify_busy_sec, verify_rate, sizeof(verify_rate));
     printf("Done.\n");
     if (!s.verify_only) {
         format_bytes(s.planned_copy_bytes, logical, sizeof(logical));
@@ -782,11 +796,17 @@ void stats_print_final(int verbose) {
                s.verify_requested_percent, achieved);
         printf("Verify seed       : %" PRIu64 "\n", s.verify_seed);
         printf("Verify wall sec   : %.3f\n", verify_wall_sec);
-        printf("Verify object rate: %.2f objects/s\n",
-               verify_wall_sec > 0.0
-                   ? (double)s.verify_objects / verify_wall_sec
+        if (verify_overlapped) {
+            printf("  (overlapped copy; wall is not additive with copy time - "
+                   "see Total Elapsed)\n");
+        }
+        printf("Verify busy sec   : %.3f (summed worker service)\n",
+               verify_busy_sec);
+        printf("Verify object rate: %.2f objects/s (worker-equivalent)\n",
+               verify_busy_sec > 0.0
+                   ? (double)s.verify_objects / verify_busy_sec
                    : 0.0);
-        printf("Verify sample rate: %s\n", verify_rate);
+        printf("Verify sample rate: %s (worker-equivalent)\n", verify_rate);
         printf("Verify hash backend: %s\n", blake3_backend());
         printf("Verify readahead  : %s\n",
                s.verify_requested_percent >= 100.0 ? "sequential" : "random");

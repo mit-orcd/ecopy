@@ -62,6 +62,9 @@ void stats_set_verify_config(int metadata, int data, double percent, uint64_t se
 void stats_set_verify_runtime(int verify_only, int workers,
                               uint64_t queue_peak, uint64_t active_peak);
 void stats_set_verify_pending_peak(uint64_t pending_peak);
+/* Summed per-item verify worker service time (parallel, so it can exceed wall);
+ * used to report a worker-equivalent verify rate that overlap does not dilute. */
+void stats_add_verify_busy_ns(uint64_t ns);
 void stats_record_verify(uint64_t bytes, uint64_t scope_bytes, uint64_t blocks,
                          int metadata_checked,
                          int data_mismatch, int metadata_mismatch,

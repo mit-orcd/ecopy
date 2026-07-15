@@ -229,10 +229,13 @@ The final report separates phases so verification time never depresses the repor
 - One-second payload-rate windows begin with the first payload and end when file work drains. They include zero-rate
   stall windows and are collected even when stdout is redirected; only the live 10-second rolling display requires a
   terminal.
-- **Verification wall time/rate** measures the checker phase and sampled bytes. For directory trees this phase
-  overlaps copy (see pipelining above), so its wall time is not additive with the copy timings; `Total Elapsed`
-  remains the ground truth. Scope, achieved coverage, verified objects/s, the compact pending peak, bounded
-  worker-queue peak, hole reads avoided, hash backend, and categorized failures are reported independently.
+- **Verification wall/busy time and rate.** `Verify wall sec` is the pipeline start-to-finish window; for directory
+  trees it overlaps copy (see pipelining above), so it is not additive with the copy timings and the report says so
+  (`Total Elapsed` is the ground truth). `Verify busy sec` is the summed checker-worker service time, and the
+  `Verify object rate` / `Verify sample rate` are computed from it (worker-equivalent, like the transfer
+  summed-service rate) so an overlapped verify phase is not made to look slow by the copy window it hides behind.
+  Scope, achieved coverage, the compact pending peak, bounded worker-queue peak, hole reads avoided, hash backend,
+  and categorized failures are reported independently.
 
 Percentiles use bounded integer logarithmic histograms: counts, sums, and min/max are exact, while percentile values
 are bucket approximations. Min and max are intentionally shown but are highly sensitive to single-file and

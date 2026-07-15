@@ -87,6 +87,7 @@ typedef struct {
     uint64_t verify_pending_peak;
     uint64_t verify_queue_peak;
     uint64_t verify_active_peak;
+    uint64_t verify_busy_ns; /* summed worker service time across checkers */
     int verify_workers;
     int verify_only;
     int verify_metadata_enabled;
