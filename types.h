@@ -37,6 +37,11 @@ typedef struct {
     uint64_t dirs_created;
     uint64_t bytes_copied;
     uint64_t bytes_skipped;
+    uint64_t symlinks_seen;
+    uint64_t symlinks_created;
+    uint64_t hardlinks_seen;
+    uint64_t hardlinks_created;
+    uint64_t hardlink_bytes_saved;
     uint64_t copy_file_range_calls;
     uint64_t copy_file_range_bytes;
     uint64_t copy_file_range_fallbacks;

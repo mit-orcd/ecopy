@@ -16,6 +16,7 @@
 #include "fs_util.h"
 #include "copy_policy.h"
 #include "verify.h"
+#include "hardlinks.h"
 #include "types.h"
 
 #include <stdio.h>
@@ -791,6 +792,7 @@ int main(int argc, char **argv) {
     if (progress_start() != 0) { workers_stop(); sshx_disconnect(); return 1; }
 
     int enqueue_failed = 0;
+    hardlinks_reset();
     if (src_is_dir) {
         if (traversal_start(src_abs, dst_root) != 0) {
             progress_stop();
@@ -806,6 +808,16 @@ int main(int argc, char **argv) {
     }
     workers_stop();
     int finalize_failed = src_is_dir ? (traversal_finalize_metadata() != 0) : enqueue_failed;
+
+    /*
+     * All file data has landed. Materialize deferred hard links now: every
+     * primary is fully renamed into place, and (remotely) MSG_LINK is sent
+     * before the flush barrier so the server drains all prior file frames first.
+     */
+    int link_failed = 0;
+    if (!finalize_failed && src_is_dir) {
+        link_failed = (hardlinks_replay(remote) != 0);
+    }
 
     /* Single-file local rename: the worker landed the file under its source
      * name; move it to the requested final name if they differ. */
@@ -862,7 +874,7 @@ int main(int argc, char **argv) {
     suggestion_print_next_run();
 
     if (traversal_status() != 0 || workers_status() != 0 || remote_failed ||
-        verify_failed) {
+        verify_failed || link_failed) {
         return 1;
     }
     return 0;

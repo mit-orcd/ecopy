@@ -68,4 +68,21 @@ int rename_temp_to_final_at(int dir_fd,
                             const char *display_path);
 void unlink_temp_at(int dir_fd, const char *tmp_name);
 
+/* hardlink_create() return code: the two paths are on different filesystems. */
+#define FS_LINK_EXDEV (-2)
+
+/*
+ * Recreate a symlink (never dereferenced) at dir_fd/name pointing at target,
+ * preserving uid/gid and times. Uses temp+rename on an existing tree for atomic
+ * overwrite. Returns 0 on success, -1 on error.
+ */
+int symlink_recreate_at(int dir_fd, const char *name, const char *display_path,
+                        const char *target, const struct stat *src_st);
+
+/*
+ * Create a hard link at link_path referencing primary_path. Returns 0 on
+ * success, FS_LINK_EXDEV for a cross-filesystem link, or -1 on other errors.
+ */
+int hardlink_create(const char *primary_path, const char *link_path);
+
 #endif

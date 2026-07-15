@@ -294,6 +294,11 @@ void stats_inc_files_copied(void){ pthread_mutex_lock(&g_lock); g_stats.files_co
 void stats_inc_files_skipped(void){ pthread_mutex_lock(&g_lock); g_stats.files_skipped++; pthread_mutex_unlock(&g_lock);} 
 void stats_inc_dirs_seen(void){ pthread_mutex_lock(&g_lock); g_stats.dirs_seen++; pthread_mutex_unlock(&g_lock);} 
 void stats_inc_dirs_created(void){ pthread_mutex_lock(&g_lock); g_stats.dirs_created++; pthread_mutex_unlock(&g_lock);} 
+void stats_inc_symlink_seen(void){ pthread_mutex_lock(&g_lock); g_stats.symlinks_seen++; pthread_mutex_unlock(&g_lock);} 
+void stats_inc_symlink_created(void){ pthread_mutex_lock(&g_lock); g_stats.symlinks_created++; pthread_mutex_unlock(&g_lock);} 
+void stats_inc_hardlink_seen(void){ pthread_mutex_lock(&g_lock); g_stats.hardlinks_seen++; pthread_mutex_unlock(&g_lock);} 
+void stats_inc_hardlink_created(void){ pthread_mutex_lock(&g_lock); g_stats.hardlinks_created++; pthread_mutex_unlock(&g_lock);} 
+void stats_add_hardlink_saved(uint64_t bytes){ pthread_mutex_lock(&g_lock); g_stats.hardlink_bytes_saved += bytes; pthread_mutex_unlock(&g_lock);} 
 void stats_record_copy_file_range_call(uint64_t bytes) { pthread_mutex_lock(&g_lock); g_stats.copy_file_range_calls++; g_stats.copy_file_range_bytes += bytes; pthread_mutex_unlock(&g_lock); }
 void stats_record_copy_file_range_fallback(void) { pthread_mutex_lock(&g_lock); g_stats.copy_file_range_fallbacks++; pthread_mutex_unlock(&g_lock); }
 void stats_add_copy_file_range_usage(uint64_t calls, uint64_t bytes, uint64_t fallbacks) { pthread_mutex_lock(&g_lock); g_stats.copy_file_range_calls += calls; g_stats.copy_file_range_bytes += bytes; g_stats.copy_file_range_fallbacks += fallbacks; pthread_mutex_unlock(&g_lock); } 
@@ -673,6 +678,16 @@ void stats_print_final(int verbose) {
     printf("Dirs seen     : %" PRIu64 "\n", s.dirs_seen);
     if (!s.verify_only) {
         printf("Dirs created  : %" PRIu64 "\n", s.dirs_created);
+        if (s.symlinks_seen > 0) {
+            printf("Symlinks      : %" PRIu64 " of %" PRIu64 "\n",
+                   s.symlinks_created, s.symlinks_seen);
+        }
+        if (s.hardlinks_seen > 0) {
+            char saved[32];
+            format_bytes(s.hardlink_bytes_saved, saved, sizeof(saved));
+            printf("Hard links    : %" PRIu64 " linked, %s not duplicated\n",
+                   s.hardlinks_created, saved);
+        }
         printf("Logical bytes : %" PRIu64 " (%s)\n", s.planned_copy_bytes, logical);
         printf("Payload bytes : %" PRIu64 " (%s)\n", s.bytes_copied, payload);
         if (s.planned_copy_bytes > s.bytes_copied) {

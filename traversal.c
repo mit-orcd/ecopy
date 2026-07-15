@@ -13,6 +13,7 @@
 #include "verify.h"
 #include "workers.h"
 #include "ssh_transport.h"
+#include "hardlinks.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -601,6 +602,49 @@ static int flush_file_batch(dir_handle_t *handle,
     return rc;
 }
 
+/*
+ * Recreate a symlink without following it: read the link target and create the
+ * same link at the destination (local symlinkat / remote MSG_SYMLINK). The
+ * target string is preserved verbatim, matching cp -d semantics.
+ */
+static void copy_symlink_entry(dir_handle_t *handle, const dir_node_t *node,
+                               const char *name, const struct stat *st, int remote)
+{
+    char target[PATH_MAX];
+    ssize_t len = readlinkat(handle->src_fd, name, target, sizeof(target) - 1);
+    if (len < 0) {
+        perror(name);
+        mark_traversal_error();
+        return;
+    }
+    if (len >= (ssize_t)sizeof(target) - 1) {
+        fprintf(stderr, "Symlink target too long under %s/%s\n", node->src, name);
+        mark_traversal_error();
+        return;
+    }
+    target[len] = '\0';
+    stats_inc_symlink_seen();
+
+    char dst_path[PATH_MAX];
+    if (join_path(dst_path, sizeof(dst_path), node->dst, name) != 0) {
+        fprintf(stderr, "Path too long under %s\n", node->dst);
+        mark_traversal_error();
+        return;
+    }
+
+    if (remote) {
+        if (sshx_symlink(dst_path, target, st) != 0) {
+            perror(dst_path);
+            mark_traversal_error();
+            return;
+        }
+    } else if (symlink_recreate_at(handle->dst_fd, name, dst_path, target, st) != 0) {
+        mark_traversal_error();
+        return;
+    }
+    stats_inc_symlink_created();
+}
+
 static void process_dir_entries(dir_handle_t *handle,
                                 const dir_node_t *node,
                                 DIR *dir,
@@ -653,11 +697,37 @@ static void process_dir_entries(dir_handle_t *handle,
                 mark_traversal_error();
             }
             pthread_mutex_unlock(&g_dir_lock);
+        } else if (S_ISLNK(st.st_mode)) {
+            copy_symlink_entry(handle, node, entry->d_name, &st, remote);
         } else if (S_ISREG(st.st_mode)) {
             if (strlen(entry->d_name) >= sizeof(s->batch[0].name)) {
                 fprintf(stderr, "Name too long: %s\n", entry->d_name);
                 mark_traversal_error();
                 continue;
+            }
+            /*
+             * Hard-linked file: only the first sighting of an inode is copied;
+             * later links are materialized after the copy phase (see
+             * hardlinks_replay) so the data is never duplicated. Leaving
+             * saw_file untouched for a secondary lets a directory that holds
+             * only secondaries still get an explicit remote MKDIR, so the
+             * finalize SETMETA (and the later hard link) find the directory.
+             */
+            if (st.st_nlink > 1) {
+                if (join_path(dst_path, sizeof(dst_path), node->dst,
+                              entry->d_name) != 0) {
+                    fprintf(stderr, "Path too long under %s\n", node->dst);
+                    mark_traversal_error();
+                    continue;
+                }
+                hl_result_t hr = hardlinks_note(&st, dst_path);
+                if (hr == HL_SECONDARY) {
+                    continue;
+                }
+                if (hr == HL_ERROR) {
+                    mark_traversal_error();
+                    /* fall through and copy it as a normal file (no data loss) */
+                }
             }
             stats_inc_files_seen();
             saw_file = 1;

@@ -34,6 +34,7 @@ OBJS = \
 	progress.o \
 	telemetry.o \
 	fs_util.o \
+	hardlinks.o \
 	copy_policy.o \
 	verify.o \
 	$(BLAKE3_OBJS) \

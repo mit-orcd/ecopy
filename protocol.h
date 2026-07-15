@@ -22,7 +22,7 @@
 #include <string.h>
 #include <sys/types.h>
 
-#define ECOPY_PROTO_VERSION 8u
+#define ECOPY_PROTO_VERSION 9u
 
 /* Upper bound on a single control-frame payload we are willing to read. Data
  * frames (WRITE) carry their own length and are streamed, so this only bounds
@@ -48,7 +48,9 @@ typedef enum {
     MSG_BYE            = 16, /* client->server: clean shutdown ; fire */
     MSG_PUTFILE        = 17, /* meta + path + data (whole small file) ; fire */
     MSG_BARRIER        = 18, /* flush + drain ; reply STATUS w/ aggregate */
-    MSG_VERIFY_PATH    = 19  /* path + metadata + BLAKE3 digest batch ; fire */
+    MSG_VERIFY_PATH    = 19, /* path + metadata + BLAKE3 digest batch ; fire */
+    MSG_SYMLINK        = 20, /* target, link_path, uid, gid, atime, mtime ; fire */
+    MSG_LINK           = 21  /* primary_path, link_path ; fire */
 } msg_type_t;
 
 /*

@@ -20,6 +20,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <limits.h>
 
 static int direct_io_fallback_errno(int err) {
     return err == EINVAL || err == EOPNOTSUPP || err == ENOTSUP || err == ENOSYS;
@@ -1127,4 +1128,141 @@ int finalize_copied_file_fd(int fd, const char *path_for_warning, const struct s
      */
     return preserve_fd_metadata_impl(fd, path_for_warning, src_st,
                                      (int)copy_data_mode(src_st->st_mode));
+}
+
+/*
+ * Apply a symlink's ownership and times without dereferencing it. Mode bits are
+ * not meaningful for symlinks on Linux, so only uid/gid and atime/mtime are
+ * preserved. Ownership is best-effort: an unprivileged process cannot chown to a
+ * foreign uid, so that case is downgraded to the same one-time warning used for
+ * regular files rather than treated as an error.
+ */
+static void apply_symlink_metadata(int dir_fd, const char *name,
+                                   const char *display_path,
+                                   const struct stat *src_st)
+{
+    if (!owner_matches_self(src_st)) {
+        if (chown_uid_unpreservable(src_st)) {
+            note_chown_not_preserved();
+        } else if (fchownat(dir_fd, name, src_st->st_uid, src_st->st_gid,
+                            AT_SYMLINK_NOFOLLOW) != 0) {
+            if (chown_permission_errno(errno)) {
+                note_chown_not_preserved();
+            } else {
+                progress_interrupt();
+                if (display_path && *display_path) fprintf(stderr, "%s: ", display_path);
+                perror("fchownat");
+                stats_inc_metadata_error();
+            }
+        }
+    }
+    if (copy_policy_preserve_times()) {
+        struct timespec times[2];
+        times[0] = src_st->st_atim;
+        times[1] = src_st->st_mtim;
+        if (utimensat(dir_fd, name, times, AT_SYMLINK_NOFOLLOW) != 0) {
+            stats_inc_metadata_warning();
+        }
+    }
+}
+
+int symlink_recreate_at(int dir_fd, const char *name, const char *display_path,
+                        const char *target, const struct stat *src_st)
+{
+    char tmp_name[256];
+
+    /*
+     * Fresh tree: create straight at the final name. If something already lives
+     * there (existing tree, or a re-run) fall back to the atomic temp+rename.
+     */
+    if (copy_policy_small_inplace()) {
+        if (symlinkat(target, dir_fd, name) == 0) {
+            apply_symlink_metadata(dir_fd, name, display_path, src_st);
+            return 0;
+        }
+        if (errno != EEXIST) {
+            progress_interrupt();
+            if (display_path && *display_path) fprintf(stderr, "%s: ", display_path);
+            perror("symlinkat");
+            return -1;
+        }
+    }
+
+    if (make_temp_name(tmp_name, sizeof(tmp_name)) != 0) {
+        progress_interrupt();
+        if (display_path && *display_path) fprintf(stderr, "%s: ", display_path);
+        perror("make_temp_name");
+        return -1;
+    }
+    if (symlinkat(target, dir_fd, tmp_name) != 0) {
+        progress_interrupt();
+        if (display_path && *display_path) fprintf(stderr, "%s: ", display_path);
+        perror("symlinkat");
+        return -1;
+    }
+    apply_symlink_metadata(dir_fd, tmp_name, display_path, src_st);
+    if (renameat(dir_fd, tmp_name, dir_fd, name) != 0) {
+        progress_interrupt();
+        if (display_path && *display_path) fprintf(stderr, "%s: ", display_path);
+        perror("renameat");
+        (void)unlinkat(dir_fd, tmp_name, 0);
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * Create a hard link at link_path pointing at primary_path. Returns 0 on
+ * success, FS_LINK_EXDEV if the two paths are on different filesystems (so the
+ * caller can fall back to a full copy), or -1 on any other error. Overwrites an
+ * existing entry atomically via a temp link + rename.
+ */
+int hardlink_create(const char *primary_path, const char *link_path)
+{
+    char tmp_full[PATH_MAX];
+    char base[256];
+    const char *slash;
+    size_t dirlen;
+
+    if (link(primary_path, link_path) == 0) {
+        return 0;
+    }
+    if (errno == EXDEV) return FS_LINK_EXDEV;
+    if (errno != EEXIST) {
+        progress_interrupt();
+        fprintf(stderr, "%s: ", link_path);
+        perror("link");
+        return -1;
+    }
+
+    if (make_temp_name(base, sizeof(base)) != 0) {
+        progress_interrupt();
+        perror("make_temp_name");
+        return -1;
+    }
+    slash = strrchr(link_path, '/');
+    dirlen = slash ? (size_t)(slash - link_path) : 0;
+    if (snprintf(tmp_full, sizeof(tmp_full), "%.*s/%s",
+                 (int)dirlen, link_path, base) >= (int)sizeof(tmp_full)) {
+        errno = ENAMETOOLONG;
+        progress_interrupt();
+        fprintf(stderr, "%s: ", link_path);
+        perror("link");
+        return -1;
+    }
+    if (link(primary_path, tmp_full) != 0) {
+        if (errno == EXDEV) return FS_LINK_EXDEV;
+        progress_interrupt();
+        fprintf(stderr, "%s: ", link_path);
+        perror("link");
+        return -1;
+    }
+    if (rename(tmp_full, link_path) != 0) {
+        progress_interrupt();
+        fprintf(stderr, "%s: ", link_path);
+        perror("rename");
+        (void)unlink(tmp_full);
+        return -1;
+    }
+    return 0;
 }

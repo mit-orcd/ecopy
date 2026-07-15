@@ -1313,6 +1313,113 @@ static void handle_unlink(const uint8_t *payload, uint32_t plen)
     (void)unlink(path);
 }
 
+/*
+ * Recreate a symlink verbatim (never dereferenced). Ownership is best-effort:
+ * an unprivileged server cannot lchown to a foreign uid, so EPERM/EACCES is
+ * downgraded to a one-time warning like regular-file chown.
+ */
+static void handle_symlink(const uint8_t *payload, uint32_t plen)
+{
+    char target[PATH_MAX];
+    char link_in[PATH_MAX];
+    pdec_t d; pdec_init(&d, payload, plen);
+    if (pdec_str(&d, target, sizeof(target)) != 0) return;
+    if (pdec_str(&d, link_in, sizeof(link_in)) != 0) return;
+    uint32_t uid = pdec_u32(&d);
+    uint32_t gid = pdec_u32(&d);
+    int64_t at_s = pdec_i64(&d), at_ns = pdec_i64(&d);
+    int64_t mt_s = pdec_i64(&d), mt_ns = pdec_i64(&d);
+    if (d.error) return;
+
+    char link_path[PATH_MAX];
+    if (resolve_path(link_in, link_path, sizeof(link_path)) != 0) {
+        log_op_error(link_in, errno);
+        return;
+    }
+
+    char dir[PATH_MAX], base[PATH_MAX];
+    split_dir_base(link_path, dir, sizeof(dir), base, sizeof(base));
+    if (ensure_dir_cached_mode(dir, 0755) != 0) {
+        log_op_error(dir, errno);
+        return;
+    }
+
+    static _Atomic uint64_t sym_seq;
+    uint64_t seq = atomic_fetch_add(&sym_seq, 1) + 1;
+    char tmp[PATH_MAX];
+    if (snprintf(tmp, sizeof(tmp), "%s/.ecopy.tmp.sym.%u.%llu",
+                 dir, (unsigned)getpid(), (unsigned long long)seq) >= (int)sizeof(tmp)) {
+        log_op_error(link_path, ENAMETOOLONG);
+        return;
+    }
+    if (symlink(target, tmp) != 0) {
+        log_op_error(link_path, errno);
+        return;
+    }
+    if ((uid_t)uid != g_euid || (gid_t)gid != g_egid) {
+        if (lchown(tmp, (uid_t)uid, (gid_t)gid) != 0) {
+            if (chown_permission_errno(errno)) {
+                if (atomic_exchange(&g_chown_permission_warned, 1) == 0) {
+                    fprintf(stderr,
+                            "ecopy: remote chown not permitted; continuing "
+                            "without preserving uid/gid ownership\n");
+                }
+            } else {
+                log_op_error(link_path, errno);
+            }
+        }
+    }
+    if (g_preserve_times) {
+        struct timespec ts[2];
+        ts[0].tv_sec = (time_t)at_s; ts[0].tv_nsec = (long)at_ns;
+        ts[1].tv_sec = (time_t)mt_s; ts[1].tv_nsec = (long)mt_ns;
+        (void)utimensat(AT_FDCWD, tmp, ts, AT_SYMLINK_NOFOLLOW);
+    }
+    if (rename(tmp, link_path) != 0) {
+        log_op_error(link_path, errno);
+        (void)unlink(tmp);
+    }
+}
+
+/*
+ * Create a hard link. This message is non-pooled, so the reader has already
+ * drained the apply pool before we run: the primary file it references is
+ * guaranteed materialized. Overwrites an existing entry atomically.
+ */
+static void handle_link(const uint8_t *payload, uint32_t plen)
+{
+    char pri_in[PATH_MAX], link_in[PATH_MAX];
+    pdec_t d; pdec_init(&d, payload, plen);
+    if (pdec_str(&d, pri_in, sizeof(pri_in)) != 0) return;
+    if (pdec_str(&d, link_in, sizeof(link_in)) != 0) return;
+    if (d.error) return;
+
+    char pri[PATH_MAX], link_path[PATH_MAX];
+    if (resolve_path(pri_in, pri, sizeof(pri)) != 0) { log_op_error(pri_in, errno); return; }
+    if (resolve_path(link_in, link_path, sizeof(link_path)) != 0) { log_op_error(link_in, errno); return; }
+
+    char dir[PATH_MAX], base[PATH_MAX];
+    split_dir_base(link_path, dir, sizeof(dir), base, sizeof(base));
+    if (ensure_dir_cached_mode(dir, 0755) != 0) { log_op_error(dir, errno); return; }
+
+    if (link(pri, link_path) == 0) return;
+    if (errno != EEXIST) { log_op_error(link_path, errno); return; }
+
+    static _Atomic uint64_t link_seq;
+    uint64_t seq = atomic_fetch_add(&link_seq, 1) + 1;
+    char tmp[PATH_MAX];
+    if (snprintf(tmp, sizeof(tmp), "%s/.ecopy.tmp.lnk.%u.%llu",
+                 dir, (unsigned)getpid(), (unsigned long long)seq) >= (int)sizeof(tmp)) {
+        log_op_error(link_path, ENAMETOOLONG);
+        return;
+    }
+    if (link(pri, tmp) != 0) { log_op_error(link_path, errno); return; }
+    if (rename(tmp, link_path) != 0) {
+        log_op_error(link_path, errno);
+        (void)unlink(tmp);
+    }
+}
+
 /* -------------------- apply pool -------------------- */
 
 /*
@@ -1543,6 +1650,8 @@ int server_main(const char *root, int read_only)
         case MSG_VERIFY_PATH: handle_verify_path(payload, plen); break;
         case MSG_BARRIER:   rc = handle_barrier(id, payload, plen); break;
         case MSG_UNLINK:    handle_unlink(payload, plen); break;
+        case MSG_SYMLINK:   handle_symlink(payload, plen); break;
+        case MSG_LINK:      handle_link(payload, plen); break;
         case MSG_BYE:
             free(payload);
             pool_shutdown();

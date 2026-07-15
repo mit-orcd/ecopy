@@ -295,8 +295,8 @@ case_skip_rerun() {
     fi
 }
 
-case_symlink_ignored() {
-    case_begin "symlink-ignored"
+case_symlink_preserved() {
+    case_begin "symlink-preserved"
     local s="$work/link_src" d="$work/link_dst"
     mkdir -p "$s"
     printf 'real file\n' > "$s/real.txt"
@@ -309,10 +309,71 @@ case_symlink_ignored() {
     else
         fail "regular file not copied correctly"
     fi
-    if [[ ! -e "$d/link.txt" ]]; then
-        ok "symlink ignored (not copied)"
+    if [[ -L "$d/link.txt" && "$(readlink "$d/link.txt")" == "real.txt" ]]; then
+        ok "symlink recreated with same target"
     else
-        fail "symlink unexpectedly present in dst"
+        fail "symlink not recreated correctly"
+    fi
+}
+
+case_hardlink_preserved() {
+    case_begin "hardlink-preserved"
+    local s="$work/hl_src" d="$work/hl_dst"
+    mkdir -p "$s/sub"
+    head -c 4096 /dev/urandom > "$s/a.bin"
+    ln "$s/a.bin" "$s/b.bin"       # same-directory hard link
+    ln "$s/a.bin" "$s/sub/c.bin"   # cross-directory hard link
+    if ! run_ecopy buffered "$s" "$d" >/dev/null 2>&1; then
+        fail "ecopy run failed"; return
+    fi
+    local f content_ok=1
+    for f in a.bin b.bin sub/c.bin; do
+        cmp -s "$s/a.bin" "$d/$f" || content_ok=0
+    done
+    if [[ "$content_ok" -eq 1 ]]; then
+        ok "hard-linked files present with identical content"
+    else
+        fail "hard-linked content mismatch"
+    fi
+    local ia ib ic
+    ia="$(stat -c %i "$d/a.bin")"; ib="$(stat -c %i "$d/b.bin")"; ic="$(stat -c %i "$d/sub/c.bin")"
+    if [[ "$ia" == "$ib" && "$ia" == "$ic" ]]; then
+        ok "hard links share one inode on dst"
+    else
+        fail "hard links not preserved (distinct inodes: $ia $ib $ic)"
+    fi
+    local nl
+    nl="$(stat -c %h "$d/a.bin")"
+    if [[ "$nl" -ge 3 ]]; then
+        ok "dst link count preserved ($nl)"
+    else
+        fail "dst link count wrong ($nl)"
+    fi
+}
+
+case_ssh_symlink_hardlink() {
+    case_begin "ssh-symlink-hardlink"
+    local s="$work/ssh_lnk_src" d="$work/ssh_lnk_dst"
+    mkdir -p "$s/sub"
+    printf 'payload\n' > "$s/real.txt"
+    ln -s real.txt "$s/link.txt"
+    head -c 4096 /dev/urandom > "$s/a.bin"
+    ln "$s/a.bin" "$s/sub/c.bin"
+    if ! run_ecopy_ssh "$s" "$d" >/dev/null 2>&1; then
+        fail "remote ecopy run failed"; return
+    fi
+    if [[ -L "$d/link.txt" && "$(readlink "$d/link.txt")" == "real.txt" ]]; then
+        ok "remote symlink recreated with same target"
+    else
+        fail "remote symlink not recreated correctly"
+    fi
+    local ia ic
+    ia="$(stat -c %i "$d/a.bin" 2>/dev/null)"
+    ic="$(stat -c %i "$d/sub/c.bin" 2>/dev/null)"
+    if [[ -n "$ia" && "$ia" == "$ic" ]]; then
+        ok "remote hard link shares one inode"
+    else
+        fail "remote hard link not preserved ($ia vs $ic)"
     fi
 }
 
@@ -983,7 +1044,9 @@ case_large_file
 case_sparse_file
 case_all_hole_file
 case_skip_rerun
-case_symlink_ignored
+case_symlink_preserved
+case_hardlink_preserved
+case_ssh_symlink_hardlink
 case_readonly_mode
 case_single_file
 case_local_fresh_policy

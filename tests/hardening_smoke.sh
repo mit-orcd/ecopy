@@ -28,8 +28,15 @@ mkdir -p "$tmp/src_symlink" "$tmp/dst_symlink"
 printf 'outside\n' > "$tmp/outside.txt"
 ln -s "$tmp/outside.txt" "$tmp/src_symlink/link.txt"
 run_ecopy "$tmp/src_symlink" "$tmp/dst_symlink" >/dev/null
-if [[ -e "$tmp/dst_symlink/link.txt" ]]; then
-    echo "source symlink was copied" >&2
+# The symlink is recreated verbatim, never dereferenced: the destination entry
+# must be a symlink (not a regular-file copy of the outside target's contents)
+# and must still point at the original target.
+if [[ ! -L "$tmp/dst_symlink/link.txt" ]]; then
+    echo "source symlink was not recreated as a symlink" >&2
+    exit 1
+fi
+if [[ "$(readlink "$tmp/dst_symlink/link.txt")" != "$tmp/outside.txt" ]]; then
+    echo "recreated symlink target was rewritten" >&2
     exit 1
 fi
 

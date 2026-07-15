@@ -88,6 +88,19 @@ int sshx_stat_bulk(const char *base, const char *const *names, int n,
 int sshx_setmeta(const char *path, const struct stat *src_st, int is_dir);
 
 /*
+ * Recreate a symlink at link_path pointing at target (verbatim, never
+ * dereferenced), preserving uid/gid/times from src_st. Fire-and-forget.
+ */
+int sshx_symlink(const char *link_path, const char *target,
+                 const struct stat *src_st);
+
+/*
+ * Create a hard link at link_path referencing an already-transferred file at
+ * primary_path. Fire-and-forget; must be sent after the primary's frames.
+ */
+int sshx_link(const char *primary_path, const char *link_path);
+
+/*
  * Send a whole small file in one fire-and-forget frame (metadata from src_st +
  * path + data). The server creates parent dirs, writes, applies metadata, and
  * renames into place. No per-file round trip; failures surface at the next

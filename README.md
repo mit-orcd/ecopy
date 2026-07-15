@@ -90,7 +90,12 @@ The target may be an `ssh://` URL to push a local tree to another host:
 
 ## What It Does
 
-- Walks the source tree and recreates it on the target. Copies regular files only.
+- Walks the source tree and recreates it on the target: regular files, directories, symlinks, and hard links.
+- Recreates symlinks verbatim without ever following them (`cp -d` semantics): the link's target string is
+  preserved unchanged, and the link's `uid`/`gid`/times are applied to the link itself.
+- Preserves hard links: files sharing a source inode are copied once (the first occurrence), and additional links
+  become real hard links on the target instead of duplicating the data. A cross-filesystem link (`EXDEV`) falls back
+  to a full copy locally so no file is lost.
 - Skips unchanged files based on `size + mtime`.
 - Detects sparse files and copies only their data, preserving holes instead of moving zeros.
 - On a newly created destination tree, writes small files directly to their final names to avoid destination stats
@@ -100,8 +105,13 @@ The target may be an `ssh://` URL to push a local tree to another host:
 - Opens entries relative to open directory handles, so symlink swaps are rejected during traversal and copy.
 - Preserves `uid`/`gid` (when permitted), permission bits, `atime`, and `mtime`.
 
-Not preserved: xattrs, ACLs, SELinux labels, file capabilities. Non-regular entries (symlinks, devices, FIFOs,
-sockets) are ignored on the source and rejected on the target rather than reconciled.
+The final report shows `Symlinks : <created> of <seen>` and `Hard links : <created> linked, <N> not duplicated`
+whenever the source tree contains them. Symlinks and hard-link secondaries are not enrolled in `--verify` (the
+primary file's data is verified, and a hard link shares its content by construction).
+
+Not preserved: xattrs, ACLs, SELinux labels, file capabilities. Other non-regular entries (devices, FIFOs, sockets)
+are ignored on the source and rejected on the target rather than reconciled. A top-level source that is itself a
+symlink is rejected.
 
 ## Transfer Verification
 

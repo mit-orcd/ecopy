@@ -829,6 +829,43 @@ int sshx_setmeta(const char *path, const struct stat *src_st, int is_dir)
     return 0;
 }
 
+int sshx_symlink(const char *link_path, const char *target,
+                 const struct stat *src_st)
+{
+    uint8_t buf[2 * PATH_MAX + 64];
+    penc_t e; penc_init(&e, buf, sizeof(buf));
+    penc_str(&e, target);
+    penc_str(&e, link_path);
+    penc_u32(&e, (uint32_t)src_st->st_uid);
+    penc_u32(&e, (uint32_t)src_st->st_gid);
+    penc_i64(&e, (int64_t)src_st->st_atim.tv_sec);
+    penc_i64(&e, (int64_t)src_st->st_atim.tv_nsec);
+    penc_i64(&e, (int64_t)src_st->st_mtim.tv_sec);
+    penc_i64(&e, (int64_t)src_st->st_mtim.tv_nsec);
+    if (e.overflow) { errno = ENAMETOOLONG; return -1; }
+    /* Fire-and-forget: errors surface at the next barrier. */
+    if (conn_send(MSG_SYMLINK, next_request_id(), buf, (uint32_t)e.len) != 0) {
+        return -1;
+    }
+    maybe_periodic_barrier();
+    return 0;
+}
+
+int sshx_link(const char *primary_path, const char *link_path)
+{
+    uint8_t buf[2 * PATH_MAX + 16];
+    penc_t e; penc_init(&e, buf, sizeof(buf));
+    penc_str(&e, primary_path);
+    penc_str(&e, link_path);
+    if (e.overflow) { errno = ENAMETOOLONG; return -1; }
+    /* Fire-and-forget: errors surface at the next barrier. */
+    if (conn_send(MSG_LINK, next_request_id(), buf, (uint32_t)e.len) != 0) {
+        return -1;
+    }
+    maybe_periodic_barrier();
+    return 0;
+}
+
 int sshx_putfile(const char *final_path, const struct stat *src_st,
                  mode_t parent_mode, const void *buf, size_t len, int inplace)
 {
