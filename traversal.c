@@ -19,6 +19,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -295,12 +296,19 @@ typedef struct finalize_batch_ctx {
     size_t end;
     size_t next;
     int failed;
+    int bind_seq;
     pthread_mutex_t lock;
 } finalize_batch_ctx_t;
 
 static void *finalize_batch_worker(void *arg)
 {
     finalize_batch_ctx_t *ctx = (finalize_batch_ctx_t *)arg;
+
+    /* Spread finalize SETMETA across the SSH connection pool (no-op locally). */
+    pthread_mutex_lock(&ctx->lock);
+    int bind_idx = ctx->bind_seq++;
+    pthread_mutex_unlock(&ctx->lock);
+    sshx_bind_thread(bind_idx);
 
     for (;;) {
         size_t idx_local;
@@ -348,8 +356,10 @@ static int finalize_directories_parallel(void)
      * Remote SETMETA is processed by the server apply pool. Drain all file and
      * mkdir work once before finalization, then drain after each depth group:
      * children must finish before their parent receives its final timestamp.
+     * The barrier must cover every connection since children may have been
+     * written by any server in the pool.
      */
-    if (sshx_active() && sshx_barrier(0) != 0) {
+    if (sshx_active() && sshx_barrier_all(0) != 0) {
         return -1;
     }
 
@@ -389,6 +399,7 @@ static int finalize_directories_parallel(void)
         ctx.end = end;
         ctx.next = start;
         ctx.failed = 0;
+        ctx.bind_seq = 0;
         pthread_mutex_init(&ctx.lock, NULL);
 
         for (i = 0; i < worker_count; i++) {
@@ -416,7 +427,7 @@ static int finalize_directories_parallel(void)
             return -1;
         }
 
-        if (sshx_active() && sshx_barrier(0) != 0) {
+        if (sshx_active() && sshx_barrier_all(0) != 0) {
             return -1;
         }
 
@@ -859,7 +870,8 @@ static void process_directory_node(dir_node_t *node)
 
 static void *traversal_worker_main(void *arg)
 {
-    (void)arg;
+    /* Spread mkdir/stat/symlink work across the SSH connection pool. */
+    sshx_bind_thread((int)(intptr_t)arg);
 
     for (;;) {
         dir_node_t *node;
@@ -940,7 +952,8 @@ int traversal_start(const char *src_dir, const char *dst_dir) {
     pthread_mutex_unlock(&g_dir_lock);
 
     for (i = 0; i < g_traversal_workers; i++) {
-        if (pthread_create(&g_threads[i], NULL, traversal_worker_main, NULL) != 0) {
+        if (pthread_create(&g_threads[i], NULL, traversal_worker_main,
+                           (void *)(intptr_t)i) != 0) {
             perror("pthread_create");
             pthread_mutex_lock(&g_dir_lock);
             g_dir_done = 1;

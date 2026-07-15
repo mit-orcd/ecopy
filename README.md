@@ -49,9 +49,22 @@ The target may be an `ssh://` URL to push a local tree to another host:
 ```
 
 - **Push only.** The source is always local; an `ssh://` source is rejected.
-- `ecopy` opens one SSH connection and runs `ecopy --server <path>` on the remote host, then streams
-  data and metadata over a single pipelined binary channel. Reads stay local (O_DIRECT, sparse detection);
+- `ecopy` opens one or more SSH connections and runs `ecopy --server <path>` on the remote host over each,
+  then streams data and metadata over pipelined binary channels. Reads stay local (O_DIRECT, sparse detection);
   the remote peer performs the destination syscalls confined under `<path>`.
+- **Parallel connections, single authentication.** `DIRECT_COPY_SSH_CONNECTIONS` (default 4) transfers over N
+  sessions to lift the single-stream throughput ceiling. Authentication happens exactly once: the first
+  connection is an SSH `ControlMaster` (it performs the one interactive prompt, e.g. an MFA/Duo push) and the
+  remaining connections attach to its control socket with `ControlMaster=no`, so they never re-authenticate.
+  Every connection still runs its own remote `ecopy --server` process; the shared destination filesystem lets any
+  connection perform any operation, and a streamed file's frames all stay on one connection. Multiplexed sessions
+  share one authenticated TCP connection with independent SSH channel windows, so they beat a per-channel-window
+  limit but not a single-TCP congestion-window limit — compare `DIRECT_COPY_SSH_CONNECTIONS=1` vs `=4` on your
+  link to see which applies. Set `DIRECT_COPY_SSH_MULTIPLEX=0` to disable the `ControlMaster` injection (each
+  session then authenticates independently). If a secondary connection fails to attach, the run degrades
+  gracefully to the connections that did come up. Requires an OpenSSH client with `ControlMaster` support and a
+  writable short socket path (under `$TMPDIR`/`/tmp`); `N=1` reproduces the classic single-channel behavior and
+  needs no multiplexing.
 - **Latency-aware by design:** small files, directory creation, and metadata updates are *fire-and-forget* (no
   per-item round-trip). A small file at or below `DIRECT_COPY_SSH_PUTFILE_MAX` ships as a single frame (path +
   metadata + data); larger files stream in pipelined chunks. Many files stream concurrently. Sparse files send
@@ -246,6 +259,8 @@ Best settings are workload- and environment-dependent. Key knobs (defaults in pa
 | `DIRECT_COPY_DISABLE_COPY_FILE_RANGE` | 0 | Skip `copy_file_range()` on buffered paths |
 | `ECOPY_SSH` | `ssh` | Command used to reach an `ssh://` target (e.g. `ssh -i key`) |
 | `ECOPY_REMOTE_CMD` | `ecopy` | Remote `ecopy` binary/command for `ssh://` targets |
+| `DIRECT_COPY_SSH_CONNECTIONS` | 4 | Parallel SSH sessions per `ssh://` run; all share one authenticated connection (1–16) |
+| `DIRECT_COPY_SSH_MULTIPLEX` | 1 | Use SSH `ControlMaster` to authenticate once for all connections; `0` disables it |
 | `DIRECT_COPY_SSH_PUTFILE_MAX` | 1024 | Max size (KiB) a file may be to ship as a single `ssh://` PUTFILE frame |
 | `DIRECT_COPY_SSH_BARRIER_OPS` | 8192 | Fire-and-forget remote ops between drain/flush barriers (min 256) |
 | `DIRECT_COPY_SSH_SERVER_THREADS` | 16 | Apply threads on the `ssh://` peer; higher hides more per-op RPC latency (max 256) |

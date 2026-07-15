@@ -795,6 +795,7 @@ typedef struct {
     int failed;
     int remote;
     int nthreads;
+    int bind_seq;
     pthread_t *threads;
 } verify_pool_t;
 
@@ -822,6 +823,13 @@ static void free_arena(verify_arena_chunk_t *arena)
 static void *verify_pool_worker(void *arg)
 {
     verify_pool_t *pool = arg;
+
+    /* Spread remote verify batches across the SSH connection pool. */
+    pthread_mutex_lock(&pool->lock);
+    int bind_idx = pool->bind_seq++;
+    pthread_mutex_unlock(&pool->lock);
+    sshx_bind_thread(bind_idx);
+
     for (;;) {
         pthread_mutex_lock(&pool->lock);
         while (!pool->head && !pool->stop) {
@@ -966,7 +974,7 @@ int verify_run_queued(int remote)
 
     failed = run_pool_list(item, remote) != 0;
     free_arena(arena);
-    if (remote && verify_enabled() && sshx_barrier(0) != 0) {
+    if (remote && verify_enabled() && sshx_barrier_all(0) != 0) {
         failed = 1;
     }
     return failed ? -1 : 0;
@@ -1074,7 +1082,7 @@ int verify_run_tree(const char *src, const char *dst, int remote,
     if (walk_submit(&pool, src, dst, &st) != 0) failed = 1;
     if (verify_pool_finish(&pool) != 0) failed = 1;
     stats_set_traversal_done();
-    if (remote && sshx_barrier(0) != 0) {
+    if (remote && sshx_barrier_all(0) != 0) {
         failed = 1;
     }
     return failed ? -1 : 0;

@@ -28,6 +28,7 @@
 #include <sys/types.h>
 #include <sys/syscall.h>
 #include <limits.h>
+#include <stdint.h>
 #include <time.h>
 
 #ifndef SEEK_DATA
@@ -2038,7 +2039,9 @@ out:
 
 static void *worker_main(void *arg)
 {
-    (void)arg;
+    /* Bind this worker to one SSH connection of the pool so a streamed file's
+     * OPEN/WRITE/COMMIT frames all land on the same server (a no-op locally). */
+    sshx_bind_thread((int)(intptr_t)arg);
 
     for (;;) {
         work_claim_t claim = dequeue_work();
@@ -2160,7 +2163,8 @@ int workers_start(void)
     }
 
     for (i = 0; i < g_worker_count; i++) {
-        if (pthread_create(&g_workers[i], NULL, worker_main, NULL) != 0) {
+        if (pthread_create(&g_workers[i], NULL, worker_main,
+                           (void *)(intptr_t)i) != 0) {
             perror("pthread_create");
             return -1;
         }

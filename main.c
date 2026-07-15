@@ -807,17 +807,27 @@ int main(int argc, char **argv) {
         stats_set_traversal_done();
     }
     workers_stop();
-    int finalize_failed = src_is_dir ? (traversal_finalize_metadata() != 0) : enqueue_failed;
 
     /*
-     * All file data has landed. Materialize deferred hard links now: every
-     * primary is fully renamed into place, and (remotely) MSG_LINK is sent
-     * before the flush barrier so the server drains all prior file frames first.
+     * Materialize deferred hard links before finalizing directory metadata.
+     * Creating a link bumps its parent directory's mtime, so the links must
+     * exist before each directory receives its preserved timestamp; otherwise
+     * the destination directory mtimes would be wrong (and --verify would flag
+     * them). Remote primaries are fire-and-forget, so drain all prior file
+     * frames across every connection first: a link's primary (possibly written
+     * by another connection) must be materialized on the shared filesystem
+     * before MSG_LINK references it.
      */
     int link_failed = 0;
-    if (!finalize_failed && src_is_dir) {
-        link_failed = (hardlinks_replay(remote) != 0);
+    if (src_is_dir) {
+        if (remote && sshx_barrier_all(0) != 0) {
+            link_failed = 1;
+        } else {
+            link_failed = (hardlinks_replay(remote) != 0);
+        }
     }
+
+    int finalize_failed = src_is_dir ? (traversal_finalize_metadata() != 0) : enqueue_failed;
 
     /* Single-file local rename: the worker landed the file under its source
      * name; move it to the requested final name if they differ. */

@@ -377,6 +377,53 @@ case_ssh_symlink_hardlink() {
     fi
 }
 
+# Copy a mixed tree (regular + symlink + hard link) over the SSH transport with
+# multiple parallel connections, and again with a single connection, asserting
+# identical results and clean --verify. With ECOPY_SSH set the pool spawns N
+# independent `ecopy --server` sessions (no ControlMaster), so this exercises the
+# connection-pool refactor end-to-end without SSH auth.
+case_ssh_parallel_connections() {
+    case_begin "ssh-parallel-connections"
+    local s="$work/sshpar_src"
+    mkdir -p "$s/sub"
+    printf 'payload\n' > "$s/real.txt"
+    ln -s real.txt "$s/link.txt"
+    head -c 4096 /dev/urandom > "$s/a.bin"
+    ln "$s/a.bin" "$s/sub/c.bin"
+    local i
+    for i in $(seq 1 40); do head -c 20000 /dev/urandom > "$s/f_$i.bin"; done
+
+    local -a base_env=(DIRECT_COPY_LARGE_THRESHOLD_MB=1 ECOPY_REMOTE_CMD="$bin")
+    if [[ "${ECOPY_HARNESS_REAL_SSH:-0}" != "1" ]]; then
+        base_env+=(ECOPY_SSH="$repo_root/tests/fake_ssh.sh")
+    fi
+
+    local n
+    for n in 1 4; do
+        local d="$work/sshpar_dst_$n"
+        if ! env "${common_env[@]}" "${base_env[@]}" DIRECT_COPY_SSH_CONNECTIONS="$n" \
+                 "$bin" --verify "$s" "ssh://localhost${d}" >/dev/null 2>&1; then
+            fail "remote ecopy (N=$n) failed"; continue
+        fi
+        if verify_regular_files "$s" "$d"; then
+            ok "N=$n: regular files match with clean --verify"
+        fi
+        if [[ -L "$d/link.txt" && "$(readlink "$d/link.txt")" == "real.txt" ]]; then
+            ok "N=$n: symlink recreated with same target"
+        else
+            fail "N=$n: symlink not recreated correctly"
+        fi
+        local ia ic
+        ia="$(stat -c %i "$d/a.bin" 2>/dev/null)"
+        ic="$(stat -c %i "$d/sub/c.bin" 2>/dev/null)"
+        if [[ -n "$ia" && "$ia" == "$ic" ]]; then
+            ok "N=$n: hard link shares one inode"
+        else
+            fail "N=$n: hard link not preserved ($ia vs $ic)"
+        fi
+    done
+}
+
 case_readonly_mode() {
     case_begin "readonly-mode"
     local s="$work/ro_src" d="$work/ro_dst"
@@ -1047,6 +1094,7 @@ case_skip_rerun
 case_symlink_preserved
 case_hardlink_preserved
 case_ssh_symlink_hardlink
+case_ssh_parallel_connections
 case_readonly_mode
 case_single_file
 case_local_fresh_policy

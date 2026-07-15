@@ -53,6 +53,17 @@ int sshx_connect(const ssh_target_t *t);
 /* True once a remote destination is active for this run. */
 int sshx_active(void);
 
+/* Number of parallel SSH connections established for this run (>=1). */
+int sshx_connection_count(void);
+
+/*
+ * Bind the calling thread to one connection of the pool (by index, taken mod
+ * the connection count). All subsequent transport calls on this thread use that
+ * connection. Threads that never bind use connection 0. Call once at thread
+ * start so a streamed file's frames all land on one server.
+ */
+void sshx_bind_thread(int idx);
+
 /* Clean shutdown: send BYE, join threads, reap ssh. Safe to call once. */
 void sshx_disconnect(void);
 
@@ -110,14 +121,18 @@ int sshx_putfile(const char *final_path, const struct stat *src_st,
                  mode_t parent_mode, const void *buf, size_t len, int inplace);
 
 /*
- * Synchronization point: drain all prior fire-and-forget frames on the server,
- * optionally flush to stable storage, and collect the cumulative remote error
- * count. Returns 0 if no remote errors so far, -1 otherwise (a diagnostic with
- * the first failing path is printed).
+ * Synchronization point on the calling thread's connection: drain its prior
+ * fire-and-forget frames, optionally flush to stable storage, and collect the
+ * cumulative remote error count. Returns 0 if no remote errors so far, -1
+ * otherwise (a diagnostic with the first failing path is printed). Use
+ * sshx_barrier_all at phase boundaries that must cover every connection.
  */
 int sshx_barrier(int flush);
 
-/* Final drain + flush. Equivalent to sshx_barrier(1). */
+/* Barrier every connection in the pool (used at phase boundaries). */
+int sshx_barrier_all(int flush);
+
+/* Final drain + flush across all connections. */
 int sshx_flush(void);
 
 /* Queue a bounded remote verification batch. final reapplies the captured
