@@ -629,6 +629,7 @@ void stats_get_progress_snapshot(progress_snapshot_t *snap) {
     snap->verify_enabled = g_stats.verify_metadata_enabled ||
                            g_stats.verify_data_enabled;
     snap->verify_only = g_stats.verify_only;
+    snap->copy_complete = g_stats.copy_complete;
     snprintf(snap->current_file, sizeof(snap->current_file), "%s", g_current_file);
     pthread_mutex_unlock(&g_lock);
     snap->rolling_gibs = stats_rolling_gibs();

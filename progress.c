@@ -152,9 +152,14 @@ static void build_progress_line(char *out, size_t out_sz) {
 
     stats_get_progress_snapshot(&snap);
     format_duration(snap.elapsed_sec, elapsed_buf, sizeof(elapsed_buf));
-    if (snap.verify_enabled &&
-        (snap.verify_only || verify_queue_depth() > 0 ||
-         verify_active_count() > 0)) {
+    /*
+     * Phase-based selection: verification overlaps copy, so choosing the display
+     * by instantaneous verify activity would flip-flop between the two formats.
+     * Show the full verify line only for --verify-only and the post-copy verify
+     * tail (copy complete); during copy the transfer line carries a compact
+     * inline verify segment instead.
+     */
+    if (snap.verify_enabled && (snap.verify_only || snap.copy_complete)) {
         char verified_buf[32];
         double coverage = snap.verify_scope_bytes
                               ? 100.0 * (double)snap.verify_bytes /
@@ -199,6 +204,24 @@ static void build_progress_line(char *out, size_t out_sz) {
         n += snprintf(out + n, out_sz - (size_t)n, " | left:00:00:00");
     } else if (n > 0 && (size_t)n < out_sz) {
         n += snprintf(out + n, out_sz - (size_t)n, " | left:scan");
+    }
+
+    /*
+     * Verify overlaps copy: carry a compact, steady verify segment on the
+     * transfer line so progress does not flip between two formats. Placed before
+     * the current-file path so it survives width trimming (the path is cut
+     * first). Shown whenever --verify is active during the copy phase.
+     */
+    if (snap.verify_enabled && !snap.verify_only && n > 0 && (size_t)n < out_sz) {
+        char verify_sampled_buf[32];
+        format_bytes_adaptive(snap.verify_bytes, verify_sampled_buf,
+                              sizeof(verify_sampled_buf));
+        n += snprintf(out + n, out_sz - (size_t)n,
+            " | vfy: %s, %" PRIu64 " obj, va:%" PRIu64 "/%d",
+            verify_sampled_buf,
+            snap.verify_objects,
+            verify_active_count(),
+            verify_worker_count());
     }
 
     if (snap.current_file_total > 0 && n > 0 && (size_t)n < out_sz) {

@@ -151,6 +151,7 @@ typedef struct {
     uint64_t verify_scope_bytes;
     int verify_enabled;
     int verify_only;
+    int copy_complete;
 } progress_snapshot_t;
 
 #endif
