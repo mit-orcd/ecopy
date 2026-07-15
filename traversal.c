@@ -591,7 +591,8 @@ static int flush_file_batch(dir_handle_t *handle,
                 }
                 stats_add_skipped_bytes((uint64_t)batch[i].st.st_size);
                 stats_inc_files_skipped();
-                if (verify_queue_file(src_path, dst_path, &batch[i].st, 1) != 0) {
+                /* Skipped files already exist at their final path (durable). */
+                if (verify_queue_file(src_path, dst_path, &batch[i].st, 1, 1) != 0) {
                     fprintf(stderr, "ecopy: unable to queue verification for %s\n",
                             dst_path);
                     rc = -1;

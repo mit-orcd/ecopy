@@ -176,10 +176,20 @@ Verification is opt-in, so ordinary copies pay no extra opens, reads, hashing, a
   and ignores target-only extras. It defaults to metadata plus 1% sampled data unless explicit
   `--verify-metadata` or `--verify-data[=PERCENT]` selectors are supplied. `--verify-skipped` is redundant in this
   mode. Local single-file target mapping is the same as copy mode; an SSH target is always a directory.
-- Verification uses a bounded post-copy/read-only worker pool. `--verify-workers=N` or
+- Verification uses a bounded read-only worker pool. `--verify-workers=N` or
   `DIRECT_COPY_VERIFY_WORKERS=N` selects 1–128 workers. Defaults are the online CPU count capped at 16 locally and
-  8 for SSH. Copy and verification remain separate phases, so the checker pool does not compete with bulk copy
-  workers.
+  8 for SSH.
+- For directory-tree copies, verification is **pipelined with copy**: the checker pool and a feeder thread start at
+  copy time and verify each file as soon as it is durable, so the verify wall time is largely hidden behind copy
+  instead of being paid afterward. Durable items (local temp+rename, remote streamed COMMIT, and skipped files) are
+  verified immediately. Remote fire-and-forget small files (`PUTFILE`) are not materialized until the next barrier,
+  so they are released in barrier-gated generations: after `DIRECT_COPY_VERIFY_PIPELINE_OPS` such files accumulate
+  (default 4096) or the feeder idles ~250 ms, one barrier materializes them and hands them to the checker pool.
+  Directory-metadata checks are always done after directory timestamps are finalized (the final step), never
+  mid-copy. Over SSH the verify traffic **shares the same connection pool** as copy, so at 100% coverage it competes
+  with copy for bandwidth. Copy workers only enqueue verify records (they never block on the checker pool), and
+  single-file copies keep the small post-copy check. Because verification overlaps copy, `Verify wall sec` and the
+  copy timings are not additive; `Total Elapsed` is the ground truth.
 - Local targets compare source and destination bytes directly. SSH targets send full 32-byte BLAKE3 digests in
   bounded batches and hash target blocks in the remote server pool; sampled file data is not sent back over SSH and
   there is one phase barrier rather than a per-file round trip. SSH verify-only starts a read-only peer and refuses
@@ -219,9 +229,10 @@ The final report separates phases so verification time never depresses the repor
 - One-second payload-rate windows begin with the first payload and end when file work drains. They include zero-rate
   stall windows and are collected even when stdout is redirected; only the live 10-second rolling display requires a
   terminal.
-- **Verification wall time/rate** measures the checker phase and sampled bytes. Scope, achieved coverage, verified
-  objects/s, the compact pre-phase pending peak, bounded worker-queue peak, hole reads avoided, hash backend, and
-  categorized failures are reported independently.
+- **Verification wall time/rate** measures the checker phase and sampled bytes. For directory trees this phase
+  overlaps copy (see pipelining above), so its wall time is not additive with the copy timings; `Total Elapsed`
+  remains the ground truth. Scope, achieved coverage, verified objects/s, the compact pending peak, bounded
+  worker-queue peak, hole reads avoided, hash backend, and categorized failures are reported independently.
 
 Percentiles use bounded integer logarithmic histograms: counts, sums, and min/max are exact, while percentile values
 are bucket approximations. Min and max are intentionally shown but are highly sensitive to single-file and
@@ -274,7 +285,8 @@ Best settings are workload- and environment-dependent. Key knobs (defaults in pa
 | `DIRECT_COPY_SSH_BARRIER_OPS` | 8192 | Fire-and-forget remote ops between drain/flush barriers (min 256) |
 | `DIRECT_COPY_SSH_SERVER_THREADS` | 16 | Apply threads on the `ssh://` peer; higher hides more per-op RPC latency (max 256) |
 | `DIRECT_COPY_SSH_SERVER_DIRECT_IO` | 1 | Remote peer opens streamed dense files with `O_DIRECT`; `0` forces buffered writes |
-| `DIRECT_COPY_VERIFY_WORKERS` | local: min(CPUs, 16); SSH: min(CPUs, 8) | Bounded post-copy/verify-only checker threads (1–128) |
+| `DIRECT_COPY_VERIFY_WORKERS` | local: min(CPUs, 16); SSH: min(CPUs, 8) | Bounded verify/verify-only checker threads (1–128) |
+| `DIRECT_COPY_VERIFY_PIPELINE_OPS` | 4096 | Remote fire-and-forget files released per barrier-gated verify generation (1–1000000) |
 | `DIRECT_COPY_NO_PRESERVE_TIMES` | 0 | Skip atime/mtime on local/NFS and `ssh://` targets (same as `--no-preserve-times`) |
 
 Out-of-range numeric values are clamped with a warning. The final report prints one suggested next-run experiment;

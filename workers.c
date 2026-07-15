@@ -1586,7 +1586,8 @@ static void finish_large_file_ctx(large_file_ctx_t *ctx)
                                 (uint64_t)ctx->src_st.st_size,
                                 monotonic_ns() - ctx->service_start_ns);
             telemetry_flush_thread();
-            if (verify_queue_file(ctx->src, ctx->dst, &ctx->src_st, 0) != 0) {
+            /* Local temp+rename: the file is durable and at its final path. */
+            if (verify_queue_file(ctx->src, ctx->dst, &ctx->src_st, 0, 1) != 0) {
                 fprintf(stderr, "ecopy: unable to queue verification for %s\n",
                         ctx->dst);
                 rc = -1;
@@ -2064,9 +2065,15 @@ static void *worker_main(void *arg)
                                     (uint64_t)claim.file_task->src_st.st_size,
                                     payload_bytes,
                                     monotonic_ns() - service_start_ns);
+                /* Fire-and-forget remote PUTFILE frames are not materialized
+                 * until the next barrier, so they are non-durable and must be
+                 * barrier-gated before verification. Everything else (local
+                 * copies, remote streamed COMMIT, sparse streamed) is durable. */
+                int durable = !sshx_active() || sparse ||
+                    claim.file_task->src_st.st_size > g_ssh_putfile_max;
                 if (verify_queue_file(claim.file_task->src,
                                       claim.file_task->dst,
-                                      &claim.file_task->src_st, 0) != 0) {
+                                      &claim.file_task->src_st, 0, durable) != 0) {
                     fprintf(stderr, "ecopy: unable to queue verification for %s\n",
                             claim.file_task->dst);
                     mark_worker_error();

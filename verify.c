@@ -7,6 +7,7 @@
 #define _GNU_SOURCE
 #include "verify.h"
 
+#include "config.h"
 #include "copy_policy.h"
 #include "fs_util.h"
 #include "progress.h"
@@ -35,6 +36,7 @@ typedef struct verify_item {
     struct stat src_st;
     int skipped;
     int is_dir;
+    int durable;
     int arena_owned;
     int dst_heap;
     struct verify_item *next;
@@ -58,16 +60,27 @@ typedef struct {
 } verify_config_t;
 
 static verify_config_t g_cfg;
-static verify_item_t *g_head;
+static verify_item_t *g_head;          /* file intake list (fed to the pool) */
 static verify_item_t *g_tail;
+static verify_item_t *g_dir_head;      /* directory items, held until finish */
+static verify_item_t *g_dir_tail;
 static verify_arena_chunk_t *g_arena_head;
 static verify_arena_chunk_t *g_arena_tail;
 static uint64_t g_pending_count;
 static uint64_t g_pending_peak;
 static pthread_mutex_t g_queue_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_queue_cv = PTHREAD_COND_INITIALIZER;
 static _Atomic uint64_t g_run_queue_depth;
 static _Atomic uint64_t g_run_active;
 static atomic_flag g_atime_warning = ATOMIC_FLAG_INIT;
+
+/* Verify pipeline (feeder) state; g_pipe_pool is declared after verify_pool_t. */
+static pthread_t g_feeder_thread;
+static int g_feeder_started;
+static int g_feeder_stop;              /* set under g_queue_lock */
+static int g_feeder_failed;
+static int g_pipe_remote;
+static uint64_t g_pipeline_ops = VERIFY_PIPELINE_OPS_DEFAULT; /* gen size */
 
 static uint64_t mix64(uint64_t x)
 {
@@ -202,13 +215,18 @@ static void append_queued_item_locked(verify_item_t *item)
 }
 
 int verify_queue_file(const char *src, const char *dst,
-                      const struct stat *src_st, int skipped)
+                      const struct stat *src_st, int skipped, int durable)
 {
     verify_item_t *item;
     if (!verify_enabled() || (skipped && !g_cfg.include_skipped)) return 0;
     pthread_mutex_lock(&g_queue_lock);
     item = make_queued_item_locked(src, dst, src_st, skipped, 0);
-    if (item) append_queued_item_locked(item);
+    if (item) {
+        item->durable = durable ? 1 : 0;
+        append_queued_item_locked(item);
+        /* Wake the feeder (a no-op when the pipeline is not running). */
+        pthread_cond_signal(&g_queue_cv);
+    }
     pthread_mutex_unlock(&g_queue_lock);
     return item ? 0 : -1;
 }
@@ -220,7 +238,14 @@ int verify_queue_directory(const char *src, const char *dst,
     if (!g_cfg.metadata) return 0;
     pthread_mutex_lock(&g_queue_lock);
     item = make_queued_item_locked(src, dst, src_st, 0, 1);
-    if (item) append_queued_item_locked(item);
+    if (item) {
+        /* Directory metadata is finalized deepest-first at the end of the run,
+         * so these items are held on a separate list and only released in
+         * verify_pipeline_finish() / verify_run_queued(). */
+        if (g_dir_tail) g_dir_tail->next = item;
+        else g_dir_head = item;
+        g_dir_tail = item;
+    }
     pthread_mutex_unlock(&g_queue_lock);
     return item ? 0 : -1;
 }
@@ -888,6 +913,9 @@ typedef struct {
     pthread_t *threads;
 } verify_pool_t;
 
+/* The long-lived pool used by the copy/verify pipeline. */
+static verify_pool_t g_pipe_pool;
+
 static void free_item(verify_item_t *item)
 {
     if (!item) return;
@@ -1049,12 +1077,21 @@ static int run_pool_list(verify_item_t *list, int remote)
 int verify_run_queued(int remote)
 {
     verify_item_t *item;
+    verify_item_t *tail;
     verify_arena_chunk_t *arena;
     int failed;
     pthread_mutex_lock(&g_queue_lock);
     item = g_head;
+    tail = g_tail;
+    /* Directory items were held on a separate list; append them so the single
+     * post-copy drain verifies both files and directories. */
+    if (g_dir_head) {
+        if (tail) tail->next = g_dir_head;
+        else item = g_dir_head;
+    }
     arena = g_arena_head;
     g_head = g_tail = NULL;
+    g_dir_head = g_dir_tail = NULL;
     g_arena_head = g_arena_tail = NULL;
     stats_set_verify_pending_peak(g_pending_peak);
     g_pending_count = 0;
@@ -1066,6 +1103,175 @@ int verify_run_queued(int remote)
     if (remote && verify_enabled() && sshx_barrier_all(0) != 0) {
         failed = 1;
     }
+    return failed ? -1 : 0;
+}
+
+/* Barrier-gate then submit a generation of non-durable (remote fire-and-forget)
+ * items. The barrier drains every SSH connection, materializing the PUTFILE
+ * targets before verification opens them. Local items are always durable, so
+ * this list stays empty and no barrier is issued for local runs. */
+static int pipeline_flush_gen(verify_item_t **head, verify_item_t **tail,
+                              uint64_t *count)
+{
+    int rc = 0;
+    verify_item_t *it = *head;
+    if (!it) return 0;
+    if (g_pipe_remote && sshx_barrier_all(0) != 0) rc = -1;
+    while (it) {
+        verify_item_t *next = it->next;
+        it->next = NULL;
+        if (verify_pool_submit(&g_pipe_pool, it) != 0) rc = -1;
+        it = next;
+    }
+    *head = *tail = NULL;
+    *count = 0;
+    return rc;
+}
+
+static void *verify_feeder_main(void *arg)
+{
+    (void)arg;
+    verify_item_t *gen_head = NULL, *gen_tail = NULL;
+    uint64_t gen_count = 0;
+
+    /* Bind the feeder to a connection so its barriers use a valid stream. */
+    sshx_bind_thread(0);
+
+    for (;;) {
+        int timed_out = 0;
+        pthread_mutex_lock(&g_queue_lock);
+        while (!g_head && !g_feeder_stop) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_nsec += 250L * 1000L * 1000L;
+            if (ts.tv_nsec >= 1000000000L) {
+                ts.tv_sec += 1;
+                ts.tv_nsec -= 1000000000L;
+            }
+            if (pthread_cond_timedwait(&g_queue_cv, &g_queue_lock, &ts) ==
+                ETIMEDOUT) {
+                timed_out = 1;
+                break;
+            }
+        }
+        verify_item_t *batch = g_head;
+        g_head = g_tail = NULL;
+        int stop = g_feeder_stop;
+        pthread_mutex_unlock(&g_queue_lock);
+
+        uint64_t stolen = 0;
+        while (batch) {
+            verify_item_t *next = batch->next;
+            batch->next = NULL;
+            if (batch->durable) {
+                if (verify_pool_submit(&g_pipe_pool, batch) != 0) {
+                    g_feeder_failed = 1;
+                }
+            } else {
+                if (gen_tail) gen_tail->next = batch;
+                else gen_head = batch;
+                gen_tail = batch;
+                gen_count++;
+            }
+            stolen++;
+            batch = next;
+        }
+        if (stolen) {
+            pthread_mutex_lock(&g_queue_lock);
+            g_pending_count -= stolen;
+            pthread_mutex_unlock(&g_queue_lock);
+        }
+
+        /* Release a generation when it is full or when copy has gone idle. */
+        if (gen_count &&
+            (gen_count >= g_pipeline_ops || timed_out || stop)) {
+            if (pipeline_flush_gen(&gen_head, &gen_tail, &gen_count) != 0) {
+                g_feeder_failed = 1;
+            }
+        }
+        if (stop) break;
+    }
+    return NULL;
+}
+
+int verify_pipeline_start(int remote)
+{
+    const char *env;
+    if (!verify_enabled()) return 0;
+
+    env = getenv("DIRECT_COPY_VERIFY_PIPELINE_OPS");
+    if (env && *env) {
+        long v = strtol(env, NULL, 10);
+        if (v >= 1 && v <= 1000000) g_pipeline_ops = (uint64_t)v;
+    }
+    g_pipe_remote = remote;
+    g_feeder_stop = 0;
+    g_feeder_failed = 0;
+
+    if (verify_pool_start(&g_pipe_pool, remote) != 0) {
+        fprintf(stderr, "ecopy: unable to start verification workers\n");
+        return -1;
+    }
+    if (pthread_create(&g_feeder_thread, NULL, verify_feeder_main, NULL) != 0) {
+        pthread_mutex_lock(&g_pipe_pool.lock);
+        g_pipe_pool.stop = 1;
+        pthread_cond_broadcast(&g_pipe_pool.work_cv);
+        pthread_mutex_unlock(&g_pipe_pool.lock);
+        verify_pool_finish(&g_pipe_pool);
+        return -1;
+    }
+    g_feeder_started = 1;
+    return 0;
+}
+
+int verify_pipeline_finish(int remote, int include_dirs)
+{
+    verify_item_t *dirs;
+    verify_arena_chunk_t *arena;
+    int failed;
+
+    if (!g_feeder_started) return 0;
+
+    /* Stop the feeder: it drains any remaining file items and flushes its final
+     * generation (materialized already by the sshx_flush() in main). */
+    pthread_mutex_lock(&g_queue_lock);
+    g_feeder_stop = 1;
+    pthread_cond_signal(&g_queue_cv);
+    pthread_mutex_unlock(&g_queue_lock);
+    pthread_join(g_feeder_thread, NULL);
+    g_feeder_started = 0;
+
+    failed = g_feeder_failed;
+
+    pthread_mutex_lock(&g_queue_lock);
+    dirs = g_dir_head;
+    g_dir_head = g_dir_tail = NULL;
+    stats_set_verify_pending_peak(g_pending_peak);
+    pthread_mutex_unlock(&g_queue_lock);
+
+    /* Directory metadata is now finalized and flushed; release those items. */
+    while (dirs) {
+        verify_item_t *next = dirs->next;
+        dirs->next = NULL;
+        if (include_dirs) {
+            if (verify_pool_submit(&g_pipe_pool, dirs) != 0) failed = 1;
+        }
+        /* Arena-owned items need no free; the arena is released below. */
+        dirs = next;
+    }
+
+    if (verify_pool_finish(&g_pipe_pool) != 0) failed = 1;
+    if (remote && sshx_barrier_all(0) != 0) failed = 1;
+
+    pthread_mutex_lock(&g_queue_lock);
+    arena = g_arena_head;
+    g_head = g_tail = NULL;
+    g_arena_head = g_arena_tail = NULL;
+    g_pending_count = 0;
+    g_pending_peak = 0;
+    pthread_mutex_unlock(&g_queue_lock);
+    free_arena(arena);
+
     return failed ? -1 : 0;
 }
 

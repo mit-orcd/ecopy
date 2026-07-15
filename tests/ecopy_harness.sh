@@ -983,6 +983,104 @@ case_verify_sparse_data_domain() {
     fi
 }
 
+# A mixed tree exercising every durability class of the verify pipeline: many
+# small files (remote fire-and-forget PUTFILE, barrier-gated), a streamed file
+# over 1 MiB (durable at COMMIT), and nested directories (released after
+# finalize). A tiny DIRECT_COPY_VERIFY_PIPELINE_OPS forces several barrier-gated
+# generations so the release path is actually taken.
+mk_pipeline_tree() {
+    local root="$1" i
+    mkdir -p "$root/d1/d2"
+    for i in $(seq 0 19); do
+        head -c $(((i % 4 + 1) * 1024)) /dev/urandom > "$root/small_$i.bin"
+    done
+    head -c 3000 /dev/urandom > "$root/d1/a.bin"
+    head -c 5000 /dev/urandom > "$root/d1/d2/b.bin"
+    head -c 2097152 /dev/urandom > "$root/big.bin"
+}
+
+case_verify_pipeline_local() {
+    case_begin "verify-pipeline-local"
+    local s="$work/pipe_local_src" d="$work/pipe_local_dst"
+    local out rc files dirs vobj
+    mk_pipeline_tree "$s"
+
+    out="$(env "${common_env[@]}" DIRECT_COPY_DISABLE_DIRECT_IO=1 \
+              DIRECT_COPY_VERIFY_PIPELINE_OPS=8 \
+              "$bin" --verify --verify-data=100 --verify-seed=321 \
+              "$s" "$d" 2>&1)"; rc=$?
+    files="$(grep -E 'Files seen' <<<"$out" | grep -oE '[0-9]+' | head -1)"
+    dirs="$(grep -E 'Dirs seen' <<<"$out" | grep -oE '[0-9]+' | head -1)"
+    vobj="$(grep -E 'Verify objects' <<<"$out" | grep -oE '[0-9]+' | head -1)"
+    if [[ "$rc" -eq 0 ]] && grep -q 'Verify failures   : 0' <<<"$out" &&
+       [[ -n "$files" && -n "$dirs" && -n "$vobj" &&
+          $((files + dirs)) -eq "$vobj" && "$vobj" -gt 0 ]]; then
+        ok "local pipeline verify clean, objects=$vobj (files=$files dirs=$dirs)"
+    else
+        fail "local pipeline verify: $(tr '\n' ' ' <<<"$out")"
+        return
+    fi
+
+    # Corrupt a small file and the streamed file; keep size+mtime so traversal
+    # skips them and --verify-skipped must still catch both content changes.
+    printf X | dd of="$d/small_3.bin" bs=1 seek=100 conv=notrunc status=none
+    touch -r "$s/small_3.bin" "$d/small_3.bin"
+    printf X | dd of="$d/big.bin" bs=1 seek=1048576 conv=notrunc status=none
+    touch -r "$s/big.bin" "$d/big.bin"
+    out="$(env "${common_env[@]}" DIRECT_COPY_DISABLE_DIRECT_IO=1 \
+              "$bin" --verify --verify-data=100 --verify-skipped --verify-seed=321 \
+              "$s" "$d" 2>&1)"; rc=$?
+    if [[ "$rc" -ne 0 ]] && grep -q 'verification data mismatch' <<<"$out"; then
+        ok "local pipeline corruption detected"
+    else
+        fail "local pipeline corruption detection: $(tr '\n' ' ' <<<"$out")"
+    fi
+}
+
+case_verify_pipeline_remote() {
+    case_begin "verify-pipeline-remote"
+    local s="$work/pipe_remote_src" rd="$work/pipe_remote_dst"
+    local out rc files dirs vobj
+    mk_pipeline_tree "$s"
+    local -a remote_env=(DIRECT_COPY_LARGE_THRESHOLD_MB=1 ECOPY_REMOTE_CMD="$bin")
+    if [[ "${ECOPY_HARNESS_REAL_SSH:-0}" != "1" ]]; then
+        remote_env+=(ECOPY_SSH="$repo_root/tests/fake_ssh.sh")
+    fi
+
+    out="$(env "${common_env[@]}" "${remote_env[@]}" \
+              DIRECT_COPY_VERIFY_PIPELINE_OPS=8 "$bin" \
+              --verify --verify-data=100 --verify-seed=654 \
+              "$s" "ssh://localhost${rd}" 2>&1)"; rc=$?
+    files="$(grep -E 'Files seen' <<<"$out" | grep -oE '[0-9]+' | head -1)"
+    dirs="$(grep -E 'Dirs seen' <<<"$out" | grep -oE '[0-9]+' | head -1)"
+    vobj="$(grep -E 'Verify objects' <<<"$out" | grep -oE '[0-9]+' | head -1)"
+    if [[ "$rc" -eq 0 ]] && grep -q 'Verify failures   : 0' <<<"$out" &&
+       ! grep -q 'remote reported' <<<"$out" &&
+       [[ -n "$files" && -n "$dirs" && -n "$vobj" &&
+          $((files + dirs)) -eq "$vobj" && "$vobj" -gt 0 ]]; then
+        ok "remote pipeline verify clean, objects=$vobj (files=$files dirs=$dirs)"
+    else
+        fail "remote pipeline verify: $(tr '\n' ' ' <<<"$out")"
+        return
+    fi
+
+    # Corrupt a barrier-gated small file and the streamed file; size+mtime kept
+    # so both are skipped, and --verify-skipped over SSH must detect both.
+    printf Y | dd of="$rd/small_5.bin" bs=1 seek=50 conv=notrunc status=none
+    touch -r "$s/small_5.bin" "$rd/small_5.bin"
+    printf Y | dd of="$rd/big.bin" bs=1 seek=1048576 conv=notrunc status=none
+    touch -r "$s/big.bin" "$rd/big.bin"
+    out="$(env "${common_env[@]}" "${remote_env[@]}" "$bin" \
+              --verify --verify-data=100 --verify-skipped --verify-seed=654 \
+              "$s" "ssh://localhost${rd}" 2>&1)"; rc=$?
+    if [[ "$rc" -ne 0 ]] && grep -q 'remote reported' <<<"$out" &&
+       grep -Eq 'data mismatches[[:space:]]*: [1-9]' <<<"$out"; then
+        ok "remote pipeline corruption detected"
+    else
+        fail "remote pipeline corruption detection: $(tr '\n' ' ' <<<"$out")"
+    fi
+}
+
 case_verify_only() {
     case_begin "verify-only"
     local s="$work/verify_only_src" d="$work/verify_only_dst"
@@ -1206,6 +1304,8 @@ case_ssh_empty_dir_collision
 case_ssh_no_preserve_times
 case_transfer_verification
 case_verify_sparse_data_domain
+case_verify_pipeline_local
+case_verify_pipeline_remote
 case_verify_only
 
 echo

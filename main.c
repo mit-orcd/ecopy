@@ -791,12 +791,32 @@ int main(int argc, char **argv) {
     }
     if (progress_start() != 0) { workers_stop(); sshx_disconnect(); return 1; }
 
+    /*
+     * Overlap verification with copy for directory trees: start the verify pool
+     * and feeder now so copy workers can hand off finished files immediately.
+     * Single-file copies keep the post-copy drain (a rename may retarget the
+     * verify path after workers stop), so their tiny verify wall is not worth
+     * pipelining.
+     */
+    int verify_pipeline_on = 0;
+    if (src_is_dir && verify_enabled()) {
+        stats_set_verification_started();
+        if (verify_pipeline_start(remote) != 0) {
+            progress_stop();
+            workers_stop();
+            sshx_disconnect();
+            return 1;
+        }
+        verify_pipeline_on = 1;
+    }
+
     int enqueue_failed = 0;
     hardlinks_reset();
     if (src_is_dir) {
         if (traversal_start(src_abs, dst_root) != 0) {
-            progress_stop();
             workers_stop();
+            if (verify_pipeline_on) verify_pipeline_finish(remote, 0);
+            progress_stop();
             sshx_disconnect();
             return 1;
         }
@@ -853,7 +873,13 @@ int main(int argc, char **argv) {
     }
     stats_set_copy_complete();
     int verify_failed = 0;
-    if (!finalize_failed && !remote_failed && verify_enabled()) {
+    if (verify_pipeline_on) {
+        /* Always join the feeder/pool (even on failure) so no threads leak;
+         * only release directory-metadata items when the copy fully succeeded. */
+        verify_failed = (verify_pipeline_finish(
+                             remote, !finalize_failed && !remote_failed) != 0);
+        stats_set_verification_done();
+    } else if (!finalize_failed && !remote_failed && verify_enabled()) {
         stats_set_verification_started();
         verify_failed = (verify_run_queued(remote) != 0);
         stats_set_verification_done();

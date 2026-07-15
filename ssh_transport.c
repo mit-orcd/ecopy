@@ -900,7 +900,13 @@ static void publish_remote_drain(void)
 }
 
 /* Issue a BARRIER on one connection and fold its aggregates into stats. */
-static int barrier_conn(conn_t *c, int flush)
+/*
+ * Issue one BARRIER on a connection. The caller must hold c->barrier_lock so
+ * that barriers on the same connection are serialized: the pipeline feeder can
+ * call sshx_barrier_all() concurrently with copy workers' periodic barriers,
+ * and the per-connection verify_counts delta bookkeeping below must not race.
+ */
+static int barrier_conn_locked(conn_t *c, int flush)
 {
     uint8_t buf[1];
     penc_t e; penc_init(&e, buf, sizeof(buf));
@@ -952,6 +958,14 @@ static int barrier_conn(conn_t *c, int flush)
     return 0;
 }
 
+static int barrier_conn(conn_t *c, int flush)
+{
+    pthread_mutex_lock(&c->barrier_lock);
+    int rc = barrier_conn_locked(c, flush);
+    pthread_mutex_unlock(&c->barrier_lock);
+    return rc;
+}
+
 /*
  * Count one fire-and-forget op on the current connection and, once enough have
  * accumulated, issue a periodic BARRIER to bound the outstanding window and
@@ -968,7 +982,7 @@ static void maybe_periodic_barrier(conn_t *c)
     }
     if (atomic_load(&c->ops_since_barrier) >= c->barrier_ops) {
         atomic_store(&c->ops_since_barrier, 0);
-        (void)barrier_conn(c, 0);
+        (void)barrier_conn_locked(c, 0);
     }
     pthread_mutex_unlock(&c->barrier_lock);
 }
