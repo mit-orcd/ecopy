@@ -22,7 +22,7 @@
 #include <string.h>
 #include <sys/types.h>
 
-#define ECOPY_PROTO_VERSION 9u
+#define ECOPY_PROTO_VERSION 10u
 
 /* Upper bound on a single control-frame payload we are willing to read. Data
  * frames (WRITE) carry their own length and are streamed, so this only bounds
@@ -87,6 +87,7 @@ typedef enum {
  * PRESERVE_TIMES bit as "preserve" so behavior is unchanged by default.
  */
 #define ECOPY_OPT_PRESERVE_TIMES 0x1u  /* apply atime/mtime (else skip the SETATTR) */
+#define ECOPY_OPT_SERVER_BUFFERED 0x2u /* disable server O_DIRECT (buffered writes) */
 
 /* Fixed frame header: type(u8), request id(u64 LE), payload length(u32 LE). */
 #define ECOPY_HDR_LEN 13u

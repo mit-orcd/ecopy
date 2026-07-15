@@ -424,6 +424,41 @@ case_ssh_parallel_connections() {
     done
 }
 
+# Stream dense files (> PUTFILE max, so they take the OPEN/WRITE/COMMIT path) to
+# an ssh:// target with the server opening them O_DIRECT (the default), and again
+# with server direct I/O disabled. Files include exactly-aligned sizes and
+# unaligned tails so the buffered-tail path is exercised. On a filesystem that
+# lacks O_DIRECT (e.g. tmpfs) the server open falls back to buffered; either way
+# content and --verify must be clean.
+case_ssh_server_direct_io() {
+    case_begin "ssh-server-direct-io"
+    local s="$work/sdio_src"
+    mkdir -p "$s"
+    # All > 1 MiB (default PUTFILE max) to force the streamed path.
+    head -c $((2 * 1024 * 1024))        /dev/urandom > "$s/aligned_2m.bin"
+    head -c $((2 * 1024 * 1024 + 123))  /dev/urandom > "$s/tail_123.bin"
+    head -c $((1 * 1024 * 1024 + 4095)) /dev/urandom > "$s/tail_4095.bin"
+    head -c $((3 * 1024 * 1024 + 4096)) /dev/urandom > "$s/aligned_3m4k.bin"
+
+    local -a base_env=(DIRECT_COPY_LARGE_THRESHOLD_MB=1 ECOPY_REMOTE_CMD="$bin")
+    if [[ "${ECOPY_HARNESS_REAL_SSH:-0}" != "1" ]]; then
+        base_env+=(ECOPY_SSH="$repo_root/tests/fake_ssh.sh")
+    fi
+
+    local mode dio
+    for mode in on off; do
+        [[ "$mode" == "on" ]] && dio=1 || dio=0
+        local d="$work/sdio_dst_$mode"
+        if ! env "${common_env[@]}" "${base_env[@]}" DIRECT_COPY_SSH_SERVER_DIRECT_IO="$dio" \
+                 "$bin" --verify "$s" "ssh://localhost${d}" >/dev/null 2>&1; then
+            fail "server direct I/O=$dio run failed"; continue
+        fi
+        if verify_regular_files "$s" "$d"; then
+            ok "direct I/O=$dio: streamed files match with clean --verify"
+        fi
+    done
+}
+
 case_readonly_mode() {
     case_begin "readonly-mode"
     local s="$work/ro_src" d="$work/ro_dst"
@@ -1095,6 +1130,7 @@ case_symlink_preserved
 case_hardlink_preserved
 case_ssh_symlink_hardlink
 case_ssh_parallel_connections
+case_ssh_server_direct_io
 case_readonly_mode
 case_single_file
 case_local_fresh_policy

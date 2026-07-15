@@ -511,6 +511,12 @@ static int handshake(conn_t *c, const char *expect_path)
     uint32_t options = copy_policy_preserve_times()
                            ? ECOPY_OPT_PRESERVE_TIMES
                            : 0;
+    /* Server opens streamed dense files with O_DIRECT by default; let the client
+     * turn it off (server then writes buffered). Absent bit => direct. */
+    {
+        const char *s = getenv("DIRECT_COPY_SSH_SERVER_DIRECT_IO");
+        if (s && s[0] == '0') options |= ECOPY_OPT_SERVER_BUFFERED;
+    }
 
     penc_init(&e, buf, sizeof(buf));
     penc_u32(&e, ECOPY_PROTO_VERSION);

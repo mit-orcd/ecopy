@@ -82,6 +82,11 @@ The target may be an `ssh://` URL to push a local tree to another host:
   separate synchronous RPC, so a single-threaded peer sits idle waiting on latency. The remote runs an apply pool
   (`DIRECT_COPY_SSH_SERVER_THREADS`, default 16) so file writes and final directory metadata run concurrently.
   Barriers before finalization and between directory-depth groups preserve ordering for restrictive parent modes.
+- **Direct I/O on the peer:** the remote opens streamed dense files with `O_DIRECT` (bypassing its page cache),
+  writing the client's already block-aligned chunks straight through. The single unaligned tail of a file, and any
+  filesystem that rejects `O_DIRECT`, transparently fall back to buffered writes so a transfer never fails on
+  alignment. Small (single-frame) files and sparse files always use buffered writes. Set
+  `DIRECT_COPY_SSH_SERVER_DIRECT_IO=0` on the client to force buffered writes on the peer.
 - **Batched client scheduling:** traversal appends each stat group to the file queues under one lock instead of
   locking and signaling once per file. The same scheduler path is used for local/NFS and SSH destinations.
 - **Fewer RPCs per file:** the peer creates files with their final mode (no extra `fchmod`) and skips `chown` when
@@ -264,6 +269,7 @@ Best settings are workload- and environment-dependent. Key knobs (defaults in pa
 | `DIRECT_COPY_SSH_PUTFILE_MAX` | 1024 | Max size (KiB) a file may be to ship as a single `ssh://` PUTFILE frame |
 | `DIRECT_COPY_SSH_BARRIER_OPS` | 8192 | Fire-and-forget remote ops between drain/flush barriers (min 256) |
 | `DIRECT_COPY_SSH_SERVER_THREADS` | 16 | Apply threads on the `ssh://` peer; higher hides more per-op RPC latency (max 256) |
+| `DIRECT_COPY_SSH_SERVER_DIRECT_IO` | 1 | Remote peer opens streamed dense files with `O_DIRECT`; `0` forces buffered writes |
 | `DIRECT_COPY_VERIFY_WORKERS` | local: min(CPUs, 16); SSH: min(CPUs, 8) | Bounded post-copy/verify-only checker threads (1–128) |
 | `DIRECT_COPY_NO_PRESERVE_TIMES` | 0 | Skip atime/mtime on local/NFS and `ssh://` targets (same as `--no-preserve-times`) |
 

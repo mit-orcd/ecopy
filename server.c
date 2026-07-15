@@ -42,12 +42,22 @@
 #define PATH_MAX 4096
 #endif
 
+/*
+ * Block alignment for O_DIRECT on the destination. 4096 is a multiple of every
+ * common logical block size (512/4096), so buffers/offsets/lengths aligned to it
+ * satisfy O_DIRECT everywhere. The client already sends streamed dense writes at
+ * 4096-aligned offsets and lengths (chunk size is a MiB multiple) except the
+ * final tail, which we handle by dropping to buffered for that one write.
+ */
+#define ECOPY_DIRECT_ALIGN 4096u
+
 /* -------------------- open-file table -------------------- */
 
 typedef struct open_file {
     uint64_t id;
     int fd;
     int inplace;
+    int direct;       /* fd currently open with O_DIRECT (streamed dense files) */
     int failed;
     int32_t err;      /* negative errno of the first failure */
     char tmp_path[PATH_MAX];
@@ -62,6 +72,7 @@ static int g_root_present;           /* did the confinement root exist before we
 static uid_t g_euid;                 /* our effective ids: skip no-op chown RPCs */
 static gid_t g_egid;
 static int g_preserve_times = 1;     /* client HELLO option: apply atime/mtime? */
+static int g_server_direct_io = 1;   /* open streamed dense files with O_DIRECT */
 
 /*
  * Deferred error log for fire-and-forget operations (PUTFILE/MKDIR/SETMETA).
@@ -662,6 +673,9 @@ static int handle_hello(uint64_t id, const uint8_t *payload, uint32_t plen, cons
      * older client is treated as "preserve" so default behavior is unchanged. */
     uint32_t opts = pdec_u32(&d);
     g_preserve_times = (d.error || (opts & ECOPY_OPT_PRESERVE_TIMES)) ? 1 : 0;
+    /* Default: open streamed dense files with O_DIRECT. The client sets the
+     * SERVER_BUFFERED bit to turn it off; a missing bit keeps direct on. */
+    if (!d.error && (opts & ECOPY_OPT_SERVER_BUFFERED)) g_server_direct_io = 0;
 
     g_caps = ccaps;
 
@@ -691,6 +705,42 @@ static int handle_hello(uint64_t id, const uint8_t *payload, uint32_t plen, cons
      * decide to bootstrap; the version field is what it checks. */
     (void)cver; (void)root;
     return frame_write(STDOUT_FILENO, MSG_HELLO_OK, id, buf, (uint32_t)e.len);
+}
+
+/* True if an O_DIRECT open should be retried as a plain buffered open. */
+static int direct_open_fallback_errno(int e)
+{
+    return e == EINVAL || e == EOPNOTSUPP || e == ENOTSUP || e == ENOSYS ||
+           e == EPERM;
+}
+
+/*
+ * Aligned bounce buffer for O_DIRECT writes. handle_write runs only on the
+ * single reader thread (WRITE is never pooled), so this needs no locking. Grown
+ * on demand and freed in server_main cleanup.
+ */
+static uint8_t *g_wbuf;
+static size_t g_wbuf_cap;
+
+static uint8_t *wbuf_ensure(size_t need)
+{
+    if (g_wbuf_cap >= need) return g_wbuf;
+    size_t want = ECOPY_DIRECT_ALIGN;
+    while (want < need) want <<= 1;
+    void *p = NULL;
+    if (posix_memalign(&p, ECOPY_DIRECT_ALIGN, want) != 0) return NULL;
+    free(g_wbuf);
+    g_wbuf = (uint8_t *)p;
+    g_wbuf_cap = want;
+    return g_wbuf;
+}
+
+/* Turn off O_DIRECT on an open file's fd so subsequent writes go buffered. */
+static void drop_direct(open_file_t *f)
+{
+    int fl = fcntl(f->fd, F_GETFL);
+    if (fl >= 0) (void)fcntl(f->fd, F_SETFL, fl & ~O_DIRECT);
+    f->direct = 0;
 }
 
 static void handle_open(const uint8_t *payload, uint32_t plen)
@@ -729,11 +779,20 @@ static void handle_open(const uint8_t *payload, uint32_t plen)
         return;
     }
 
-    int fd;
+    /*
+     * Streamed dense files get O_DIRECT (bypass the page cache) when the client
+     * left it enabled. Sparse files stay buffered: their write offsets/lengths
+     * are hole-derived and not block-aligned. If the filesystem rejects
+     * O_DIRECT at open time, retry buffered so the transfer still succeeds.
+     */
+    int want_direct = g_server_direct_io && !(flags & ECOPY_OPEN_SPARSE);
+    int base_flags = f->inplace
+                         ? (O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC)
+                         : (O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC);
+    mode_t create_mode = copy_data_mode((mode_t)mode);
+
     if (f->inplace) {
         snprintf(f->tmp_path, sizeof(f->tmp_path), "%s", finalp);
-        fd = open(finalp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,
-                  copy_data_mode((mode_t)mode));
     } else {
         int need = snprintf(f->tmp_path, sizeof(f->tmp_path), "%s/.ecopy.tmp.%u.%llu",
                             dir, (unsigned)getpid(), (unsigned long long)fid);
@@ -742,8 +801,21 @@ static void handle_open(const uint8_t *payload, uint32_t plen)
             f->next = g_files; g_files = f;
             return;
         }
-        fd = open(f->tmp_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
-                  copy_data_mode((mode_t)mode));
+    }
+
+    int fd = -1;
+    if (want_direct) {
+        fd = open(f->tmp_path, base_flags | O_DIRECT, create_mode);
+        if (fd >= 0) {
+            f->direct = 1;
+        } else if (!direct_open_fallback_errno(errno)) {
+            f->failed = 1; f->err = -errno;
+            f->next = g_files; g_files = f;
+            return;
+        }
+    }
+    if (fd < 0) {
+        fd = open(f->tmp_path, base_flags, create_mode);
     }
 
     if (fd < 0) {
@@ -780,6 +852,53 @@ static void handle_write(const uint8_t *payload, uint32_t plen)
     if (f->failed || f->fd < 0) return;
 
     uint64_t t0 = server_ns();
+
+    /*
+     * Direct path: full aligned blocks are written from an aligned bounce
+     * buffer with O_DIRECT. The single unaligned tail (always the last write of
+     * a dense file) and any surprise EINVAL drop the fd to buffered. A
+     * misaligned offset (shouldn't happen for dense) also falls back.
+     */
+    if (f->direct) {
+        int aligned = ((offset % ECOPY_DIRECT_ALIGN) == 0) &&
+                      ((len % ECOPY_DIRECT_ALIGN) == 0);
+        if (!aligned) {
+            drop_direct(f);
+        } else {
+            uint8_t *ab = wbuf_ensure(len);
+            if (!ab) {
+                drop_direct(f);         /* no aligned buffer: fall back */
+            } else {
+                memcpy(ab, data, len);
+                size_t done = 0;
+                int fell_back = 0;
+                while (done < len) {
+                    ssize_t w = pwrite(f->fd, ab + done, len - done,
+                                       offset + (off_t)done);
+                    if (w < 0) {
+                        if (errno == EINTR) continue;
+                        if (errno == EINVAL && done == 0) {
+                            drop_direct(f); /* alignment surprise: go buffered */
+                            fell_back = 1;
+                            break;
+                        }
+                        f->failed = 1; f->err = -errno;
+                        break;
+                    }
+                    if (w == 0) { f->failed = 1; f->err = -EIO; break; }
+                    done += (size_t)w;
+                }
+                if (!fell_back) {
+                    atomic_fetch_add(&g_drain_bytes, (uint64_t)done);
+                    atomic_fetch_add(&g_drain_ns, server_ns() - t0);
+                    return;
+                }
+            }
+        }
+    }
+
+    /* Buffered path (also the fallback target from above): write directly from
+     * the frame payload; no alignment constraints. */
     size_t done = 0;
     while (done < len) {
         ssize_t w = pwrite(f->fd, data + done, len - done, offset + (off_t)done);
@@ -1656,6 +1775,9 @@ int server_main(const char *root, int read_only)
             free(payload);
             pool_shutdown();
             dir_cache_destroy();
+            free(g_wbuf);
+            g_wbuf = NULL;
+            g_wbuf_cap = 0;
             return 0;
         default:            break; /* ignore unknown */
         }
@@ -1677,5 +1799,8 @@ int server_main(const char *root, int read_only)
         if (!f->inplace && f->tmp_path[0]) (void)unlink(f->tmp_path);
         free(f);
     }
+    free(g_wbuf);
+    g_wbuf = NULL;
+    g_wbuf_cap = 0;
     return 0;
 }
