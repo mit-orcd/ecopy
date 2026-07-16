@@ -62,4 +62,15 @@
  */
 #define SSH_VERIFY_CONNECTIONS_DEFAULT (-1)
 
+/*
+ * Cipher preference list biased toward hardware-accelerated AEAD ciphers
+ * (AES-NI + GHASH), fastest first. Injected as `Ciphers=^<list>` so the `^`
+ * prepends these to the client's default cipher set: every default cipher stays
+ * available as automatic fallback, so KEX can never fail because of this
+ * preference. Only used when driving the stock ssh client and only on OpenSSH
+ * >= 7.8 (the `^` prepend syntax). Override with DIRECT_COPY_SSH_CIPHER
+ * (0/off disables; any other value replaces this list verbatim).
+ */
+#define SSH_CIPHER_DEFAULT "aes128-gcm@openssh.com,aes256-gcm@openssh.com,chacha20-poly1305@openssh.com"
+
 #endif

@@ -60,11 +60,26 @@ The target may be an `ssh://` URL to push a local tree to another host:
   connection perform any operation, and a streamed file's frames all stay on one connection. Multiplexed sessions
   share one authenticated TCP connection with independent SSH channel windows, so they beat a per-channel-window
   limit but not a single-TCP congestion-window limit — compare `DIRECT_COPY_SSH_CONNECTIONS=1` vs `=4` on your
-  link to see which applies. Set `DIRECT_COPY_SSH_MULTIPLEX=0` to disable the `ControlMaster` injection (each
-  session then authenticates independently). If a secondary connection fails to attach, the run degrades
-  gracefully to the connections that did come up. Requires an OpenSSH client with `ControlMaster` support and a
-  writable short socket path (under `$TMPDIR`/`/tmp`); `N=1` reproduces the classic single-channel behavior and
-  needs no multiplexing.
+  link to see which applies. Set `DIRECT_COPY_SSH_MULTIPLEX=0` to disable the `ControlMaster` injection so each
+  session gets its own independent TCP flow (separate KEX/cipher and congestion window, which can beat a
+  single-TCP ceiling) — but then **each connection authenticates independently, so an MFA/Duo prompt fires once
+  per connection** (with the defaults that is up to 5 pushes: 4 copy + 1 verify). Prefer leaving multiplexing on
+  (one push) and take the throughput win from the faster cipher below; only disable it if the single TCP path is
+  provably the ceiling and you can tolerate N interactive prompts. If a secondary connection fails to attach, the
+  run degrades gracefully to the connections that did come up. Requires an OpenSSH client with `ControlMaster`
+  support and a writable short socket path (under `$TMPDIR`/`/tmp`); `N=1` reproduces the classic single-channel
+  behavior and needs no multiplexing.
+- **Fast cipher, fallback-safe.** For the stock `ssh` client `ecopy` biases the transport toward the fastest
+  hardware-accelerated AEAD cipher by injecting `-o Ciphers=^aes128-gcm@openssh.com,aes256-gcm@openssh.com,chacha20-poly1305@openssh.com`.
+  The leading `^` *prepends* these to the client's default cipher set rather than replacing it, so every default
+  cipher stays available as automatic fallback and key exchange can never fail because of this preference — no
+  retry, no probe, no extra authentication prompt. On AES-NI hardware `aes128-gcm` costs far less CPU per byte
+  than the usual negotiated default (roughly a 2x single-stream win on links where crypto was the bottleneck);
+  it is a standard strong AEAD cipher, so there is no meaningful security downgrade. The `^` prepend syntax needs
+  an OpenSSH client >= 7.8; on older clients the option is skipped automatically (`ecopy` parses `ssh -V` once).
+  Because only the `ControlMaster` (and non-multiplexed connections) negotiate KEX, the cipher is chosen once and
+  applies to all traffic riding that transport. Set `DIRECT_COPY_SSH_CIPHER` to a comma list to override the
+  preference, or to `0`/`off` to disable the injection entirely. Custom `ECOPY_SSH` wrappers are never modified.
 - **Latency-aware by design:** small files, directory creation, and metadata updates are *fire-and-forget* (no
   per-item round-trip). A small file at or below `DIRECT_COPY_SSH_PUTFILE_MAX` ships as a single frame (path +
   metadata + data); larger files stream in pipelined chunks. Many files stream concurrently. Sparse files send
@@ -311,7 +326,8 @@ Best settings are workload- and environment-dependent. Key knobs (defaults in pa
 | `ECOPY_SSH` | `ssh` | Command used to reach an `ssh://` target (e.g. `ssh -i key`) |
 | `ECOPY_REMOTE_CMD` | `ecopy` | Remote `ecopy` binary/command for `ssh://` targets |
 | `DIRECT_COPY_SSH_CONNECTIONS` | 4 | Parallel SSH sessions per `ssh://` run; all share one authenticated connection (1–16) |
-| `DIRECT_COPY_SSH_MULTIPLEX` | 1 | Use SSH `ControlMaster` to authenticate once for all connections; `0` disables it |
+| `DIRECT_COPY_SSH_MULTIPLEX` | 1 | Use SSH `ControlMaster` to authenticate once for all connections; `0` disables it (one MFA/Duo prompt per connection) |
+| `DIRECT_COPY_SSH_CIPHER` | fast AEAD list | Ciphers prepended (via `Ciphers=^…`) to the stock ssh client defaults, biasing toward `aes128-gcm@openssh.com`; defaults stay as fallback so KEX can't fail. `0`/`off` disables; a custom list overrides; skipped on OpenSSH < 7.8 |
 | `DIRECT_COPY_SSH_VERIFY_CONNECTIONS` | -1 (auto) | Extra connections opened for pipelined verify, in addition to the copy connections; `-1` auto-opens 1, `0` shares the copy pool, `N` opens N (0–16) |
 | `DIRECT_COPY_SSH_PUTFILE_MAX` | 1024 | Max size (KiB) a file may be to ship as a single `ssh://` PUTFILE frame |
 | `DIRECT_COPY_SSH_BARRIER_OPS` | 8192 | Fire-and-forget remote ops between drain/flush barriers (min 256) |

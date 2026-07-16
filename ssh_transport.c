@@ -24,6 +24,7 @@
 #include "copy_policy.h"
 #include "protocol.h"
 #include "stats.h"
+#include "config.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -106,6 +107,7 @@ static int g_use_mux;                    /* ControlMaster multiplexing in use */
 static uint64_t g_barrier_ops;           /* shared periodic-barrier threshold */
 static char g_control_path[108];         /* ssh ControlPath socket (short) */
 static ssh_target_t g_target;            /* remembered for teardown (-O exit) */
+static char g_cipher_opt[192];           /* "Ciphers=^..." for -o, "" = none */
 
 /* The connection the current thread should use for its transport operations. */
 static __thread conn_t *t_conn;
@@ -369,6 +371,49 @@ static int using_default_ssh(void)
     return !(e && *e);
 }
 
+/*
+ * Resolve the cipher preference into g_cipher_opt (a ready-to-inject
+ * "Ciphers=^<list>" value, or "" for none). Runs once, only for the stock ssh
+ * client. We bias toward hardware-accelerated AEAD ciphers, prepended to the
+ * client defaults via `^` so negotiation can never fail from our preference and
+ * no cipher is ever removed. The `^` prepend syntax needs OpenSSH >= 7.8, so we
+ * parse `ssh -V` and skip the option on older clients (safe no-op).
+ */
+static void ssh_detect_version_and_cipher(void)
+{
+    g_cipher_opt[0] = '\0';
+    if (!using_default_ssh()) return;
+
+    const char *spec = getenv("DIRECT_COPY_SSH_CIPHER");
+    if (!spec) {
+        spec = SSH_CIPHER_DEFAULT;
+    } else if (!spec[0] || strcmp(spec, "0") == 0 ||
+               strcasecmp(spec, "off") == 0) {
+        return;                          /* explicitly disabled */
+    }
+
+    /* ssh -V prints e.g. "OpenSSH_9.6p1, OpenSSL ..." to stderr. */
+    int major = 0, minor = 0, ok = 0;
+    FILE *fp = popen("ssh -V 2>&1", "r");
+    if (fp) {
+        char line[256];
+        while (fgets(line, sizeof(line), fp)) {
+            const char *p = strstr(line, "OpenSSH_");
+            if (p && sscanf(p, "OpenSSH_%d.%d", &major, &minor) == 2) {
+                ok = 1;
+                break;
+            }
+        }
+        pclose(fp);
+    }
+    if (!ok) return;                     /* unparseable -> stay on defaults */
+
+    /* `^` prepend syntax is OpenSSH >= 7.8. */
+    if (major < 7 || (major == 7 && minor < 8)) return;
+
+    snprintf(g_cipher_opt, sizeof(g_cipher_opt), "Ciphers=^%s", spec);
+}
+
 static const char *remote_ecopy_cmd(void)
 {
     const char *e = getenv("ECOPY_REMOTE_CMD");
@@ -413,7 +458,7 @@ static int spawn_ssh(const ssh_target_t *t, const char *remote_command,
         char portbuf[16];
         char cm_opt[32];
         char cp_opt[sizeof(g_control_path) + 16];
-        char *argv[24];
+        char *argv[28];
         int ai = 0;
         argv[ai++] = (char *)ssh_binary();
         if (t->port > 0) {
@@ -423,6 +468,15 @@ static int spawn_ssh(const ssh_target_t *t, const char *remote_command,
         }
         argv[ai++] = "-o";
         argv[ai++] = "BatchMode=no";
+        /*
+         * Bias toward the fast AEAD cipher. Only the master (and non-muxed
+         * connections) run their own KEX; secondaries ride the master's already
+         * negotiated transport, so injecting it there would be a no-op.
+         */
+        if (g_cipher_opt[0] && mux != SSH_MUX_SECONDARY) {
+            argv[ai++] = "-o";
+            argv[ai++] = g_cipher_opt;
+        }
         if (mux != SSH_MUX_NONE) {
             snprintf(cm_opt, sizeof(cm_opt), "ControlMaster=%s",
                      mux == SSH_MUX_MASTER ? "auto" : "no");
@@ -822,6 +876,9 @@ int sshx_connect(const ssh_target_t *t)
     } else {
         g_control_path[0] = '\0';
     }
+
+    /* Resolve the cipher preference once, before the master negotiates KEX. */
+    ssh_detect_version_and_cipher();
 
     /* SIGPIPE would kill us if ssh dies mid-write; treat write errors instead. */
     signal(SIGPIPE, SIG_IGN);
