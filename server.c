@@ -845,7 +845,13 @@ static void handle_open(const uint8_t *payload, uint32_t plen)
     if (!(flags & ECOPY_OPEN_SPARSE) && expected > 0) {
         if (fallocate(fd, 0, 0, (off_t)expected) != 0) {
             if (errno == EOPNOTSUPP || errno == ENOSYS) {
-                (void)ftruncate(fd, (off_t)expected);
+                /*
+                 * Best-effort preallocation fallback; if even ftruncate fails
+                 * the subsequent writes still extend the file, so ignore it.
+                 */
+                if (ftruncate(fd, (off_t)expected) != 0) {
+                    /* intentionally ignored */
+                }
             }
         }
     }
