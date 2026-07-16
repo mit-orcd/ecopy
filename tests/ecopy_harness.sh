@@ -424,6 +424,51 @@ case_ssh_parallel_connections() {
     done
 }
 
+# Pipelined verify over SSH with an additive verify connection: auto (one extra
+# verify connection on top of the copy pool), forced-shared (=0, no extra
+# connection), a single copy connection (auto still adds one -> 1 copy + 1
+# verify), and an explicit multi-verify count. All must verify cleanly with
+# reconciled counts, proving the additive partition never drops, duplicates, or
+# misroutes work and that verify counters still aggregate across the pool.
+case_ssh_verify_dedicated_stream() {
+    case_begin "ssh-verify-dedicated-stream"
+    local s="$work/vstream_src"
+    mk_pipeline_tree "$s"
+    local -a base_env=(DIRECT_COPY_LARGE_THRESHOLD_MB=1 ECOPY_REMOTE_CMD="$bin")
+    if [[ "${ECOPY_HARNESS_REAL_SSH:-0}" != "1" ]]; then
+        base_env+=(ECOPY_SSH="$repo_root/tests/fake_ssh.sh")
+    fi
+
+    # label -> extra env for that scenario
+    local scenarios=("auto:DIRECT_COPY_SSH_CONNECTIONS=3"
+                     "share:DIRECT_COPY_SSH_CONNECTIONS=3 DIRECT_COPY_SSH_VERIFY_CONNECTIONS=0"
+                     "single:DIRECT_COPY_SSH_CONNECTIONS=1"
+                     "multi:DIRECT_COPY_SSH_CONNECTIONS=2 DIRECT_COPY_SSH_VERIFY_CONNECTIONS=2")
+    local entry label extra out rc files dirs vobj
+    for entry in "${scenarios[@]}"; do
+        label="${entry%%:*}"
+        extra="${entry#*:}"
+        local d="$work/vstream_dst_$label"
+        out="$(env "${common_env[@]}" "${base_env[@]}" $extra \
+                  DIRECT_COPY_VERIFY_PIPELINE_OPS=8 "$bin" \
+                  --verify --verify-data=100 --verify-seed=246 \
+                  "$s" "ssh://localhost${d}" 2>&1)"; rc=$?
+        files="$(grep -E 'Files seen' <<<"$out" | grep -oE '[0-9]+' | head -1)"
+        dirs="$(grep -E 'Dirs seen' <<<"$out" | grep -oE '[0-9]+' | head -1)"
+        vobj="$(grep -E 'Verify objects' <<<"$out" | grep -oE '[0-9]+' | head -1)"
+        if [[ "$rc" -eq 0 ]] && grep -q 'Verify failures   : 0' <<<"$out" &&
+           ! grep -q 'remote reported' <<<"$out" &&
+           [[ -n "$files" && -n "$dirs" && -n "$vobj" &&
+              $((files + dirs)) -eq "$vobj" && "$vobj" -gt 0 ]] &&
+           verify_regular_files "$s" "$d"; then
+            ok "verify $label: clean, objects=$vobj (files=$files dirs=$dirs)"
+        else
+            fail "verify $label: $(tr '\n' ' ' <<<"$out")"
+            return
+        fi
+    done
+}
+
 # Stream dense files (> PUTFILE max, so they take the OPEN/WRITE/COMMIT path) to
 # an ssh:// target with the server opening them O_DIRECT (the default), and again
 # with server direct I/O disabled. Files include exactly-aligned sizes and
@@ -1358,6 +1403,7 @@ case_symlink_preserved
 case_hardlink_preserved
 case_ssh_symlink_hardlink
 case_ssh_parallel_connections
+case_ssh_verify_dedicated_stream
 case_ssh_server_direct_io
 case_readonly_mode
 case_single_file

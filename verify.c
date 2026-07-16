@@ -941,11 +941,16 @@ static void *verify_pool_worker(void *arg)
 {
     verify_pool_t *pool = arg;
 
-    /* Spread remote verify batches across the SSH connection pool. */
+    /*
+     * Spread remote verify batches across the SSH pool's verify role: when a
+     * verify partition is active (pipelined dir copy) this pins verify frames to
+     * the reserved verify connection(s) so they do not interleave with bulk copy
+     * data; otherwise it falls back to the whole pool (verify-only, post-copy).
+     */
     pthread_mutex_lock(&pool->lock);
     int bind_idx = pool->bind_seq++;
     pthread_mutex_unlock(&pool->lock);
-    sshx_bind_thread(bind_idx);
+    sshx_bind_thread_verify(bind_idx);
 
     for (;;) {
         pthread_mutex_lock(&pool->lock);

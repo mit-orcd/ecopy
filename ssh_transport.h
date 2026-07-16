@@ -61,8 +61,25 @@ int sshx_connection_count(void);
  * the connection count). All subsequent transport calls on this thread use that
  * connection. Threads that never bind use connection 0. Call once at thread
  * start so a streamed file's frames all land on one server.
+ *
+ * sshx_bind_thread() is the COPY role: when a verify partition is active it maps
+ * only into the copy connections; otherwise it uses the whole pool.
+ * sshx_bind_thread_verify() is the VERIFY role: when a partition is active it
+ * maps only into the reserved verify connections; otherwise it uses the whole
+ * pool (shared, as before).
  */
 void sshx_bind_thread(int idx);
+void sshx_bind_thread_verify(int idx);
+
+/*
+ * Request `nverify` additional connections dedicated to verify traffic, opened
+ * in addition to the DIRECT_COPY_SSH_CONNECTIONS copy connections (never carved
+ * from them, so copy parallelism is unaffected). Must be called before
+ * sshx_connect(), which sizes and establishes the pool accordingly. If the
+ * extra connections cannot be established, verify falls back to sharing the copy
+ * connections. Clamped to [0, 16].
+ */
+void sshx_request_verify_connections(int nverify);
 
 /* Clean shutdown: send BYE, join threads, reap ssh. Safe to call once. */
 void sshx_disconnect(void);

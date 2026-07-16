@@ -51,4 +51,15 @@
  */
 #define SIZE_PRIORITY_DEFAULT 1
 
+/*
+ * Additional connections opened for pipelined verify, on top of (never carved
+ * from) the DIRECT_COPY_SSH_CONNECTIONS copy connections, so verify's tiny
+ * digest frames do not share a connection or remote server process with bulk
+ * copy and copy parallelism is unaffected. -1 = auto: open 1 verify connection.
+ * 0 = none (verify shares the copy connections). N>0 = open N. Override with
+ * DIRECT_COPY_SSH_VERIFY_CONNECTIONS. Only applies to overlapped copy+verify;
+ * verify-only shares the copy pool.
+ */
+#define SSH_VERIFY_CONNECTIONS_DEFAULT (-1)
+
 #endif

@@ -186,10 +186,18 @@ Verification is opt-in, so ordinary copies pay no extra opens, reads, hashing, a
   so they are released in barrier-gated generations: after `DIRECT_COPY_VERIFY_PIPELINE_OPS` such files accumulate
   (default 4096) or the feeder idles ~250 ms, one barrier materializes them and hands them to the checker pool.
   Directory-metadata checks are always done after directory timestamps are finalized (the final step), never
-  mid-copy. Over SSH the verify traffic **shares the same connection pool** as copy, so at 100% coverage it competes
-  with copy for bandwidth. Copy workers only enqueue verify records (they never block on the checker pool), and
-  single-file copies keep the small post-copy check. Because verification overlaps copy, `Verify wall sec` and the
-  copy timings are not additive; `Total Elapsed` is the ground truth.
+  mid-copy. Over SSH, pipelined verify runs on its own **additive connection** (`DIRECT_COPY_SSH_VERIFY_CONNECTIONS`,
+  auto-opens one): it is established in addition to the `DIRECT_COPY_SSH_CONNECTIONS` copy connections, never carved
+  from them, so copy parallelism is unaffected. Verify's tiny fire-and-forget digest frames then never interleave with
+  bulk copy frames on a connection's write path, and because each SSH session is a separate remote `ecopy --server`
+  process, verify reads (`pread` + BLAKE3) no longer queue behind copy `pwrite`/`fsync` in a shared server thread
+  pool. Under `ControlMaster` multiplexing (default) the extra verify session attaches to the same authenticated
+  master (no additional MFA/Duo) and rides the master TCP connection, so it removes application- and
+  server-process-level contention but not TCP-level bandwidth sharing; disable multiplexing for a fully separate path.
+  Set `DIRECT_COPY_SSH_VERIFY_CONNECTIONS=0` to share the copy connections instead. Copy workers only enqueue verify
+  records (they never block on the checker pool), and single-file copies keep the small post-copy check. Because
+  verification overlaps copy, `Verify wall sec` and the copy timings are not additive; `Total Elapsed` is the ground
+  truth.
 - Local targets compare source and destination bytes directly. SSH targets send full 32-byte BLAKE3 digests in
   bounded batches and hash target blocks in the remote server pool; sampled file data is not sent back over SSH and
   there is one phase barrier rather than a per-file round trip. SSH verify-only starts a read-only peer and refuses
@@ -291,6 +299,7 @@ Best settings are workload- and environment-dependent. Key knobs (defaults in pa
 | `ECOPY_REMOTE_CMD` | `ecopy` | Remote `ecopy` binary/command for `ssh://` targets |
 | `DIRECT_COPY_SSH_CONNECTIONS` | 4 | Parallel SSH sessions per `ssh://` run; all share one authenticated connection (1–16) |
 | `DIRECT_COPY_SSH_MULTIPLEX` | 1 | Use SSH `ControlMaster` to authenticate once for all connections; `0` disables it |
+| `DIRECT_COPY_SSH_VERIFY_CONNECTIONS` | -1 (auto) | Extra connections opened for pipelined verify, in addition to the copy connections; `-1` auto-opens 1, `0` shares the copy pool, `N` opens N (0–16) |
 | `DIRECT_COPY_SSH_PUTFILE_MAX` | 1024 | Max size (KiB) a file may be to ship as a single `ssh://` PUTFILE frame |
 | `DIRECT_COPY_SSH_BARRIER_OPS` | 8192 | Fire-and-forget remote ops between drain/flush barriers (min 256) |
 | `DIRECT_COPY_SSH_SERVER_THREADS` | 16 | Apply threads on the `ssh://` peer; higher hides more per-op RPC latency (max 256) |

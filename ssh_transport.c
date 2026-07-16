@@ -89,6 +89,18 @@ typedef enum {
 
 static conn_t *g_conns;                  /* pool of size g_nconns */
 static int g_nconns;
+/*
+ * Additive role partition of the pool. Verify connections are established in
+ * addition to the DIRECT_COPY_SSH_CONNECTIONS copy connections (never carved
+ * from them), so pipelined verify never costs copy parallelism. g_verify_want
+ * is requested before sshx_connect(); after connect, connections
+ * [g_verify_base, g_nconns) are the verify connections and [0, g_verify_base)
+ * are copy connections. g_nverify == 0 means verify falls back to sharing the
+ * copy pool (e.g. request was 0 or the extra connections failed to establish).
+ */
+static int g_verify_want;
+static int g_verify_base;
+static int g_nverify;
 static int g_read_only;
 static int g_use_mux;                    /* ControlMaster multiplexing in use */
 static uint64_t g_barrier_ops;           /* shared periodic-barrier threshold */
@@ -106,7 +118,29 @@ static conn_t *cur_conn(void)
 void sshx_bind_thread(int idx)
 {
     if (g_nconns <= 0) { t_conn = NULL; return; }
-    t_conn = &g_conns[(unsigned)idx % (unsigned)g_nconns];
+    /* COPY role: restricted to [0, g_verify_base) when a verify partition is
+     * active, otherwise the whole pool. */
+    int span = g_nverify > 0 ? g_verify_base : g_nconns;
+    t_conn = &g_conns[(unsigned)idx % (unsigned)span];
+}
+
+void sshx_bind_thread_verify(int idx)
+{
+    if (g_nconns <= 0) { t_conn = NULL; return; }
+    /* VERIFY role: restricted to [g_verify_base, g_nconns) when a partition is
+     * active, otherwise the whole pool (shared, as before). */
+    if (g_nverify > 0) {
+        t_conn = &g_conns[g_verify_base + (unsigned)idx % (unsigned)g_nverify];
+    } else {
+        t_conn = &g_conns[(unsigned)idx % (unsigned)g_nconns];
+    }
+}
+
+void sshx_request_verify_connections(int nverify)
+{
+    if (nverify < 0) nverify = 0;
+    if (nverify > 16) nverify = 16;
+    g_verify_want = nverify;
 }
 
 int sshx_connection_count(void)
@@ -758,6 +792,14 @@ int sshx_connect(const ssh_target_t *t)
         g_barrier_ops = (uint64_t)v;
     }
 
+    /*
+     * Verify connections are additive: they sit on top of the `want` copy
+     * connections rather than being carved from them, so pipelined verify never
+     * reduces copy parallelism. `want` copy + `g_verify_want` verify = total.
+     */
+    int verify_want = g_verify_want;
+    int total = want + verify_want;
+
     int mux_enabled = 1;
     {
         const char *s = getenv("DIRECT_COPY_SSH_MULTIPLEX");
@@ -767,9 +809,11 @@ int sshx_connect(const ssh_target_t *t)
      * ControlMaster multiplexing lets N sessions share one authenticated TCP
      * connection, so the interactive auth (MFA/Duo) happens exactly once. It
      * only applies to the stock ssh client; a custom ECOPY_SSH wrapper (e.g.
-     * the test harness) spawns independent sessions that need no auth.
+     * the test harness) spawns independent sessions that need no auth. Gate on
+     * the total session count so an additive verify connection is multiplexed
+     * too (no extra auth) even when there is a single copy connection.
      */
-    g_use_mux = (want > 1) && mux_enabled && using_default_ssh();
+    g_use_mux = (total > 1) && mux_enabled && using_default_ssh();
     if (g_use_mux) {
         const char *tmp = getenv("TMPDIR");
         if (!tmp || !*tmp) tmp = "/tmp";
@@ -782,9 +826,9 @@ int sshx_connect(const ssh_target_t *t)
     /* SIGPIPE would kill us if ssh dies mid-write; treat write errors instead. */
     signal(SIGPIPE, SIG_IGN);
 
-    g_conns = calloc((size_t)want, sizeof(conn_t));
+    g_conns = calloc((size_t)total, sizeof(conn_t));
     if (!g_conns) { perror("calloc"); return -1;}
-    g_nconns = want;
+    g_nconns = total;
 
     /* Connection 0 is the master: it performs the single interactive auth. */
     ssh_mux_t m0 = g_use_mux ? SSH_MUX_MASTER : SSH_MUX_NONE;
@@ -796,20 +840,44 @@ int sshx_connect(const ssh_target_t *t)
         return -1;
     }
 
-    /* Secondaries attach to the master (no re-auth) or, without mux, connect
-     * independently. A partial failure degrades gracefully to fewer channels. */
-    int established = 1;
+    /* Copy secondaries attach to the master (no re-auth) or, without mux,
+     * connect independently. A partial failure degrades to fewer copy
+     * channels. */
+    int copy_established = 1;
     for (int i = 1; i < want; i++) {
         ssh_mux_t mi = g_use_mux ? SSH_MUX_SECONDARY : SSH_MUX_NONE;
         if (connect_one(&g_conns[i], t, mi, 0) != 0) {
             fprintf(stderr,
-                    "ecopy: established %d of %d SSH connections; continuing with %d\n",
-                    established, want, established);
+                    "ecopy: established %d of %d SSH copy connections; continuing with %d\n",
+                    copy_established, want, copy_established);
             break;
         }
-        established++;
+        copy_established++;
     }
-    g_nconns = established;
+
+    /*
+     * Additive verify connections, appended right after the established copy
+     * connections so the pool stays contiguous from index 0. If they fail to
+     * establish, g_nverify stays 0 and verify falls back to sharing the copy
+     * connections (still correct, just no dedicated stream).
+     */
+    int verify_established = 0;
+    for (int i = 0; i < verify_want; i++) {
+        int idx = copy_established + verify_established;
+        ssh_mux_t mi = g_use_mux ? SSH_MUX_SECONDARY : SSH_MUX_NONE;
+        if (connect_one(&g_conns[idx], t, mi, 0) != 0) {
+            fprintf(stderr,
+                    "ecopy: established %d of %d SSH verify connections; "
+                    "verify will share copy connections\n",
+                    verify_established, verify_want);
+            break;
+        }
+        verify_established++;
+    }
+
+    g_nconns = copy_established + verify_established;
+    g_verify_base = copy_established;
+    g_nverify = verify_established;
     return 0;
 }
 
@@ -859,6 +927,9 @@ void sshx_disconnect(void)
     free(g_conns);
     g_conns = NULL;
     g_nconns = 0;
+    g_nverify = 0;
+    g_verify_base = 0;
+    g_verify_want = 0;
     t_conn = NULL;
 }
 

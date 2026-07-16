@@ -18,6 +18,7 @@
 #include "verify.h"
 #include "hardlinks.h"
 #include "types.h"
+#include "config.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -659,6 +660,30 @@ int main(int argc, char **argv) {
             return 1;
         }
         sshx_set_read_only(verify_only);
+        /*
+         * Request additive verify connection(s) before connecting so the pool
+         * is sized as copy + verify. Only for overlapped copy+verify (pipelined
+         * remote directory); verify-only and single-file paths share the pool.
+         * Auto (-1) opens one dedicated verify connection; 0 shares; N adds N.
+         */
+        /* verify_configure() runs later, so gate on the parsed flags here. */
+        if (src_is_dir && (verify_metadata || verify_data) && !verify_only) {
+            int nverify = SSH_VERIFY_CONNECTIONS_DEFAULT;
+            const char *vc_env = getenv("DIRECT_COPY_SSH_VERIFY_CONNECTIONS");
+            if (vc_env && *vc_env) {
+                char *end = NULL;
+                long value = strtol(vc_env, &end, 10);
+                if (!end || *end || value < -1 || value > 16) {
+                    fprintf(stderr,
+                            "ecopy: invalid DIRECT_COPY_SSH_VERIFY_CONNECTIONS: %s\n",
+                            vc_env);
+                    return 1;
+                }
+                nverify = (int)value;
+            }
+            if (nverify < 0) nverify = 1; /* auto: one additive verify connection */
+            sshx_request_verify_connections(nverify);
+        }
         if (sshx_connect(&target) != 0) {
             return 1;
         }
