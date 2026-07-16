@@ -28,7 +28,18 @@
 #   DST        rsync destination (user@host:/path/)           [default below]
 #   MAX_SIZE   skip files larger than this            [default: 2G]
 #   RSYNC_SSH  remote-shell command, e.g. a ControlMaster ssh  [default: unset]
+#   VERBOSE    1 = show live per-file progress (see note below)     [default: 0]
 #   LOG        log file path                   [default: logs/rsync-audit-checksum.log]
+#
+# Why the progress line looks frozen: this is a dry run, so nothing is
+# transferred and the byte/percent/rate fields of --info=progress2 stay at 0 for
+# the whole run - they only count transferred data. The field that actually
+# moves is the ir-chk/to-chk file counter, and each decrement is one full-content
+# MD5 read on BOTH ends (slow over remote scratch), so it advances slowly but is
+# not stuck. With incremental recursion (default) its denominator also keeps
+# growing, so it can look stuck; set VERBOSE=1 to build the full file list up
+# front (--no-inc-recursive) so it becomes a stable, monotonically decreasing
+# to-chk=N/M. Watch that counter, not the byte/rate fields.
 #
 # Exit code is rsync's own.
 
@@ -56,6 +67,13 @@ rsync_args=(
 # Optional: reuse an authenticated SSH connection (avoids repeated MFA/Duo).
 if [ -n "${RSYNC_SSH:-}" ]; then
   rsync_args+=(-e "$RSYNC_SSH")
+fi
+
+# VERBOSE=1: build the whole file list first so to-chk=N/M counts down against a
+# stable total, and show file-list build progress. (Per-file "is uptodate" lines
+# would need -vv and flood the log for large trees, so the counter is the signal.)
+if [ "${VERBOSE:-0}" = "1" ]; then
+  rsync_args+=(--no-inc-recursive --info=flist2,progress2)
 fi
 
 echo "rsync checksum audit (max-size=$MAX_SIZE): $SRC -> $DST" >&2
