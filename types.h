@@ -125,7 +125,13 @@ typedef struct file_task {
     char name[PATH_MAX];
     dir_handle_t *dir;
     struct stat src_st;
-    struct file_task *next;
+    /*
+     * Dispatch ordering key for the scheduler max-heaps. With size priority on
+     * it is the allocated-bytes weight (biggest data first); with it off it is
+     * (UINT64_MAX - enqueue seq) so the same max-heap yields FIFO order.
+     */
+    uint64_t sched_key;
+    struct file_task *next; /* freelist link only (queues are heaps) */
 } file_task_t;
 
 typedef struct {

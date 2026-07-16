@@ -261,6 +261,12 @@ created by this invocation uses the faster non-atomic final-name path.
   large number of concurrent medium files thrash a bandwidth-limited target.
 - **Sparse files** are routed to a hole-skipping path regardless of logical size: data regions are found with
   `lseek(SEEK_DATA/SEEK_HOLE)`, only data is copied, and the destination is `ftruncate()`d to the exact source size.
+- **Dispatch order** is biggest-allocated-data-first, not FIFO: the backlog the crawler builds ahead of the workers is
+  kept in a max-heap and the file with the most real data to move is dispatched first, on both local and `ssh://`
+  targets. This lets large files start streaming and fill the link as soon as they are discovered, instead of waiting
+  behind a mountain of tiny files found earlier. The ranking weight is `min(logical size, allocated blocks)`, so a huge
+  but mostly-empty sparse file is ranked by its real data, not its logical size. Set `DIRECT_COPY_SIZE_PRIORITY=0` to
+  fall back to FIFO (discovery/directory order) if a workload benefits from directory locality.
 
 ## Tuning
 
@@ -276,6 +282,7 @@ Best settings are workload- and environment-dependent. Key knobs (defaults in pa
 | `DIRECT_COPY_LARGE_THRESHOLD_MB` | 10 | Size at which a file enters the large-file pipeline |
 | `DIRECT_COPY_TRAVERSAL_WORKERS` | 8 | Parallel directory-walker threads |
 | `DIRECT_COPY_MAX_QUEUED_FILES` | 262144 | Backpressure cap on queued file tasks |
+| `DIRECT_COPY_SIZE_PRIORITY` | 1 | Dispatch biggest-allocated-data files first (local and SSH); `0` restores FIFO order |
 | `DIRECT_COPY_SMALL_INPLACE` | 0 | Force final-name writes even on existing targets (fresh trees do this automatically; not crash-atomic) |
 | `DIRECT_COPY_DISABLE_DIRECT_IO` | 0 | Disable `O_DIRECT` on both sides (buffered I/O) |
 | `DIRECT_COPY_DISABLE_READ_DIRECT_IO` / `DIRECT_COPY_DISABLE_WRITE_DIRECT_IO` | 0 / 0 | Per-side direct-I/O switches |

@@ -1081,6 +1081,73 @@ case_verify_pipeline_remote() {
     fi
 }
 
+# A tree mixing many tiny files with a few multi-MiB files, with the largest
+# named to sort late in readdir order. Used to prove size-priority dispatch
+# never loses or corrupts tasks (biggest-first) and that FIFO fallback is also
+# clean; correctness is order-independent so both paths must reconcile.
+mk_size_priority_tree() {
+    local root="$1" i
+    mkdir -p "$root/sub"
+    for i in $(seq 0 49); do
+        head -c $(((i % 7 + 1) * 512)) /dev/urandom > "$root/tiny_$(printf %02d "$i").bin"
+    done
+    head -c 3000 /dev/urandom > "$root/sub/small.bin"
+    head -c 2097152 /dev/urandom > "$root/aa_large.bin"
+    head -c 4194304 /dev/urandom > "$root/mm_large.bin"
+    # Largest and named to sort last, i.e. discovered late under readdir order.
+    head -c 6291456 /dev/urandom > "$root/zz_largest.bin"
+}
+
+case_size_priority_local() {
+    case_begin "size-priority-local"
+    local s="$work/sizeprio_src" prio out rc
+    mk_size_priority_tree "$s"
+    # priority on (default) then FIFO fallback; both must be clean and identical.
+    for prio in 1 0; do
+        local d="$work/sizeprio_dst_$prio"
+        # threshold 1 MiB so the multi-MiB files exercise the large heap ordering.
+        out="$(env "${common_env[@]}" DIRECT_COPY_DISABLE_DIRECT_IO=1 \
+                  DIRECT_COPY_LARGE_THRESHOLD_MB=1 \
+                  DIRECT_COPY_SIZE_PRIORITY="$prio" \
+                  "$bin" --verify --verify-data=100 --verify-seed=777 \
+                  "$s" "$d" 2>&1)"; rc=$?
+        if [[ "$rc" -eq 0 ]] && grep -q 'Verify failures   : 0' <<<"$out" &&
+           verify_regular_files "$s" "$d"; then
+            ok "local size-priority=$prio clean and byte-identical"
+        else
+            fail "local size-priority=$prio: $(tr '\n' ' ' <<<"$out")"
+            return
+        fi
+    done
+}
+
+case_size_priority_remote() {
+    case_begin "size-priority-remote"
+    local s="$work/sizeprio_remote_src" prio out rc files
+    mk_size_priority_tree "$s"
+    local -a remote_env=(DIRECT_COPY_LARGE_THRESHOLD_MB=1 ECOPY_REMOTE_CMD="$bin")
+    if [[ "${ECOPY_HARNESS_REAL_SSH:-0}" != "1" ]]; then
+        remote_env+=(ECOPY_SSH="$repo_root/tests/fake_ssh.sh")
+    fi
+    for prio in 1 0; do
+        local rd="$work/sizeprio_remote_dst_$prio"
+        out="$(env "${common_env[@]}" "${remote_env[@]}" \
+                  DIRECT_COPY_SIZE_PRIORITY="$prio" "$bin" \
+                  --verify --verify-data=100 --verify-seed=888 \
+                  "$s" "ssh://localhost${rd}" 2>&1)"; rc=$?
+        files="$(grep -E 'Files seen' <<<"$out" | grep -oE '[0-9]+' | head -1)"
+        if [[ "$rc" -eq 0 ]] && grep -q 'Verify failures   : 0' <<<"$out" &&
+           ! grep -q 'remote reported' <<<"$out" &&
+           [[ -n "$files" && "$files" -eq 54 ]] &&
+           verify_regular_files "$s" "$rd"; then
+            ok "remote size-priority=$prio clean, files=$files"
+        else
+            fail "remote size-priority=$prio: $(tr '\n' ' ' <<<"$out")"
+            return
+        fi
+    done
+}
+
 case_verify_only() {
     case_begin "verify-only"
     local s="$work/verify_only_src" d="$work/verify_only_dst"
@@ -1306,6 +1373,8 @@ case_transfer_verification
 case_verify_sparse_data_domain
 case_verify_pipeline_local
 case_verify_pipeline_remote
+case_size_priority_local
+case_size_priority_remote
 case_verify_only
 
 echo

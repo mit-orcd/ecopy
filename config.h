@@ -41,4 +41,14 @@
  */
 #define VERIFY_PIPELINE_OPS_DEFAULT 4096
 
+/*
+ * Dispatch ordering. When 1 (default), copy workers drain the backlog
+ * biggest-allocated-data-first so large files start streaming and fill
+ * bandwidth as soon as the crawler discovers them (weight is
+ * min(st_size, st_blocks*512), so sparse files are ranked by real data, not
+ * logical size). When 0, dispatch falls back to FIFO (discovery/directory
+ * order). Override with DIRECT_COPY_SIZE_PRIORITY.
+ */
+#define SIZE_PRIORITY_DEFAULT 1
+
 #endif

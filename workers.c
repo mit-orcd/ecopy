@@ -136,10 +136,20 @@ static pthread_mutex_t g_queue_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_queue_cond = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t  g_space_cond = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t  g_large_done_cond = PTHREAD_COND_INITIALIZER;
-static file_task_t    *g_small_queue_head = NULL;
-static file_task_t    *g_small_queue_tail = NULL;
-static file_task_t    *g_large_queue_head = NULL;
-static file_task_t    *g_large_queue_tail = NULL;
+/*
+ * Dispatch queues are max-heaps keyed by file_task_t.sched_key (see enqueue),
+ * so the backlog drains biggest-data-first rather than FIFO. The small/large
+ * split is unchanged (it selects the execution path and slot budget); only the
+ * ordering within each queue changed. Both are guarded by g_queue_lock; len is
+ * the queue depth reported to progress and used for backpressure.
+ */
+typedef struct {
+    file_task_t **items;
+    size_t        len;
+    size_t        cap;
+} task_heap_t;
+static task_heap_t     g_small_heap;
+static task_heap_t     g_large_heap;
 /*
  * Recycled file_task_t nodes. Each task carries three PATH_MAX buffers (~12 KiB)
  * so allocating and zeroing one per file dominated small-file CPU under perf.
@@ -148,10 +158,14 @@ static file_task_t    *g_large_queue_tail = NULL;
  */
 static file_task_t    *g_task_freelist = NULL;
 static int             g_queue_done = 0;
-static uint64_t        g_small_queue_depth = 0;
-static uint64_t        g_large_queue_depth = 0;
 static uint64_t        g_small_workers_active = 0;
 static uint64_t        g_large_workers_active = 0;
+/*
+ * When set (default), dispatch prefers files with the most allocated data.
+ * When 0, sched_key falls back to enqueue order so the heaps behave FIFO.
+ */
+static int             g_size_priority = 1;
+static uint64_t        g_enqueue_seq = 0; /* monotonic, under g_queue_lock */
 
 static int g_workers_error = 0;
 static pthread_mutex_t g_workers_error_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -324,6 +338,9 @@ static void init_runtime_config(void)
                                             1,
                                             10000000);
 
+    g_size_priority = env_int_or_default("DIRECT_COPY_SIZE_PRIORITY",
+                                         SIZE_PRIORITY_DEFAULT, 0, 1);
+
     g_small_worker_limit = env_int_or_default("DIRECT_COPY_SMALL_MAX_WORKERS",
                                              SMALL_WORKER_SLOTS,
                                              1,
@@ -466,15 +483,87 @@ static void free_file_task(file_task_t *task)
     pthread_mutex_unlock(&g_queue_lock);
 }
 
-static file_task_t *pop_file_task(file_task_t **head, file_task_t **tail)
+/*
+ * Bytes a file will actually move: min(logical size, allocated blocks). This is
+ * st_size for dense files and the allocated data for sparse files, so a huge
+ * logical / tiny real sparse file does not wrongly float to the front.
+ */
+static uint64_t task_weight(const struct stat *st)
 {
-    file_task_t *t = *head;
-    *head = t->next;
-    if (!*head) {
-        *tail = NULL;
+    off_t size = st->st_size > 0 ? st->st_size : 0;
+    off_t alloc = (off_t)st->st_blocks * 512;
+    if (alloc < 0) {
+        alloc = 0;
     }
-    t->next = NULL;
-    return t;
+    off_t w = size < alloc ? size : alloc;
+    return (uint64_t)w;
+}
+
+/* Ensure the heap can hold at least `need` entries. Caller holds g_queue_lock. */
+static int heap_reserve(task_heap_t *h, size_t need)
+{
+    if (h->cap >= need) {
+        return 0;
+    }
+    size_t ncap = h->cap ? h->cap * 2 : 64;
+    while (ncap < need) {
+        ncap *= 2;
+    }
+    file_task_t **ni = realloc(h->items, ncap * sizeof(*ni));
+    if (!ni) {
+        return -1;
+    }
+    h->items = ni;
+    h->cap = ncap;
+    return 0;
+}
+
+/* Push a task whose sched_key is set. Capacity must be reserved by the caller. */
+static void heap_push(task_heap_t *h, file_task_t *t)
+{
+    size_t i = h->len++;
+    uint64_t key = t->sched_key;
+    while (i > 0) {
+        size_t parent = (i - 1) / 2;
+        if (h->items[parent]->sched_key >= key) {
+            break;
+        }
+        h->items[i] = h->items[parent];
+        i = parent;
+    }
+    h->items[i] = t;
+}
+
+/* Remove and return the highest-key task. Caller ensures h->len > 0. */
+static file_task_t *heap_pop_max(task_heap_t *h)
+{
+    file_task_t *top = h->items[0];
+    file_task_t *node = h->items[--h->len];
+    h->items[h->len] = NULL;
+    if (h->len > 0) {
+        size_t i = 0;
+        uint64_t key = node->sched_key;
+        for (;;) {
+            size_t l = 2 * i + 1;
+            size_t r = 2 * i + 2;
+            size_t best = i;
+            uint64_t best_key = key;
+            if (l < h->len && h->items[l]->sched_key > best_key) {
+                best = l;
+                best_key = h->items[l]->sched_key;
+            }
+            if (r < h->len && h->items[r]->sched_key > best_key) {
+                best = r;
+            }
+            if (best == i) {
+                break;
+            }
+            h->items[i] = h->items[best];
+            i = best;
+        }
+        h->items[i] = node;
+    }
+    return top;
 }
 
 static void enqueue_buffer(large_buffer_t **head, large_buffer_t **tail, large_buffer_t *buf)
@@ -1824,33 +1913,27 @@ static work_claim_t dequeue_work(void)
     for (;;) {
         int total_slots_used = total_worker_slots_used_locked();
 
-        if (g_large_queue_head &&
+        if (g_large_heap.len > 0 &&
             (int)g_large_workers_active < g_max_active_large_files &&
             total_slots_used + g_large_worker_count <= g_worker_count) {
             claim.kind = WORK_LARGE_FILE_START;
-            claim.file_task = pop_file_task(&g_large_queue_head, &g_large_queue_tail);
-            if (g_large_queue_depth > 0) {
-                g_large_queue_depth--;
-            }
+            claim.file_task = heap_pop_max(&g_large_heap);
             g_large_workers_active++;
             pthread_cond_signal(&g_space_cond);
             break;
         }
 
-        if (g_small_queue_head &&
+        if (g_small_heap.len > 0 &&
             (int)g_small_workers_active < g_small_worker_limit &&
             total_slots_used + 1 <= g_worker_count) {
             claim.kind = WORK_SMALL_FILE;
-            claim.file_task = pop_file_task(&g_small_queue_head, &g_small_queue_tail);
-            if (g_small_queue_depth > 0) {
-                g_small_queue_depth--;
-            }
+            claim.file_task = heap_pop_max(&g_small_heap);
             g_small_workers_active++;
             pthread_cond_signal(&g_space_cond);
             break;
         }
 
-        if (!g_small_queue_head && !g_large_queue_head &&
+        if (g_small_heap.len == 0 && g_large_heap.len == 0 &&
             g_queue_done && g_large_workers_active == 0 && g_small_workers_active == 0) {
             break;
         }
@@ -2097,7 +2180,7 @@ static void *worker_main(void *arg)
              * observe the termination condition and exit; a lone signal would
              * leave the others blocked forever and hang workers_stop().
              */
-            if (g_queue_done && !g_small_queue_head && !g_large_queue_head &&
+            if (g_queue_done && g_small_heap.len == 0 && g_large_heap.len == 0 &&
                 g_small_workers_active == 0 && g_large_workers_active == 0) {
                 pthread_cond_broadcast(&g_queue_cond);
             } else {
@@ -2153,12 +2236,9 @@ int workers_start(void)
 
     pthread_mutex_lock(&g_queue_lock);
     g_queue_done = 0;
-    g_small_queue_head = NULL;
-    g_small_queue_tail = NULL;
-    g_large_queue_head = NULL;
-    g_large_queue_tail = NULL;
-    g_small_queue_depth = 0;
-    g_large_queue_depth = 0;
+    g_small_heap.len = 0;
+    g_large_heap.len = 0;
+    g_enqueue_seq = 0;
     g_small_workers_active = 0;
     g_large_workers_active = 0;
     pthread_mutex_unlock(&g_queue_lock);
@@ -2199,6 +2279,24 @@ void workers_stop(void)
     while (g_large_workers_active > 0) {
         pthread_cond_wait(&g_large_done_cond, &g_queue_lock);
     }
+    /*
+     * Free any tasks still queued (only happens on an error stop; a clean run
+     * drains both heaps to empty) and release the heap backing arrays.
+     */
+    for (size_t i = 0; i < g_small_heap.len; i++) {
+        dir_handle_release(g_small_heap.items[i]->dir);
+        free(g_small_heap.items[i]);
+    }
+    for (size_t i = 0; i < g_large_heap.len; i++) {
+        dir_handle_release(g_large_heap.items[i]->dir);
+        free(g_large_heap.items[i]);
+    }
+    free(g_small_heap.items);
+    g_small_heap.items = NULL;
+    g_small_heap.len = g_small_heap.cap = 0;
+    free(g_large_heap.items);
+    g_large_heap.items = NULL;
+    g_large_heap.len = g_large_heap.cap = 0;
     /* All workers have exited; reclaim the recycled task nodes. */
     while (g_task_freelist) {
         file_task_t *next = g_task_freelist->next;
@@ -2313,7 +2411,7 @@ int workers_enqueue_batch(dir_handle_t *dir,
         size_t take;
 
         pthread_mutex_lock(&g_queue_lock);
-        while ((int)(g_small_queue_depth + g_large_queue_depth) >=
+        while ((int)(g_small_heap.len + g_large_heap.len) >=
                g_max_queued_files) {
             uint64_t wait_start_ns = g_collect_wait_timing ? monotonic_ns() : 0;
             pthread_cond_wait(&g_space_cond, &g_queue_lock);
@@ -2322,8 +2420,37 @@ int workers_enqueue_batch(dir_handle_t *dir,
             }
         }
         room = (size_t)(g_max_queued_files -
-                        (int)(g_small_queue_depth + g_large_queue_depth));
+                        (int)(g_small_heap.len + g_large_heap.len));
         take = built < room ? built : room;
+
+        /*
+         * Reserve heap capacity for this slice before pushing so heap_push is
+         * infallible. Classify first to size each heap exactly; on OOM bail out
+         * (the fail path frees the remaining batch and already-queued items stay
+         * valid).
+         */
+        {
+            size_t large_add = 0;
+            size_t small_add = 0;
+            file_task_t *scan = batch_head;
+            for (size_t i = 0; i < take; i++) {
+                int use_large = !sshx_active() &&
+                                scan->src_st.st_size > runtime_large_threshold() &&
+                                !workers_file_is_sparse(&scan->src_st);
+                if (use_large) {
+                    large_add++;
+                } else {
+                    small_add++;
+                }
+                scan = scan->next;
+            }
+            if (heap_reserve(&g_large_heap, g_large_heap.len + large_add) != 0 ||
+                heap_reserve(&g_small_heap, g_small_heap.len + small_add) != 0) {
+                pthread_mutex_unlock(&g_queue_lock);
+                errno = ENOMEM;
+                goto fail;
+            }
+        }
 
         for (size_t i = 0; i < take; i++) {
             file_task_t *t = batch_head;
@@ -2334,36 +2461,27 @@ int workers_enqueue_batch(dir_handle_t *dir,
             use_large = !sshx_active() &&
                         t->src_st.st_size > runtime_large_threshold() &&
                         !workers_file_is_sparse(&t->src_st);
-            if (use_large) {
-                if (g_large_queue_tail) {
-                    g_large_queue_tail->next = t;
-                } else {
-                    g_large_queue_head = t;
-                }
-                g_large_queue_tail = t;
-                g_large_queue_depth++;
-            } else {
-                if (g_small_queue_tail) {
-                    g_small_queue_tail->next = t;
-                } else {
-                    g_small_queue_head = t;
-                }
-                g_small_queue_tail = t;
-                g_small_queue_depth++;
-            }
+            /*
+             * Ordering key for the max-heaps: allocated-bytes weight when size
+             * priority is on (biggest data first), else a decreasing sequence
+             * so the heap yields FIFO (insertion) order.
+             */
+            t->sched_key = g_size_priority ? task_weight(&t->src_st)
+                                           : (UINT64_MAX - g_enqueue_seq++);
+            heap_push(use_large ? &g_large_heap : &g_small_heap, t);
         }
         {
             int free_slots = g_worker_count - total_worker_slots_used_locked();
             int large_wake = 0;
             int small_wake = 0;
 
-            if (g_large_queue_depth > 0 &&
+            if (g_large_heap.len > 0 &&
                 (int)g_large_workers_active < g_max_active_large_files &&
                 free_slots >= g_large_worker_count) {
                 large_wake = g_max_active_large_files -
                              (int)g_large_workers_active;
-                if (large_wake > (int)g_large_queue_depth) {
-                    large_wake = (int)g_large_queue_depth;
+                if (large_wake > (int)g_large_heap.len) {
+                    large_wake = (int)g_large_heap.len;
                 }
                 if (large_wake > free_slots / g_large_worker_count) {
                     large_wake = free_slots / g_large_worker_count;
@@ -2371,11 +2489,11 @@ int workers_enqueue_batch(dir_handle_t *dir,
                 free_slots -= large_wake * g_large_worker_count;
             }
 
-            if (g_small_queue_depth > 0 && free_slots > 0) {
+            if (g_small_heap.len > 0 && free_slots > 0) {
                 small_wake = g_small_worker_limit -
                              (int)g_small_workers_active;
-                if (small_wake > (int)g_small_queue_depth) {
-                    small_wake = (int)g_small_queue_depth;
+                if (small_wake > (int)g_small_heap.len) {
+                    small_wake = (int)g_small_heap.len;
                 }
                 if (small_wake > free_slots) {
                     small_wake = free_slots;
@@ -2442,7 +2560,7 @@ uint64_t workers_small_queue_depth(void)
 {
     uint64_t v;
     pthread_mutex_lock(&g_queue_lock);
-    v = g_small_queue_depth;
+    v = g_small_heap.len;
     pthread_mutex_unlock(&g_queue_lock);
     return v;
 }
@@ -2460,7 +2578,7 @@ uint64_t workers_large_queue_depth(void)
 {
     uint64_t v;
     pthread_mutex_lock(&g_queue_lock);
-    v = g_large_queue_depth;
+    v = g_large_heap.len;
     pthread_mutex_unlock(&g_queue_lock);
     return v;
 }
