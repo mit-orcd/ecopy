@@ -32,6 +32,7 @@
 #include <inttypes.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/resource.h>
 #include <sys/utsname.h>
 #include <time.h>
 #include <pthread.h>
@@ -40,6 +41,16 @@
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
+#endif
+
+/*
+ * O_PATH yields a lightweight directory handle usable only as the dirfd of *at
+ * calls (openat/renameat/unlinkat/...), which is all the dir-fd cache needs. If
+ * the platform lacks it, fall back to a normal directory open (0 => O_RDONLY),
+ * which also works as a dirfd, just a touch heavier.
+ */
+#ifndef O_PATH
+#define O_PATH 0
 #endif
 
 /*
@@ -548,6 +559,217 @@ static void dir_cache_destroy(void)
         }
         g_dir_cache_initialized = 0;
     }
+}
+
+/* -------------------- directory fd cache (autofs path-walk amortizer) --------
+ *
+ * On automounted (autofs) destinations every open()/utimensat()/rename() by an
+ * absolute path re-walks the whole path from '/', and autofs re-checks each
+ * component for a mountpoint -- profiles show ~60% of the busy server process's
+ * CPU there. This LRU keeps a bounded set of open O_PATH directory handles and
+ * lets the file handlers use openat()/renameat()/unlinkat()/utimensat() with a
+ * single trailing component, collapsing the per-file path walk to O(1) after
+ * the directory is first opened. A miss opens the directory relative to its
+ * (cached) parent, so warming a subtree costs one component per level total.
+ *
+ * fds are a scarce resource, so the cache is bounded (default derived from
+ * RLIMIT_NOFILE, override DIRECT_COPY_SSH_SERVER_DIRFD_CACHE) and entries in use
+ * are refcount-pinned so eviction never closes a handle a worker is mid-syscall
+ * on.
+ */
+typedef struct dfd_entry {
+    struct dfd_entry *hnext;                 /* hash chain */
+    struct dfd_entry *lru_prev, *lru_next;   /* MRU at head, LRU at tail */
+    int fd;
+    int refcount;                            /* pinned while > 0 */
+    uint32_t hash;
+    char path[];
+} dfd_entry_t;
+
+#define DFD_BUCKETS (1u << 16)
+static dfd_entry_t *g_dfd_buckets[DFD_BUCKETS];
+static dfd_entry_t *g_dfd_head;              /* MRU */
+static dfd_entry_t *g_dfd_tail;              /* LRU */
+static int g_dfd_count;
+static int g_dfd_cap;
+static pthread_mutex_t g_dfd_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void dir_fd_cache_init(void)
+{
+    long cur = -1;
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) {
+        cur = (long)rl.rlim_cur;
+    }
+    /* Leave generous headroom for streamed-file fds, pool, and the SSH pipe. */
+    int cap;
+    if (cur < 0) {
+        cap = 8192;                          /* unlimited: pick a sane ceiling */
+    } else if (cur > 1024) {
+        cap = (int)(cur - 512);
+    } else {
+        cap = (int)(cur / 2);
+    }
+    const char *env = getenv("DIRECT_COPY_SSH_SERVER_DIRFD_CACHE");
+    if (env && *env) {
+        char *end = NULL;
+        long v = strtol(env, &end, 10);
+        if (end && !*end && v >= 0) cap = (int)v;
+    }
+    if (cap < 16) cap = 16;
+    if (cap > 262144) cap = 262144;
+    g_dfd_cap = cap;
+}
+
+/* Unlink from the LRU list (caller holds g_dfd_lock). */
+static void dfd_lru_unlink(dfd_entry_t *e)
+{
+    if (e->lru_prev) e->lru_prev->lru_next = e->lru_next;
+    else g_dfd_head = e->lru_next;
+    if (e->lru_next) e->lru_next->lru_prev = e->lru_prev;
+    else g_dfd_tail = e->lru_prev;
+    e->lru_prev = e->lru_next = NULL;
+}
+
+/* Insert at MRU head (caller holds g_dfd_lock). */
+static void dfd_lru_push_front(dfd_entry_t *e)
+{
+    e->lru_prev = NULL;
+    e->lru_next = g_dfd_head;
+    if (g_dfd_head) g_dfd_head->lru_prev = e;
+    g_dfd_head = e;
+    if (!g_dfd_tail) g_dfd_tail = e;
+}
+
+/* Find + pin + promote to MRU (caller holds g_dfd_lock). */
+static dfd_entry_t *dfd_lookup_pin_locked(const char *path, uint32_t hash)
+{
+    dfd_entry_t *e = g_dfd_buckets[hash & (DFD_BUCKETS - 1u)];
+    for (; e; e = e->hnext) {
+        if (e->hash == hash && strcmp(e->path, path) == 0) {
+            e->refcount++;
+            dfd_lru_unlink(e);
+            dfd_lru_push_front(e);
+            return e;
+        }
+    }
+    return NULL;
+}
+
+/* Close unpinned tail entries until we are back under the cap (caller holds
+ * g_dfd_lock). Entries in use (refcount > 0) are skipped; if the whole cache is
+ * momentarily pinned we simply run slightly over cap. */
+static void dfd_evict_locked(void)
+{
+    dfd_entry_t *e = g_dfd_tail;
+    while (g_dfd_count > g_dfd_cap && e) {
+        dfd_entry_t *prev = e->lru_prev;
+        if (e->refcount == 0) {
+            /* unlink from hash */
+            dfd_entry_t **pp = &g_dfd_buckets[e->hash & (DFD_BUCKETS - 1u)];
+            while (*pp && *pp != e) pp = &(*pp)->hnext;
+            if (*pp) *pp = e->hnext;
+            dfd_lru_unlink(e);
+            close(e->fd);
+            free(e);
+            g_dfd_count--;
+        }
+        e = prev;
+    }
+}
+
+static void dir_fd_release(dfd_entry_t *e)
+{
+    if (!e) return;
+    pthread_mutex_lock(&g_dfd_lock);
+    if (e->refcount > 0) e->refcount--;
+    pthread_mutex_unlock(&g_dfd_lock);
+}
+
+/*
+ * Acquire a pinned O_PATH handle for directory `dir` (which must already exist,
+ * e.g. via ensure_dir_cached_mode). Returns the fd and stores the entry in
+ * *out; release with dir_fd_release(*out). Returns -1 (errno set) on failure,
+ * with *out == NULL. A miss opens `dir` relative to its cached parent so
+ * warming a deep path costs one component per level rather than a full walk.
+ */
+static int dir_fd_acquire(const char *dir, dfd_entry_t **out)
+{
+    *out = NULL;
+    if (g_dfd_cap <= 0) { errno = EINVAL; return -1; }
+
+    uint32_t hash = dir_cache_hash(dir);
+    pthread_mutex_lock(&g_dfd_lock);
+    dfd_entry_t *e = dfd_lookup_pin_locked(dir, hash);
+    pthread_mutex_unlock(&g_dfd_lock);
+    if (e) { *out = e; return e->fd; }
+
+    /* Miss: open, preferring a parent-relative single-component open. */
+    int fd = -1;
+    dfd_entry_t *pe = NULL;
+    char parent[PATH_MAX], base[PATH_MAX];
+    split_dir_base(dir, parent, sizeof(parent), base, sizeof(base));
+    int use_parent = strcmp(dir, g_root_norm) != 0 &&
+                     strcmp(parent, dir) != 0 &&
+                     base[0] && strcmp(base, "/") != 0 &&
+                     path_under_root(parent);
+    if (use_parent) {
+        int pfd = dir_fd_acquire(parent, &pe);
+        if (pfd >= 0) {
+            fd = openat(pfd, base,
+                        O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        }
+    }
+    if (fd < 0) {
+        fd = open(dir, O_PATH | O_DIRECTORY | O_CLOEXEC);
+    }
+    if (pe) dir_fd_release(pe);
+    if (fd < 0) return -1;
+
+    size_t len = strlen(dir);
+    pthread_mutex_lock(&g_dfd_lock);
+    e = dfd_lookup_pin_locked(dir, hash);   /* someone may have raced us */
+    if (e) {
+        pthread_mutex_unlock(&g_dfd_lock);
+        close(fd);
+        *out = e;
+        return e->fd;
+    }
+    e = malloc(sizeof(*e) + len + 1);
+    if (!e) {
+        pthread_mutex_unlock(&g_dfd_lock);
+        close(fd);
+        errno = ENOMEM;
+        return -1;
+    }
+    e->fd = fd;
+    e->refcount = 1;
+    e->hash = hash;
+    memcpy(e->path, dir, len + 1);
+    e->hnext = g_dfd_buckets[hash & (DFD_BUCKETS - 1u)];
+    g_dfd_buckets[hash & (DFD_BUCKETS - 1u)] = e;
+    dfd_lru_push_front(e);
+    g_dfd_count++;
+    dfd_evict_locked();
+    pthread_mutex_unlock(&g_dfd_lock);
+    *out = e;
+    return fd;
+}
+
+static void dir_fd_cache_destroy(void)
+{
+    pthread_mutex_lock(&g_dfd_lock);
+    dfd_entry_t *e = g_dfd_head;
+    while (e) {
+        dfd_entry_t *next = e->lru_next;
+        close(e->fd);
+        free(e);
+        e = next;
+    }
+    g_dfd_head = g_dfd_tail = NULL;
+    g_dfd_count = 0;
+    for (size_t i = 0; i < DFD_BUCKETS; i++) g_dfd_buckets[i] = NULL;
+    pthread_mutex_unlock(&g_dfd_lock);
 }
 
 /*
@@ -1095,11 +1317,37 @@ static void handle_setmeta(const uint8_t *payload, uint32_t plen)
     char path[PATH_MAX];
     if (resolve_path(in, path, sizeof(path)) != 0) { log_op_error(in, errno); return; }
 
-    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-    if (fd < 0) {
-        /* Directories may need O_DIRECTORY on some systems; retry. */
-        fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    /*
+     * Open the target through its parent's cached directory handle so the
+     * per-object metadata pass does not re-walk the full (autofs) path. Falls
+     * back to an absolute open for the confinement root or a cache miss.
+     */
+    char sdir[PATH_MAX], sbase[PATH_MAX];
+    split_dir_base(path, sdir, sizeof(sdir), sbase, sizeof(sbase));
+    int parent_ok = strcmp(path, g_root_norm) != 0 &&
+                    strcmp(sdir, path) != 0 &&
+                    sbase[0] && strcmp(sbase, "/") != 0 &&
+                    path_under_root(sdir);
+    int fd = -1;
+    dfd_entry_t *de = NULL;
+    if (parent_ok) {
+        int dfd = dir_fd_acquire(sdir, &de);
+        if (dfd >= 0) {
+            fd = openat(dfd, sbase, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+            if (fd < 0) {
+                fd = openat(dfd, sbase,
+                            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            }
+        }
     }
+    if (fd < 0) {
+        fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+        if (fd < 0) {
+            /* Directories may need O_DIRECTORY on some systems; retry. */
+            fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        }
+    }
+    if (de) dir_fd_release(de);
     if (fd < 0) { log_op_error(path, errno); return; }
     int mode_is_set = is_dir && dir_cache_mode_matches(path, (mode_t)mode);
     if (((uid_t)uid != g_euid || (gid_t)gid != g_egid) &&
@@ -1168,20 +1416,29 @@ static void handle_putfile(const uint8_t *payload, uint32_t plen)
     int mode_is_set = (mode & S_IWUSR) ? 1 : 0;
     mode_t create_mode = mode_is_set ? (mode_t)(mode & 07777) : copy_data_mode((mode_t)mode);
 
-    char tmp_path[PATH_MAX];
+    /*
+     * Open/create/rename relative to a cached directory handle so autofs does
+     * not re-walk the whole path per file. `tmp_name` is the basename created in
+     * `dir`; the final rename is dir-relative too.
+     */
+    dfd_entry_t *de = NULL;
+    int dfd = dir_fd_acquire(dir, &de);
+    if (dfd < 0) { log_op_error(dir, errno); return; }
+
+    char tmp_name[PATH_MAX];
     int fd;
     if (inplace) {
-        snprintf(tmp_path, sizeof(tmp_path), "%s", finalp);
-        fd = open(finalp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, create_mode);
+        snprintf(tmp_name, sizeof(tmp_name), "%s", base);
+        fd = openat(dfd, base, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, create_mode);
     } else {
         static _Atomic uint64_t put_seq;
         uint64_t seq = atomic_fetch_add(&put_seq, 1) + 1;
-        int need = snprintf(tmp_path, sizeof(tmp_path), "%s/.ecopy.tmp.%u.p%llu",
-                            dir, (unsigned)getpid(), (unsigned long long)seq);
-        if (need < 0 || need >= (int)sizeof(tmp_path)) { log_op_error(finalp, ENAMETOOLONG); return; }
-        fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, create_mode);
+        int need = snprintf(tmp_name, sizeof(tmp_name), ".ecopy.tmp.%u.p%llu",
+                            (unsigned)getpid(), (unsigned long long)seq);
+        if (need < 0 || need >= (int)sizeof(tmp_name)) { dir_fd_release(de); log_op_error(finalp, ENAMETOOLONG); return; }
+        fd = openat(dfd, tmp_name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, create_mode);
     }
-    if (fd < 0) { log_op_error(finalp, errno); return; }
+    if (fd < 0) { dir_fd_release(de); log_op_error(finalp, errno); return; }
 
     int err = 0;
     const char *failed_op = NULL;
@@ -1203,11 +1460,12 @@ static void handle_putfile(const uint8_t *payload, uint32_t plen)
     }
     if (close(fd) != 0 && err == 0) err = errno;
     if (err == 0 && !inplace) {
-        if (rename(tmp_path, finalp) != 0) err = errno;
+        if (renameat(dfd, tmp_name, dfd, base) != 0) err = errno;
     }
+    if (err != 0 && !inplace) (void)unlinkat(dfd, tmp_name, 0);
+    dir_fd_release(de);
     if (err != 0) {
         char diagnostic[PATH_MAX];
-        if (!inplace) (void)unlink(tmp_path);
         if (failed_op) {
             snprintf(diagnostic, sizeof(diagnostic), "%.*s (%s)",
                      PATH_MAX - 32, finalp, failed_op);
@@ -1485,15 +1743,21 @@ static void handle_symlink(const uint8_t *payload, uint32_t plen)
         return;
     }
 
+    dfd_entry_t *de = NULL;
+    int dfd = dir_fd_acquire(dir, &de);
+    if (dfd < 0) { log_op_error(dir, errno); return; }
+
     static _Atomic uint64_t sym_seq;
     uint64_t seq = atomic_fetch_add(&sym_seq, 1) + 1;
     char tmp[PATH_MAX];
-    if (snprintf(tmp, sizeof(tmp), "%s/.ecopy.tmp.sym.%u.%llu",
-                 dir, (unsigned)getpid(), (unsigned long long)seq) >= (int)sizeof(tmp)) {
+    if (snprintf(tmp, sizeof(tmp), ".ecopy.tmp.sym.%u.%llu",
+                 (unsigned)getpid(), (unsigned long long)seq) >= (int)sizeof(tmp)) {
+        dir_fd_release(de);
         log_op_error(link_path, ENAMETOOLONG);
         return;
     }
-    if (symlink(target, tmp) != 0) {
+    if (symlinkat(target, dfd, tmp) != 0) {
+        dir_fd_release(de);
         log_op_error(link_path, errno);
         return;
     }
@@ -1505,7 +1769,8 @@ static void handle_symlink(const uint8_t *payload, uint32_t plen)
                         "ecopy: remote chown not permitted; continuing "
                         "without preserving uid/gid ownership\n");
             }
-        } else if (lchown(tmp, (uid_t)uid, (gid_t)gid) != 0) {
+        } else if (fchownat(dfd, tmp, (uid_t)uid, (gid_t)gid,
+                            AT_SYMLINK_NOFOLLOW) != 0) {
             if (chown_permission_errno(errno)) {
                 if (atomic_exchange(&g_chown_permission_warned, 1) == 0) {
                     fprintf(stderr,
@@ -1521,12 +1786,13 @@ static void handle_symlink(const uint8_t *payload, uint32_t plen)
         struct timespec ts[2];
         ts[0].tv_sec = (time_t)at_s; ts[0].tv_nsec = (long)at_ns;
         ts[1].tv_sec = (time_t)mt_s; ts[1].tv_nsec = (long)mt_ns;
-        (void)utimensat(AT_FDCWD, tmp, ts, AT_SYMLINK_NOFOLLOW);
+        (void)utimensat(dfd, tmp, ts, AT_SYMLINK_NOFOLLOW);
     }
-    if (rename(tmp, link_path) != 0) {
+    if (renameat(dfd, tmp, dfd, base) != 0) {
         log_op_error(link_path, errno);
-        (void)unlink(tmp);
+        (void)unlinkat(dfd, tmp, 0);
     }
+    dir_fd_release(de);
 }
 
 /*
@@ -1550,22 +1816,48 @@ static void handle_link(const uint8_t *payload, uint32_t plen)
     split_dir_base(link_path, dir, sizeof(dir), base, sizeof(base));
     if (ensure_dir_cached_mode(dir, 0755) != 0) { log_op_error(dir, errno); return; }
 
-    if (link(pri, link_path) == 0) return;
-    if (errno != EEXIST) { log_op_error(link_path, errno); return; }
+    dfd_entry_t *de = NULL;
+    int dfd = dir_fd_acquire(dir, &de);
+    if (dfd < 0) { log_op_error(dir, errno); return; }
+
+    /* oldpath (primary) is absolute; newpath is created in the cached dir. */
+    if (linkat(AT_FDCWD, pri, dfd, base, 0) == 0) { dir_fd_release(de); return; }
+    if (errno != EEXIST) { dir_fd_release(de); log_op_error(link_path, errno); return; }
+
+    /*
+     * The name already exists. If it is already a link to the same inode as the
+     * primary (a re-copy of an unchanged hard link), we are done. This also
+     * avoids the temp+rename path below, where renaming two links to the same
+     * inode is a POSIX no-op that returns success WITHOUT removing the temp,
+     * orphaning it.
+     */
+    struct stat pst, lst;
+    if (fstatat(AT_FDCWD, pri, &pst, 0) == 0 &&
+        fstatat(dfd, base, &lst, AT_SYMLINK_NOFOLLOW) == 0 &&
+        pst.st_dev == lst.st_dev && pst.st_ino == lst.st_ino) {
+        dir_fd_release(de);
+        return;
+    }
 
     static _Atomic uint64_t link_seq;
     uint64_t seq = atomic_fetch_add(&link_seq, 1) + 1;
     char tmp[PATH_MAX];
-    if (snprintf(tmp, sizeof(tmp), "%s/.ecopy.tmp.lnk.%u.%llu",
-                 dir, (unsigned)getpid(), (unsigned long long)seq) >= (int)sizeof(tmp)) {
+    if (snprintf(tmp, sizeof(tmp), ".ecopy.tmp.lnk.%u.%llu",
+                 (unsigned)getpid(), (unsigned long long)seq) >= (int)sizeof(tmp)) {
+        dir_fd_release(de);
         log_op_error(link_path, ENAMETOOLONG);
         return;
     }
-    if (link(pri, tmp) != 0) { log_op_error(link_path, errno); return; }
-    if (rename(tmp, link_path) != 0) {
+    if (linkat(AT_FDCWD, pri, dfd, tmp, 0) != 0) {
+        dir_fd_release(de);
         log_op_error(link_path, errno);
-        (void)unlink(tmp);
+        return;
     }
+    if (renameat(dfd, tmp, dfd, base) != 0) {
+        log_op_error(link_path, errno);
+        (void)unlinkat(dfd, tmp, 0);
+    }
+    dir_fd_release(de);
 }
 
 /* -------------------- apply pool -------------------- */
@@ -1745,6 +2037,7 @@ int server_main(const char *root, int read_only)
         fprintf(stderr, "ecopy --server: cannot initialize directory cache\n");
         return 1;
     }
+    dir_fd_cache_init();
 
     for (;;) {
         uint8_t type;
@@ -1803,6 +2096,7 @@ int server_main(const char *root, int read_only)
         case MSG_BYE:
             free(payload);
             pool_shutdown();
+            dir_fd_cache_destroy();
             dir_cache_destroy();
             free(g_wbuf);
             g_wbuf = NULL;
@@ -1818,6 +2112,7 @@ int server_main(const char *root, int read_only)
     }
 
     pool_shutdown();
+    dir_fd_cache_destroy();
     dir_cache_destroy();
 
     /* Clean up any dangling temp files from an interrupted transfer. */

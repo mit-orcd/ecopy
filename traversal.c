@@ -25,6 +25,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/syscall.h>
 
 typedef struct dir_node {
     char src[PATH_MAX];
@@ -461,9 +462,20 @@ typedef struct {
     const char **names;
     int *present;
     struct stat *dst_st;
+    char *getdents_buf;   /* reusable raw getdents64 buffer (0 => libc readdir) */
+    size_t getdents_cap;
 } file_scratch_t;
 
 static __thread file_scratch_t g_file_scratch;
+
+/*
+ * Raw getdents64 read-buffer size per traversal worker (bytes). A larger buffer
+ * returns many dirents per syscall, cutting the syscall count on huge
+ * directories. 0 disables the raw path and falls back to libc readdir. Set once
+ * in traversal_start() from DIRECT_COPY_GETDENTS_BUF. Learned from ereport's
+ * ecrawl, which uses the same technique for fast metadata crawls.
+ */
+static size_t g_getdents_buf_bytes;
 
 static file_scratch_t *file_scratch_get(int remote)
 {
@@ -492,7 +504,89 @@ static file_scratch_t *file_scratch_get(int remote)
             return NULL;
         }
     }
+    if (g_getdents_buf_bytes > 0 && !s->getdents_buf) {
+        /* Best-effort: on OOM leave it NULL so the reader falls back to
+         * readdir instead of failing the traversal. */
+        s->getdents_buf = malloc(g_getdents_buf_bytes);
+        if (s->getdents_buf) s->getdents_cap = g_getdents_buf_bytes;
+    }
     return s;
+}
+
+/*
+ * Directory enumeration reader: raw getdents64 into the worker's reusable
+ * buffer when enabled, else libc readdir. Either way the parent dir fd used for
+ * fstatat/openat is handle->src_fd (unaffected); this only replaces the entry
+ * stream. `stream_fd` is a private dup of src_fd whose ownership passes to the
+ * reader.
+ */
+struct ecopy_dirent64 {
+    uint64_t       d_ino;
+    int64_t        d_off;
+    unsigned short d_reclen;
+    unsigned char  d_type;
+    char           d_name[];
+};
+
+typedef struct {
+    int fd;          /* getdents path stream fd; -1 => libc fallback */
+    DIR *dirp;       /* libc fallback */
+    char *buf;       /* borrowed from the worker scratch (getdents path) */
+    size_t buf_cap;
+    size_t buf_len;
+    size_t buf_off;
+} dirreader_t;
+
+/* Returns 0 on success (ownership of stream_fd taken), -1 on failure (caller
+ * still owns stream_fd). */
+static int dirreader_open(dirreader_t *rd, int stream_fd, file_scratch_t *s)
+{
+    rd->fd = -1;
+    rd->dirp = NULL;
+    rd->buf = NULL;
+    rd->buf_cap = rd->buf_len = rd->buf_off = 0;
+
+    if (g_getdents_buf_bytes > 0 && s->getdents_buf) {
+        rd->fd = stream_fd;
+        rd->buf = s->getdents_buf;
+        rd->buf_cap = s->getdents_cap;
+        return 0;
+    }
+    rd->dirp = fdopendir(stream_fd);
+    if (!rd->dirp) return -1;
+    return 0;
+}
+
+/* 1 = got an entry (*name_out valid until the next call), 0 = end, -1 = error. */
+static int dirreader_next(dirreader_t *rd, const char **name_out)
+{
+    if (rd->fd < 0) {
+        struct dirent *de = readdir(rd->dirp);
+        if (!de) return 0;
+        *name_out = de->d_name;
+        return 1;
+    }
+    for (;;) {
+        if (rd->buf_off >= rd->buf_len) {
+            long n = syscall(SYS_getdents64, rd->fd, rd->buf, rd->buf_cap);
+            if (n < 0) { perror("getdents64"); return -1; }
+            if (n == 0) return 0;
+            rd->buf_len = (size_t)n;
+            rd->buf_off = 0;
+        }
+        struct ecopy_dirent64 *d =
+            (struct ecopy_dirent64 *)(void *)(rd->buf + rd->buf_off);
+        if (d->d_reclen == 0) return 0; /* defensive: never advance by zero */
+        rd->buf_off += d->d_reclen;
+        *name_out = d->d_name;
+        return 1;
+    }
+}
+
+static void dirreader_close(dirreader_t *rd)
+{
+    if (rd->fd >= 0) { close(rd->fd); rd->fd = -1; }
+    else if (rd->dirp) { closedir(rd->dirp); rd->dirp = NULL; }
 }
 
 static int stat_destination_batch(dir_handle_t *handle,
@@ -672,30 +766,39 @@ static void copy_symlink_entry(dir_handle_t *handle, const dir_node_t *node,
 
 static void process_dir_entries(dir_handle_t *handle,
                                 const dir_node_t *node,
-                                DIR *dir,
+                                int dir_stream_fd,
                                 int remote)
 {
-    struct dirent *entry;
+    const char *ent_name;
     file_scratch_t *s = file_scratch_get(remote);
+    dirreader_t rd;
+    int rdrc;
     int n = 0;
     int saw_file = 0;
 
     if (!s) {
+        close(dir_stream_fd);
+        mark_traversal_error();
+        return;
+    }
+    if (dirreader_open(&rd, dir_stream_fd, s) != 0) {
+        perror(node->src);
+        close(dir_stream_fd);
         mark_traversal_error();
         return;
     }
 
-    while ((entry = readdir(dir)) != NULL) {
+    while ((rdrc = dirreader_next(&rd, &ent_name)) == 1) {
         struct stat st;
         char src_path[PATH_MAX], dst_path[PATH_MAX];
 
-        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        if (!strcmp(ent_name, ".") || !strcmp(ent_name, "..")) continue;
 
         if (!remote) {
             if (join_path(src_path, sizeof(src_path), node->src,
-                          entry->d_name) != 0) {
+                          ent_name) != 0) {
                 fprintf(stderr, "Source path too long: %s/%s\n",
-                        node->src, entry->d_name);
+                        node->src, ent_name);
                 mark_traversal_error();
                 continue;
             }
@@ -704,15 +807,15 @@ static void process_dir_entries(dir_handle_t *handle,
             }
         }
 
-        if (fstatat(handle->src_fd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
-            perror(entry->d_name);
+        if (fstatat(handle->src_fd, ent_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+            perror(ent_name);
             mark_traversal_error();
             continue;
         }
 
         if (S_ISDIR(st.st_mode)) {
-            if (join_path(src_path, sizeof(src_path), node->src, entry->d_name) != 0 ||
-                join_path(dst_path, sizeof(dst_path), node->dst, entry->d_name) != 0) {
+            if (join_path(src_path, sizeof(src_path), node->src, ent_name) != 0 ||
+                join_path(dst_path, sizeof(dst_path), node->dst, ent_name) != 0) {
                 fprintf(stderr, "Path too long under %s\n", node->src);
                 mark_traversal_error();
                 continue;
@@ -723,10 +826,10 @@ static void process_dir_entries(dir_handle_t *handle,
             }
             pthread_mutex_unlock(&g_dir_lock);
         } else if (S_ISLNK(st.st_mode)) {
-            copy_symlink_entry(handle, node, entry->d_name, &st, remote);
+            copy_symlink_entry(handle, node, ent_name, &st, remote);
         } else if (S_ISREG(st.st_mode)) {
-            if (strlen(entry->d_name) >= sizeof(s->batch[0].name)) {
-                fprintf(stderr, "Name too long: %s\n", entry->d_name);
+            if (strlen(ent_name) >= sizeof(s->batch[0].name)) {
+                fprintf(stderr, "Name too long: %s\n", ent_name);
                 mark_traversal_error();
                 continue;
             }
@@ -740,7 +843,7 @@ static void process_dir_entries(dir_handle_t *handle,
              */
             if (st.st_nlink > 1) {
                 if (join_path(dst_path, sizeof(dst_path), node->dst,
-                              entry->d_name) != 0) {
+                              ent_name) != 0) {
                     fprintf(stderr, "Path too long under %s\n", node->dst);
                     mark_traversal_error();
                     continue;
@@ -756,7 +859,7 @@ static void process_dir_entries(dir_handle_t *handle,
             }
             stats_inc_files_seen();
             saw_file = 1;
-            snprintf(s->batch[n].name, sizeof(s->batch[n].name), "%s", entry->d_name);
+            snprintf(s->batch[n].name, sizeof(s->batch[n].name), "%s", ent_name);
             s->batch[n].st = st;
             n++;
             if (n == FILE_STAT_BATCH) {
@@ -767,6 +870,11 @@ static void process_dir_entries(dir_handle_t *handle,
             }
         }
     }
+
+    if (rdrc < 0) {
+        mark_traversal_error();
+    }
+    dirreader_close(&rd);
 
     if (flush_file_batch(handle, node, s, n, remote) != 0) {
         mark_traversal_error();
@@ -805,7 +913,6 @@ static dir_node_t *pop_dir_locked(void)
 static void process_directory_node(dir_node_t *node)
 {
     struct stat st;
-    DIR *dir;
     dir_handle_t *handle;
     int src_fd;
     int dst_fd;
@@ -861,6 +968,12 @@ static void process_directory_node(dir_node_t *node)
         return;
     }
 
+    /*
+     * A private dup of src_fd for enumeration: the reader consumes its file
+     * offset (getdents64 or fdopendir/readdir), while src_fd keeps serving
+     * offset-independent fstatat/openat for the entries. Ownership passes to
+     * process_dir_entries, which closes it via the reader.
+     */
     dir_stream_fd = dup(handle->src_fd);
     if (dir_stream_fd < 0) {
         perror(node->src);
@@ -868,17 +981,8 @@ static void process_directory_node(dir_node_t *node)
         mark_traversal_error();
         return;
     }
-    dir = fdopendir(dir_stream_fd);
-    if (!dir) {
-        close(dir_stream_fd);
-        perror(node->src);
-        dir_handle_release(handle);
-        mark_traversal_error();
-        return;
-    }
 
-    process_dir_entries(handle, node, dir, sshx_active());
-    closedir(dir);
+    process_dir_entries(handle, node, dir_stream_fd, sshx_active());
     dir_handle_release(handle);
 }
 
@@ -946,6 +1050,19 @@ int traversal_start(const char *src_dir, const char *dst_dir) {
     }
 
     g_traversal_workers = env_int_or_default("DIRECT_COPY_TRAVERSAL_WORKERS", 8, 1, 128);
+
+    /*
+     * Raw getdents64 read-buffer size (bytes) per traversal worker; 0 falls
+     * back to libc readdir. Default 256 KiB returns thousands of entries per
+     * syscall on large directories. Clamp a nonzero value to a sane floor.
+     */
+    {
+        int v = env_int_or_default("DIRECT_COPY_GETDENTS_BUF", 262144, 0,
+                                   64 * 1024 * 1024);
+        if (v > 0 && v < 4096) v = 4096;
+        g_getdents_buf_bytes = (size_t)v;
+    }
+
     g_threads = calloc((size_t)g_traversal_workers, sizeof(*g_threads));
     if (!g_threads) {
         perror("calloc");

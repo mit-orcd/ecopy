@@ -87,6 +87,18 @@ The target may be an `ssh://` URL to push a local tree to another host:
   filesystem that rejects `O_DIRECT`, transparently fall back to buffered writes so a transfer never fails on
   alignment. Small (single-frame) files and sparse files always use buffered writes. Set
   `DIRECT_COPY_SSH_SERVER_DIRECT_IO=0` on the client to force buffered writes on the peer.
+- **Cached directory handles on the peer:** on automounted (autofs) destinations every open/rename/set-times by an
+  absolute path re-walks the whole path from `/`, and autofs re-checks each component for a mountpoint — profiling a
+  million-file tree showed ~60% of the busy peer process's CPU there. The peer keeps a bounded LRU of open `O_PATH`
+  directory handles and does its file operations with `openat`/`renameat`/`unlinkat`/`utimensat` relative to them, so
+  the per-object path walk collapses to a single trailing component once a directory is warm (a miss opens relative to
+  its cached parent, so warming a subtree costs one component per level total). The cache is sized from
+  `RLIMIT_NOFILE`; `DIRECT_COPY_SSH_SERVER_DIRFD_CACHE` overrides it (`0`/small favors fewer fds over hit-rate).
+- **Bulk directory reads:** each walker enumerates a directory with raw `getdents64` into a reusable per-thread
+  buffer (`DIRECT_COPY_GETDENTS_BUF`, default 256 KiB), returning thousands of entries per syscall instead of one
+  per `readdir` — fewer syscalls (and less seccomp/audit overhead) on huge directories. The parent directory fd is
+  reused for the relative `fstatat`/`openat` of every entry (no absolute-path re-walk). Set the buffer to `0` to fall
+  back to libc `readdir`.
 - **Batched client scheduling:** traversal appends each stat group to the file queues under one lock instead of
   locking and signaling once per file. The same scheduler path is used for local/NFS and SSH destinations.
 - **Fewer RPCs per file:** the peer creates files with their final mode (no extra `fchmod`) and skips `chown` when
@@ -289,6 +301,7 @@ Best settings are workload- and environment-dependent. Key knobs (defaults in pa
 | `DIRECT_COPY_CHUNK_MB` | 1 | Aligned bulk-transfer chunk size (1–4096) |
 | `DIRECT_COPY_LARGE_THRESHOLD_MB` | 10 | Size at which a file enters the large-file pipeline |
 | `DIRECT_COPY_TRAVERSAL_WORKERS` | 8 | Parallel directory-walker threads |
+| `DIRECT_COPY_GETDENTS_BUF` | 262144 | Per-walker raw `getdents64` read-buffer bytes; fewer syscalls on huge directories. `0` falls back to libc `readdir` (nonzero clamped to ≥4096) |
 | `DIRECT_COPY_MAX_QUEUED_FILES` | 262144 | Backpressure cap on queued file tasks |
 | `DIRECT_COPY_SIZE_PRIORITY` | 1 | Dispatch biggest-allocated-data files first (local and SSH); `0` restores FIFO order |
 | `DIRECT_COPY_SMALL_INPLACE` | 0 | Force final-name writes even on existing targets (fresh trees do this automatically; not crash-atomic) |
@@ -304,6 +317,7 @@ Best settings are workload- and environment-dependent. Key knobs (defaults in pa
 | `DIRECT_COPY_SSH_BARRIER_OPS` | 8192 | Fire-and-forget remote ops between drain/flush barriers (min 256) |
 | `DIRECT_COPY_SSH_SERVER_THREADS` | 16 | Apply threads on the `ssh://` peer; higher hides more per-op RPC latency (max 256) |
 | `DIRECT_COPY_SSH_SERVER_DIRECT_IO` | 1 | Remote peer opens streamed dense files with `O_DIRECT`; `0` forces buffered writes |
+| `DIRECT_COPY_SSH_SERVER_DIRFD_CACHE` | auto (`RLIMIT_NOFILE`-derived) | Open directory handles the peer caches to do file ops via `openat`/`renameat` instead of re-walking absolute paths (big win on autofs); `0`/small trades hit-rate for fewer fds |
 | `DIRECT_COPY_VERIFY_WORKERS` | local: min(CPUs, 16); SSH: min(CPUs, 8) | Bounded verify/verify-only checker threads (1–128) |
 | `DIRECT_COPY_VERIFY_PIPELINE_OPS` | 4096 | Remote fire-and-forget files released per barrier-gated verify generation (1–1000000) |
 | `DIRECT_COPY_NO_PRESERVE_TIMES` | 0 | Skip atime/mtime on local/NFS and `ssh://` targets (same as `--no-preserve-times`) |
