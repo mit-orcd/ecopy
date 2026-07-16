@@ -589,7 +589,20 @@ static int flush_file_batch(dir_handle_t *handle,
                     rc = -1;
                     continue;
                 }
-                stats_add_skipped_bytes((uint64_t)batch[i].st.st_size);
+                /*
+                 * Count only the data that would have crossed the wire, not the
+                 * logical size: a skipped sparse file must not inflate the
+                 * skipped/completed ("payload") totals by its hole size (e.g. a
+                 * 900 TiB sparse image holding 1 GiB of real data). This mirrors
+                 * the allocated-bytes weight used for the copied payload.
+                 */
+                off_t skip_alloc = (off_t)batch[i].st.st_blocks * 512;
+                off_t skip_payload = batch[i].st.st_size < skip_alloc
+                                         ? batch[i].st.st_size : skip_alloc;
+                if (skip_payload < 0) {
+                    skip_payload = 0;
+                }
+                stats_add_skipped_bytes((uint64_t)skip_payload);
                 stats_inc_files_skipped();
                 /* Skipped files already exist at their final path (durable). */
                 if (verify_queue_file(src_path, dst_path, &batch[i].st, 1, 1) != 0) {
