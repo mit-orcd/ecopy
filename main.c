@@ -44,8 +44,26 @@ static void usage(const char *prog) {
             "       --verify-skipped also checks files skipped as unchanged.\n"
             "       --verify-seed=N makes block selection reproducible.\n"
             "       --verify-only compares source and target without modifying either.\n"
-            "       --verify-workers=N sets checker parallelism (1-128).\n",
+            "       --verify-workers=N sets checker parallelism (1-128).\n"
+            "       --uid N forces the target owner uid of every object (else source uid).\n"
+            "       --gid N forces the target group gid of every object (else source gid).\n",
             prog);
+}
+
+/*
+ * Parse a numeric uid/gid argument into [0, UINT32_MAX-1] (the wire encoding is
+ * uint32; leave the all-ones value out as it is the "unchanged" sentinel in
+ * many APIs). Returns 0 on success, -1 on malformed/out-of-range input.
+ */
+static int parse_id_arg(const char *s, uint32_t *out)
+{
+    if (!s || !*s) return -1;
+    char *end = NULL;
+    errno = 0;
+    unsigned long long v = strtoull(s, &end, 10);
+    if (errno || !end || *end || v > 4294967294ULL) return -1;
+    *out = (uint32_t)v;
+    return 0;
 }
 
 /*
@@ -516,6 +534,10 @@ int main(int argc, char **argv) {
     int verify_only = 0;
     int verify_selector_seen = 0;
     int verify_workers = 0;
+    int uid_override_set = 0;
+    int gid_override_set = 0;
+    uint32_t uid_override = 0;
+    uint32_t gid_override = 0;
     ssh_target_t target;
 
     /* Hidden remote peer mode: `ecopy --server <root>`. */
@@ -593,6 +615,24 @@ int main(int argc, char **argv) {
                 }
                 verify_seed_value = (uint64_t)value;
                 verify_seed_set = 1;
+            } else if (strcmp(argv[i], "--uid") == 0 ||
+                       strncmp(argv[i], "--uid=", 6) == 0) {
+                const char *val = argv[i][5] == '=' ? argv[i] + 6
+                                                    : (i + 1 < argc ? argv[++i] : NULL);
+                if (parse_id_arg(val, &uid_override) != 0) {
+                    fprintf(stderr, "ecopy: invalid --uid: %s\n", val ? val : "(missing)");
+                    return 1;
+                }
+                uid_override_set = 1;
+            } else if (strcmp(argv[i], "--gid") == 0 ||
+                       strncmp(argv[i], "--gid=", 6) == 0) {
+                const char *val = argv[i][5] == '=' ? argv[i] + 6
+                                                    : (i + 1 < argc ? argv[++i] : NULL);
+                if (parse_id_arg(val, &gid_override) != 0) {
+                    fprintf(stderr, "ecopy: invalid --gid: %s\n", val ? val : "(missing)");
+                    return 1;
+                }
+                gid_override_set = 1;
             } else if (argv[i][0] == '-' && argv[i][1] != '\0' &&
                        strcmp(argv[i], "-") != 0) {
                 fprintf(stderr, "ecopy: unknown option: %s\n", argv[i]);
@@ -618,6 +658,16 @@ int main(int argc, char **argv) {
         verify_pct = 1.0;
     }
     copy_policy_init(!no_preserve_times);
+    copy_policy_set_id_override(uid_override_set, uid_override,
+                                gid_override_set, gid_override);
+    if (uid_override_set || gid_override_set) {
+        char ubuf[24], gbuf[24];
+        if (uid_override_set) snprintf(ubuf, sizeof(ubuf), "%u", uid_override);
+        else snprintf(ubuf, sizeof(ubuf), "source");
+        if (gid_override_set) snprintf(gbuf, sizeof(gbuf), "%u", gid_override);
+        else snprintf(gbuf, sizeof(gbuf), "source");
+        fprintf(stderr, "ecopy: forcing target ownership uid=%s gid=%s\n", ubuf, gbuf);
+    }
 
     if (ssh_target_is_url(src_arg)) {
         fprintf(stderr, "ecopy: ssh:// sources are not supported yet (push only)\n");
@@ -625,6 +675,7 @@ int main(int argc, char **argv) {
     }
 
     if (lstat(src_arg, &st) != 0) { perror(src_arg); return 1; }
+    copy_policy_apply_id_override(&st);
     int src_is_dir = S_ISDIR(st.st_mode);
     if (!src_is_dir && !S_ISREG(st.st_mode)) {
         fprintf(stderr, "Source is not a regular file or directory: %s\n", src_arg);

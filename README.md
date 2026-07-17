@@ -187,6 +187,16 @@ Verification is opt-in, so ordinary copies pay no extra opens, reads, hashing, a
   `chown` during copy, warns once, and reports the count on a separate `Ownership not preserved` line rather than
   counting it under `Verify failures` (so such a run still exits 0). Genuine mode/size/time mismatches, and any
   UID/GID mismatch when running privileged, remain hard failures.
+- `--uid N` / `--gid N` force the target ownership of **every** transferred object (files, directories, symlinks,
+  and hard links) to the given numeric id instead of copying the source's. Either flag may be used alone; the
+  unspecified side keeps the source value. The override is applied where each object's metadata is captured, so both
+  the apply and the verification comparison use the provided ids - `--verify`/`--verify-only` check the target
+  against the forced ids, not the source's. Two caveats: (1) it does **not** reduce crawling - `lstat`/`fstatat`
+  returns UID/GID in the same call that supplies size/mode/mtime, and ecopy already uses numeric ids (no name-lookup
+  RPCs); (2) the same privilege rules apply - an unprivileged target still cannot `chown` to a foreign uid, so
+  ownership is genuinely applied and verified only when the target can set it (a privileged target, or an override
+  equal to the target's own effective uid/gid). Otherwise the requested ids are still what verification checks
+  against, and any shortfall is reported under `Ownership not preserved` as usual.
 - `--verify-data[=PERCENT]` samples aligned 4 KiB blocks. The first and final block are always checked,
   including a short final block; empty files receive size/metadata checks only. The percentage sets the total target
   block count including those endpoints, so small files can have higher achieved coverage than requested.

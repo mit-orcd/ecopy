@@ -812,6 +812,7 @@ static void process_dir_entries(dir_handle_t *handle,
             mark_traversal_error();
             continue;
         }
+        copy_policy_apply_id_override(&st);
 
         if (S_ISDIR(st.st_mode)) {
             if (join_path(src_path, sizeof(src_path), node->src, ent_name) != 0 ||
@@ -1048,6 +1049,7 @@ int traversal_start(const char *src_dir, const char *dst_dir) {
         fprintf(stderr, "Source is not a directory: %s\n", g_src_root);
         return -1;
     }
+    copy_policy_apply_id_override(&root_st);
 
     g_traversal_workers = env_int_or_default("DIRECT_COPY_TRAVERSAL_WORKERS", 8, 1, 128);
 

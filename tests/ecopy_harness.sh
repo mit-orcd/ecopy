@@ -1388,6 +1388,102 @@ case_verify_only() {
     fi
 }
 
+case_uid_gid_override() {
+    local s="$work/idov_src"
+    mkdir -p "$s/sub"
+    printf 'top\n'        > "$s/top.txt"
+    printf 'nested\n'     > "$s/sub/b.txt"
+    ln -s top.txt "$s/link"
+    local myu myg out rc
+    myu="$(id -u)"; myg="$(id -g)"
+
+    # 1) Override to self + --verify: chown-to-self is a no-op, so ownership is
+    #    genuinely applied and verification of ownership passes (no shortfall).
+    case_begin "uid-gid-override:local-self"
+    local d="$work/idov_self"
+    out="$(env "${common_env[@]}" "$bin" --uid="$myu" --gid="$myg" --verify \
+              "$s" "$d" 2>&1)"; rc=$?
+    if [[ "$rc" -eq 0 ]] &&
+       ! grep -Eq 'Ownership not preserved: [1-9]' <<<"$out" &&
+       grep -q 'Verify failures   : 0' <<<"$out" &&
+       [[ "$(stat -c %u "$d/top.txt")" == "$myu" ]] &&
+       [[ "$(stat -c %g "$d/sub/b.txt")" == "$myg" ]] &&
+       [[ "$(stat -c %u "$d/top.txt")" == "$myu" ]]; then
+        ok "override to self applied and verified with 0 failures"
+    else
+        fail "override-to-self run: $(tr '\n' ' ' <<<"$out")"
+    fi
+
+    # 2) --uid alone (space form) leaves the group as the source's.
+    case_begin "uid-gid-override:uid-only-keeps-source-gid"
+    local d2="$work/idov_uidonly"
+    if env "${common_env[@]}" "$bin" --uid "$myu" "$s" "$d2" >/dev/null 2>&1 &&
+       [[ "$(stat -c %g "$s/top.txt")" == "$(stat -c %g "$d2/top.txt")" ]] &&
+       [[ "$(stat -c %u "$d2/top.txt")" == "$myu" ]]; then
+        ok "--uid alone overrides uid and keeps source gid"
+    else
+        fail "--uid alone did not keep source gid"
+    fi
+
+    # 3) Malformed / out-of-range ids are rejected before doing any work.
+    case_begin "uid-gid-override:parse-errors"
+    local dx="$work/idov_bad"
+    if env "${common_env[@]}" "$bin" --uid=notanint "$s" "${dx}1" >/dev/null 2>&1; then
+        fail "non-numeric --uid was accepted"
+    elif env "${common_env[@]}" "$bin" --gid=9999999999 "$s" "${dx}2" >/dev/null 2>&1; then
+        fail "out-of-range --gid was accepted"
+    elif [[ -e "${dx}1" || -e "${dx}2" ]]; then
+        fail "rejected id override still created a target"
+    else
+        ok "invalid --uid/--gid rejected without side effects"
+    fi
+
+    # 4) Same override over the SSH path (fake_ssh server runs as this user).
+    case_begin "uid-gid-override:remote-self"
+    local rd="$work/idov_remote"
+    local -a remote_env=(ECOPY_REMOTE_CMD="$bin")
+    if [[ "${ECOPY_HARNESS_REAL_SSH:-0}" != "1" ]]; then
+        remote_env+=(ECOPY_SSH="$repo_root/tests/fake_ssh.sh")
+    fi
+    out="$(env "${common_env[@]}" "${remote_env[@]}" "$bin" \
+              --uid="$myu" --gid="$myg" --verify "$s" "ssh://localhost${rd}" 2>&1)"; rc=$?
+    if [[ "$rc" -eq 0 ]] &&
+       ! grep -Eq 'Ownership not preserved: [1-9]' <<<"$out" &&
+       grep -q 'Verify failures   : 0' <<<"$out" &&
+       [[ "$(stat -c %u "$rd/top.txt")" == "$myu" ]]; then
+        ok "remote override to self applied and verified"
+    else
+        fail "remote override-to-self run: $(tr '\n' ' ' <<<"$out")"
+    fi
+
+    # 5) Prove the override actually *changes* gid (not just a self no-op) when
+    #    a genuinely different, settable gid exists. Probe candidates with a real
+    #    chgrp (a mapped/namespaced root may list groups it still cannot set), and
+    #    skip cleanly if none stick.
+    case_begin "uid-gid-override:alt-gid-applied"
+    local altg="" probe="$work/.gid_probe" g
+    : > "$probe"
+    for g in $(id -G) 12345 65534 1; do
+        if [[ "$g" != "$myg" ]] && chgrp "$g" "$probe" 2>/dev/null &&
+           [[ "$(stat -c %g "$probe")" == "$g" ]]; then
+            altg="$g"; break
+        fi
+    done
+    rm -f "$probe"
+    if [[ -n "$altg" ]]; then
+        local d3="$work/idov_altgid"
+        if env "${common_env[@]}" "$bin" --gid="$altg" "$s" "$d3" >/dev/null 2>&1 &&
+           [[ "$(stat -c %g "$d3/top.txt")" == "$altg" ]] &&
+           [[ "$(stat -c %g "$d3/sub/b.txt")" == "$altg" ]]; then
+            ok "explicit --gid applied to target objects"
+        else
+            fail "explicit --gid not applied (altg=$altg)"
+        fi
+    else
+        ok "alt-gid check skipped (no secondary group and not root)"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
@@ -1422,6 +1518,7 @@ case_verify_pipeline_remote
 case_size_priority_local
 case_size_priority_remote
 case_verify_only
+case_uid_gid_override
 
 echo
 echo "ecopy harness results: $pass_count passed, $fail_count failed"
