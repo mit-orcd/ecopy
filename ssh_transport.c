@@ -108,6 +108,7 @@ static uint64_t g_barrier_ops;           /* shared periodic-barrier threshold */
 static char g_control_path[108];         /* ssh ControlPath socket (short) */
 static ssh_target_t g_target;            /* remembered for teardown (-O exit) */
 static char g_cipher_opt[192];           /* "Ciphers=^..." for -o, "" = none */
+static char g_remote_cmd_boot[PATH_MAX]; /* bootstrapped binary path, "" = none */
 
 /* The connection the current thread should use for its transport operations. */
 static __thread conn_t *t_conn;
@@ -416,6 +417,10 @@ static void ssh_detect_version_and_cipher(void)
 
 static const char *remote_ecopy_cmd(void)
 {
+    /* Once a bootstrap has uploaded a matching binary, every subsequent
+     * connection must invoke that path; otherwise it would retry the bare
+     * command that was already found missing. */
+    if (g_remote_cmd_boot[0]) return g_remote_cmd_boot;
     const char *e = getenv("ECOPY_REMOTE_CMD");
     return (e && *e) ? e : "ecopy";
 }
@@ -801,6 +806,9 @@ static int connect_one(conn_t *c, const ssh_target_t *t, ssh_mux_t mux,
         if (bootstrap_upload_binary(t, remote_path, sizeof(remote_path)) != 0) {
             return -1;
         }
+        /* Persist so later connections reuse the uploaded binary instead of
+         * re-hitting "command not found" (they run with allow_bootstrap=0). */
+        snprintf(g_remote_cmd_boot, sizeof(g_remote_cmd_boot), "%s", remote_path);
         if (build_server_command(remote_path, t->path, cmd, sizeof(cmd)) != 0) {
             return -1;
         }

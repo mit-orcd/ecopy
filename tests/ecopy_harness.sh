@@ -424,6 +424,44 @@ case_ssh_parallel_connections() {
     done
 }
 
+# When the remote host has no ecopy on PATH, the client bootstraps its own
+# binary to /tmp and every connection must reuse that uploaded path. The
+# bootstrap fake-ssh refuses the bare `ecopy` command (exit 127) but runs the
+# uploaded /tmp/.ecopy-boot-* binary, so a multi-connection push proves the
+# bootstrapped path is shared instead of collapsing to a single connection.
+case_ssh_bootstrap_reuse() {
+    case_begin "ssh-bootstrap-reuse"
+    if [[ "${ECOPY_HARNESS_REAL_SSH:-0}" == "1" ]]; then
+        ok "bootstrap-reuse skipped under real ssh (remote already has ecopy)"
+        return
+    fi
+    local s="$work/sshboot_src" d="$work/sshboot_dst"
+    mkdir -p "$s/sub"
+    printf 'top payload\n' > "$s/top.txt"
+    local i
+    for i in $(seq 1 12); do head -c 8000 /dev/urandom > "$s/sub/f_$i.bin"; done
+
+    # No ECOPY_REMOTE_CMD: the client starts from the bare `ecopy`, which the
+    # wrapper rejects, forcing the bootstrap + upload path. Mux is off anyway for
+    # a custom ECOPY_SSH, so each of the 3 connections spawns the wrapper.
+    local out rc
+    out="$(env "${common_env[@]}" DIRECT_COPY_LARGE_THRESHOLD_MB=1 \
+              DIRECT_COPY_SSH_CONNECTIONS=3 DIRECT_COPY_SSH_MULTIPLEX=0 \
+              ECOPY_SSH="$repo_root/tests/fake_ssh_bootstrap.sh" \
+              "$bin" --verify "$s" "ssh://localhost${d}" 2>&1)"; rc=$?
+
+    if [[ "$rc" -eq 0 ]] && grep -q 'bootstrapping remote binary' <<<"$out" &&
+       ! grep -q 'established 1 of 3 SSH copy connections' <<<"$out" &&
+       verify_regular_files "$s" "$d"; then
+        ok "bootstrapped binary reused across all connections"
+    else
+        fail "bootstrap reuse: rc=$rc out=$(tr '\n' ' ' <<<"$out")"
+    fi
+
+    # Best-effort cleanup of the uploaded bootstrap binary (fixed per-uid name).
+    rm -f /tmp/.ecopy-boot-"$(id -u)"-v* 2>/dev/null || true
+}
+
 # Pipelined verify over SSH with an additive verify connection: auto (one extra
 # verify connection on top of the copy pool), forced-shared (=0, no extra
 # connection), a single copy connection (auto still adds one -> 1 copy + 1
@@ -1499,6 +1537,7 @@ case_symlink_preserved
 case_hardlink_preserved
 case_ssh_symlink_hardlink
 case_ssh_parallel_connections
+case_ssh_bootstrap_reuse
 case_ssh_verify_dedicated_stream
 case_ssh_server_direct_io
 case_readonly_mode
