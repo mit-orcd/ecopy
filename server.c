@@ -82,6 +82,8 @@ static uint32_t g_caps;
 static int g_root_present;           /* did the confinement root exist before we ran? */
 static uid_t g_euid;                 /* our effective ids: skip no-op chown RPCs */
 static gid_t g_egid;
+static gid_t g_groups[64];            /* supplementary groups (for settable-gid test) */
+static int g_ngroups;
 static int g_preserve_times = 1;     /* client HELLO option: apply atime/mtime? */
 static int g_server_direct_io = 1;   /* open streamed dense files with O_DIRECT */
 
@@ -805,6 +807,24 @@ static int chown_uid_doomed(uint32_t uid)
     return g_euid != 0 && (uid_t)uid != g_euid;
 }
 
+/*
+ * True when we can set an object's group to gid: root sets any group, and an
+ * unprivileged peer can set a group it belongs to (its egid or a supplementary
+ * group). This lets a settable gid still be applied when the owner uid is not
+ * changeable, instead of being dropped along with the doomed uid SETATTR (e.g.
+ * a forced --gid the peer belongs to). Non-member groups return false so we do
+ * not issue a guaranteed-EPERM SETATTR, preserving the metadata-cost saving.
+ */
+static int chown_gid_settable(uint32_t gid)
+{
+    if (g_euid == 0) return 1;
+    if ((gid_t)gid == g_egid) return 1;
+    for (int i = 0; i < g_ngroups; i++) {
+        if (g_groups[i] == (gid_t)gid) return 1;
+    }
+    return 0;
+}
+
 static int apply_meta(int fd, uint32_t uid, uint32_t gid, uint32_t mode,
                       int64_t at_s, int64_t at_ns, int64_t mt_s, int64_t mt_ns,
                       int mode_is_set, const char **failed_op)
@@ -813,24 +833,38 @@ static int apply_meta(int fd, uint32_t uid, uint32_t gid, uint32_t mode,
     const char *first_op = NULL;
     int force_eperm = getenv("ECOPY_TEST_FORCE_CHOWN_EPERM") != NULL;
     if (force_eperm || (uid_t)uid != g_euid || (gid_t)gid != g_egid) {
+        /*
+         * Apply owner and group independently: a uid we cannot change must not
+         * drag down a group change we are allowed to make (e.g. a forced --gid
+         * the peer belongs to). uid==-1 / gid==-1 leave that component untouched,
+         * so we still issue at most one SETATTR and skip it entirely when neither
+         * part is both needed and permitted.
+         */
         int chown_err = 0;
+        int unpreserved = 0;
         if (force_eperm) {
-            chown_err = EPERM;   /* test hook: emulate an unprivileged target */
-        } else if (chown_uid_doomed(uid)) {
-            chown_err = EPERM;   /* skip the guaranteed-EPERM SETATTR RPC */
-        } else if (fchown(fd, (uid_t)uid, (gid_t)gid) != 0) {
-            chown_err = errno;
+            unpreserved = 1;   /* test hook: emulate an unprivileged target */
+        } else {
+            uid_t want_uid = chown_uid_doomed(uid) ? (uid_t)-1 : (uid_t)uid;
+            gid_t want_gid = chown_gid_settable(gid) ? (gid_t)gid : (gid_t)-1;
+            if (want_uid == g_euid) want_uid = (uid_t)-1;   /* no-op owner */
+            if (want_gid == g_egid) want_gid = (gid_t)-1;   /* no-op group */
+            if (want_uid != (uid_t)-1 || want_gid != (gid_t)-1) {
+                if (fchown(fd, want_uid, want_gid) != 0) chown_err = errno;
+            }
+            /* Ownership we could not apply: an unchangeable owner uid, or a group
+             * we do not belong to. Reported once as a warning, not a failure. */
+            unpreserved = (chown_uid_doomed(uid) && (uid_t)uid != g_euid) ||
+                          (!chown_gid_settable(gid) && (gid_t)gid != g_egid);
         }
-        if (chown_err != 0) {
-            if (chown_permission_errno(chown_err)) {
-                if (atomic_exchange(&g_chown_permission_warned, 1) == 0) {
-                    fprintf(stderr,
-                            "ecopy: remote chown not permitted; continuing "
-                            "without preserving uid/gid ownership\n");
-                }
-            } else {
-                first_err = chown_err;
-                first_op = "fchown";
+        if (chown_err != 0 && !chown_permission_errno(chown_err)) {
+            first_err = chown_err;
+            first_op = "fchown";
+        } else if (unpreserved || chown_err != 0) {
+            if (atomic_exchange(&g_chown_permission_warned, 1) == 0) {
+                fprintf(stderr,
+                        "ecopy: remote chown not fully permitted; continuing "
+                        "without preserving some uid/gid ownership\n");
             }
         }
     }
@@ -1762,23 +1796,26 @@ static void handle_symlink(const uint8_t *payload, uint32_t plen)
         return;
     }
     if ((uid_t)uid != g_euid || (gid_t)gid != g_egid) {
-        if (chown_uid_doomed(uid)) {
-            /* Guaranteed EPERM for an unprivileged peer: skip the SETATTR RPC. */
+        /* Apply owner and group independently (see apply_meta): a settable group
+         * is honored even when the owner uid cannot be changed. */
+        uid_t want_uid = chown_uid_doomed(uid) ? (uid_t)-1 : (uid_t)uid;
+        gid_t want_gid = chown_gid_settable(gid) ? (gid_t)gid : (gid_t)-1;
+        if (want_uid == g_euid) want_uid = (uid_t)-1;
+        if (want_gid == g_egid) want_gid = (gid_t)-1;
+        int cerr = 0;
+        if (want_uid != (uid_t)-1 || want_gid != (gid_t)-1) {
+            if (fchownat(dfd, tmp, want_uid, want_gid, AT_SYMLINK_NOFOLLOW) != 0)
+                cerr = errno;
+        }
+        int unpreserved = (chown_uid_doomed(uid) && (uid_t)uid != g_euid) ||
+                          (!chown_gid_settable(gid) && (gid_t)gid != g_egid);
+        if (cerr != 0 && !chown_permission_errno(cerr)) {
+            log_op_error(link_path, cerr);
+        } else if (unpreserved || cerr != 0) {
             if (atomic_exchange(&g_chown_permission_warned, 1) == 0) {
                 fprintf(stderr,
-                        "ecopy: remote chown not permitted; continuing "
-                        "without preserving uid/gid ownership\n");
-            }
-        } else if (fchownat(dfd, tmp, (uid_t)uid, (gid_t)gid,
-                            AT_SYMLINK_NOFOLLOW) != 0) {
-            if (chown_permission_errno(errno)) {
-                if (atomic_exchange(&g_chown_permission_warned, 1) == 0) {
-                    fprintf(stderr,
-                            "ecopy: remote chown not permitted; continuing "
-                            "without preserving uid/gid ownership\n");
-                }
-            } else {
-                log_op_error(link_path, errno);
+                        "ecopy: remote chown not fully permitted; continuing "
+                        "without preserving some uid/gid ownership\n");
             }
         }
     }
@@ -2012,6 +2049,10 @@ int server_main(const char *root, int read_only)
      * the umask so O_CREAT lands the exact mode (no follow-up fchmod needed). */
     g_euid = geteuid();
     g_egid = getegid();
+    {
+        int n = getgroups((int)(sizeof(g_groups) / sizeof(g_groups[0])), g_groups);
+        g_ngroups = (n > 0) ? n : 0;
+    }
     umask(0);
     {
         struct stat rst;

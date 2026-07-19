@@ -38,6 +38,8 @@ static int g_write_direct_io_enabled = 1;
 static pthread_once_t g_write_direct_io_once = PTHREAD_ONCE_INIT;
 static uid_t g_self_uid = 0;
 static gid_t g_self_gid = 0;
+static gid_t g_self_groups[64];
+static int g_self_ngroups = 0;
 static pthread_once_t g_self_id_once = PTHREAD_ONCE_INIT;
 static int g_warned_chown_permission = 0;
 static pthread_mutex_t g_warning_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -110,6 +112,25 @@ static void init_self_ids(void)
 {
     g_self_uid = geteuid();
     g_self_gid = getegid();
+    int n = getgroups((int)(sizeof(g_self_groups) / sizeof(g_self_groups[0])),
+                      g_self_groups);
+    g_self_ngroups = (n > 0) ? n : 0;
+}
+
+/*
+ * True when we can set an object's group to gid: root sets any group, and an
+ * unprivileged process can set a group it belongs to. Lets a settable group be
+ * applied even when the owner uid is unpreservable, mirroring the server.
+ */
+static int gid_settable(gid_t gid)
+{
+    pthread_once(&g_self_id_once, init_self_ids);
+    if (g_self_uid == 0) return 1;
+    if (gid == g_self_gid) return 1;
+    for (int i = 0; i < g_self_ngroups; i++) {
+        if (g_self_groups[i] == gid) return 1;
+    }
+    return 0;
 }
 
 /*
@@ -959,21 +980,29 @@ static int preserve_fd_metadata_impl(int fd,
     struct timespec ts[2];
 
     if (!owner_matches_self(src_st)) {
-        if (chown_uid_unpreservable(src_st)) {
-            /* Skip the doomed SETATTR entirely; it would only return EPERM. */
-            note_chown_not_preserved();
-        } else if (fchown(fd, src_st->st_uid, src_st->st_gid) != 0) {
-            if (chown_permission_errno(errno)) {
-                note_chown_not_preserved();
-            } else {
-                progress_interrupt();
-                if (path_for_warning && *path_for_warning) {
-                    fprintf(stderr, "%s: ", path_for_warning);
-                }
-                perror("fchown");
-                stats_inc_metadata_error();
-                return -1;
+        /* Apply owner and group independently so an unpreservable owner uid does
+         * not drop a settable group change (uid==-1/gid==-1 leave each alone). */
+        uid_t want_uid = chown_uid_unpreservable(src_st) ? (uid_t)-1 : src_st->st_uid;
+        gid_t want_gid = gid_settable(src_st->st_gid) ? src_st->st_gid : (gid_t)-1;
+        if (want_uid == g_self_uid) want_uid = (uid_t)-1;
+        if (want_gid == g_self_gid) want_gid = (gid_t)-1;
+        int cerr = 0;
+        if (want_uid != (uid_t)-1 || want_gid != (gid_t)-1) {
+            if (fchown(fd, want_uid, want_gid) != 0) cerr = errno;
+        }
+        int unpreserved = chown_uid_unpreservable(src_st) ||
+                          (!gid_settable(src_st->st_gid) && src_st->st_gid != g_self_gid);
+        if (cerr != 0 && !chown_permission_errno(cerr)) {
+            progress_interrupt();
+            if (path_for_warning && *path_for_warning) {
+                fprintf(stderr, "%s: ", path_for_warning);
             }
+            perror("fchown");
+            stats_inc_metadata_error();
+            return -1;
+        }
+        if (unpreserved || cerr != 0) {
+            note_chown_not_preserved();
         }
     }
 
@@ -1142,18 +1171,24 @@ static void apply_symlink_metadata(int dir_fd, const char *name,
                                    const struct stat *src_st)
 {
     if (!owner_matches_self(src_st)) {
-        if (chown_uid_unpreservable(src_st)) {
+        uid_t want_uid = chown_uid_unpreservable(src_st) ? (uid_t)-1 : src_st->st_uid;
+        gid_t want_gid = gid_settable(src_st->st_gid) ? src_st->st_gid : (gid_t)-1;
+        if (want_uid == g_self_uid) want_uid = (uid_t)-1;
+        if (want_gid == g_self_gid) want_gid = (gid_t)-1;
+        int cerr = 0;
+        if (want_uid != (uid_t)-1 || want_gid != (gid_t)-1) {
+            if (fchownat(dir_fd, name, want_uid, want_gid, AT_SYMLINK_NOFOLLOW) != 0)
+                cerr = errno;
+        }
+        int unpreserved = chown_uid_unpreservable(src_st) ||
+                          (!gid_settable(src_st->st_gid) && src_st->st_gid != g_self_gid);
+        if (cerr != 0 && !chown_permission_errno(cerr)) {
+            progress_interrupt();
+            if (display_path && *display_path) fprintf(stderr, "%s: ", display_path);
+            perror("fchownat");
+            stats_inc_metadata_error();
+        } else if (unpreserved || cerr != 0) {
             note_chown_not_preserved();
-        } else if (fchownat(dir_fd, name, src_st->st_uid, src_st->st_gid,
-                            AT_SYMLINK_NOFOLLOW) != 0) {
-            if (chown_permission_errno(errno)) {
-                note_chown_not_preserved();
-            } else {
-                progress_interrupt();
-                if (display_path && *display_path) fprintf(stderr, "%s: ", display_path);
-                perror("fchownat");
-                stats_inc_metadata_error();
-            }
         }
     }
     if (copy_policy_preserve_times()) {
