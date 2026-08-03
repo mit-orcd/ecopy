@@ -24,6 +24,9 @@ BLAKE3_OBJS += \
 else
 BLAKE3_CPPFLAGS = -DBLAKE3_NO_SSE2 -DBLAKE3_NO_SSE41 \
 	-DBLAKE3_NO_AVX2 -DBLAKE3_NO_AVX512 -DBLAKE3_USE_NEON=0
+# Upstream defines get_cpu_features() unconditionally but only calls it from the
+# x86 dispatch paths, so it is dead code on every other arch.
+third_party/blake3/blake3_dispatch.o: override CFLAGS += -Wno-unused-function
 endif
 
 OBJS = \
@@ -103,6 +106,7 @@ blake3_bench: tests/blake3_bench.c $(BLAKE3_OBJS)
 
 clean:
 	rm -f *.o *.d third_party/blake3/*.o third_party/blake3/*.d $(TARGET) $(JEMALLOC_TARGET) direct_copy protocol_test telemetry_test blake3_bench
+	rm -rf *.dSYM   # debug bundles, emitted when linking with -g on macOS
 
 test: $(TARGET) protocol_test telemetry_test
 	@set -e; \

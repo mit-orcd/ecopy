@@ -6,6 +6,7 @@
  */
 
 #define _GNU_SOURCE
+#include "compat.h"
 #include "workers.h"
 #include "config.h"
 #include "types.h"
@@ -636,7 +637,12 @@ static uint64_t monotonic_ns(void)
  * worker threads are never cancelled (only joined), so we issue the syscalls
  * directly to avoid that per-syscall bookkeeping. errno is still set by the
  * syscall() wrapper on error.
+ *
+ * Elsewhere these are the plain libc calls: syscall(2) is deprecated on Darwin
+ * and there is no supported way to reach the non-cancellable variants, so the
+ * bookkeeping is simply paid.
  */
+#ifdef __linux__
 static inline ssize_t pread_nocancel(int fd, void *buf, size_t count, off_t offset)
 {
     return syscall(SYS_pread64, fd, buf, count, offset);
@@ -656,6 +662,12 @@ static inline ssize_t write_nocancel(int fd, const void *buf, size_t count)
 {
     return syscall(SYS_write, fd, buf, count);
 }
+#else
+#define pread_nocancel  pread
+#define pwrite_nocancel pwrite
+#define read_nocancel   read
+#define write_nocancel  write
+#endif
 
 static int copy_file_range_unsupported_errno_local(int err)
 {

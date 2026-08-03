@@ -18,6 +18,7 @@
  */
 
 #define _GNU_SOURCE
+#include "compat.h"
 #include "server.h"
 #include "protocol.h"
 #include "verify.h"
@@ -902,7 +903,7 @@ static const char *metadata_mismatch_stat(const struct stat *st,
     if ((!is_dir && !S_ISREG(st->st_mode)) ||
         (is_dir && !S_ISDIR(st->st_mode))) return "type";
     if ((st->st_mode & 07777) != (mode_t)(mode & 07777)) return "mode";
-    if (check_times &&
+    if (ECOPY_VERIFY_ATIME && check_times &&
         ((int64_t)st->st_atim.tv_sec != at_s ||
          (int64_t)st->st_atim.tv_nsec != at_ns)) return "atime";
     if (check_times &&
@@ -1012,6 +1013,7 @@ static void drop_direct(open_file_t *f)
 {
     int fl = fcntl(f->fd, F_GETFL);
     if (fl >= 0) (void)fcntl(f->fd, F_SETFL, fl & ~O_DIRECT);
+    (void)ecopy_clear_direct_io(f->fd);
     f->direct = 0;
 }
 
@@ -1079,7 +1081,7 @@ static void handle_open(const uint8_t *payload, uint32_t plen)
     if (want_direct) {
         fd = open(f->tmp_path, base_flags | O_DIRECT, create_mode);
         if (fd >= 0) {
-            f->direct = 1;
+            f->direct = ecopy_set_direct_io(fd) == 0;
         } else if (!direct_open_fallback_errno(errno)) {
             f->failed = 1; f->err = -errno;
             f->next = g_files; g_files = f;
@@ -1594,7 +1596,7 @@ static void handle_verify_path(const uint8_t *payload, uint32_t plen)
 #ifdef O_NOATIME
     if (!is_dir && check_times) open_flags |= O_NOATIME;
 #endif
-    if (!is_dir && count > 0 && !check_times &&
+    if (ECOPY_VERIFY_ATIME && !is_dir && count > 0 && !check_times &&
         atomic_exchange(&g_verify_atime_warned, 1) == 0) {
         fprintf(stderr,
                 "ecopy: remote verification data reads may update atime because "

@@ -20,6 +20,10 @@
  */
 
 #define _GNU_SOURCE
+#include "compat.h"
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 #include "ssh_transport.h"
 #include "copy_policy.h"
 #include "protocol.h"
@@ -686,6 +690,33 @@ static int remote_uname(const ssh_target_t *t, char *out, size_t outsz)
     return 0;
 }
 
+#ifdef __APPLE__
+/*
+ * Darwin has no /proc/self/exe, so locate the running binary explicitly.
+ * _NSGetExecutablePath can hand back a path containing symlinks or "..", so
+ * realpath() it before opening.
+ */
+static int open_self_executable(void)
+{
+    char raw[PATH_MAX];
+    uint32_t rawsz = (uint32_t)sizeof(raw);
+    if (_NSGetExecutablePath(raw, &rawsz) != 0) {
+        fprintf(stderr, "ecopy: cannot determine path of the running binary\n");
+        return -1;
+    }
+    char resolved[PATH_MAX];
+    if (!realpath(raw, resolved)) {
+        perror(raw);
+        return -1;
+    }
+    int fd = open(resolved, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        perror(resolved);
+    }
+    return fd;
+}
+#endif
+
 /*
  * Stream the local ecopy binary to a fixed remote path and mark it executable.
  * Returns the remote path (into out) on success.
@@ -707,11 +738,18 @@ static int bootstrap_upload_binary(const ssh_target_t *t, char *out, size_t outs
         return -1;
     }
 
+#ifdef __APPLE__
+    int self_fd = open_self_executable();
+    if (self_fd < 0) {
+        return -1;
+    }
+#else
     int self_fd = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
     if (self_fd < 0) {
         perror("open /proc/self/exe");
         return -1;
     }
+#endif
 
     char remote_path[PATH_MAX];
     snprintf(remote_path, sizeof(remote_path), "/tmp/.ecopy-boot-%u-v%u",

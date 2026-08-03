@@ -2,7 +2,8 @@
 
 `ecopy` is a parallel directory copy tool for moving large regular-file datasets quickly over high-throughput
 storage paths (tested on NFS v4.2 exports and local filesystems). It keeps source, network, and target busy at the
-same time using a shared pool of read/write/traversal workers.
+same time using a shared pool of read/write/traversal workers. Linux is the primary target; macOS is supported
+with the fallbacks listed under [Platforms](#platforms).
 
 ## Quick Start
 
@@ -371,6 +372,26 @@ Warning-clean verification build:
 ```bash
 make clean && make CFLAGS='-O2 -g -Wall -Wextra -Wpedantic -pthread'
 ```
+
+## Platforms
+
+Linux is the primary target and the only one the fast paths are tuned for. macOS builds and passes the same test
+suite, with these differences, all of which are fallbacks rather than failures:
+
+| Linux fast path | macOS |
+| --- | --- |
+| `O_DIRECT` | `fcntl(F_NOCACHE)` after open, so uncached I/O still bypasses the page cache |
+| `copy_file_range()` in-kernel copy | no ranged equivalent exists, so copies use the `pread`/`pwrite` path |
+| `getdents64()` bulk directory reads | `readdir()`, the same fallback Linux uses when the raw reader is disabled |
+| `posix_fadvise()` sequential/random hints | `fcntl(F_RDAHEAD)`; there is no ranged page-cache eviction, so `DONTNEED` is a no-op |
+| `fallocate()` preallocation | `fcntl(F_PREALLOCATE)` plus `ftruncate()` |
+| non-cancellable raw `pread`/`pwrite` syscalls | plain libc calls (`syscall(2)` is unsupported on Darwin) |
+| `O_NOATIME` reads | none exists, so **access times are copied but not verified** (see below) |
+
+Access times are the one semantic difference. Reading a file on macOS updates its atime and nothing can prevent
+that, so verification — which has to read both copies to hash them — would invalidate the very timestamp it then
+compares. Every other field (type, size, mode, mtime, uid, gid) is verified as usual, and atime is still
+replicated onto the target; it is only excluded from the comparison, and ecopy says so once per run.
 
 ## License
 

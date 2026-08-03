@@ -6,6 +6,7 @@
  */
 
 #define _GNU_SOURCE
+#include "compat.h"
 #include "fs_util.h"
 #include "copy_policy.h"
 #include "stats.h"
@@ -278,12 +279,17 @@ static int validate_opened_source_file(int fd,
 
 static void init_copy_file_range_enabled(void)
 {
+#ifdef __APPLE__
+    /* No ranged in-kernel file-to-file copy on Darwin; always use read/write. */
+    g_copy_file_range_enabled = 0;
+#else
     const char *env = getenv("DIRECT_COPY_DISABLE_COPY_FILE_RANGE");
     if (!env || !*env || strcmp(env, "0") == 0) {
         g_copy_file_range_enabled = 1;
     } else {
         g_copy_file_range_enabled = 0;
     }
+#endif
 }
 
 int copy_file_range_enabled(void) {
@@ -340,8 +346,9 @@ int open_read_maybe_direct(const char *path, int *used_direct) {
     if (read_direct_io_enabled()) {
         fd = open(path, O_RDONLY | O_DIRECT);
         if (fd >= 0) {
-            if (used_direct) *used_direct = 1;
-            stats_record_read_open(1);
+            int direct = ecopy_set_direct_io(fd) == 0;
+            if (used_direct) *used_direct = direct;
+            stats_record_read_open(direct);
             return fd;
         }
         if (!direct_io_fallback_errno(errno)) {
@@ -372,12 +379,13 @@ int open_read_at_maybe_direct(int dir_fd,
     if (read_direct_io_enabled()) {
         fd = openat(dir_fd, name, O_RDONLY | O_DIRECT | O_CLOEXEC | O_NOFOLLOW);
         if (fd >= 0) {
+            int direct = ecopy_set_direct_io(fd) == 0;
             if (validate_opened_source_file(fd, display_path, expected_st) != 0) {
                 close(fd);
                 return -1;
             }
-            if (used_direct) *used_direct = 1;
-            stats_record_read_open(1);
+            if (used_direct) *used_direct = direct;
+            stats_record_read_open(direct);
             return fd;
         }
         if (!direct_io_fallback_errno(errno)) {
@@ -498,6 +506,7 @@ int open_write_maybe_direct(const char *path, mode_t mode, int *used_direct) {
             }
         }
         if (fd >= 0) {
+            int direct = ecopy_set_direct_io(fd) == 0;
             if (validate_opened_regular_file(fd, path) != 0) {
                 close(fd);
                 return -1;
@@ -511,8 +520,8 @@ int open_write_maybe_direct(const char *path, mode_t mode, int *used_direct) {
                 perror("fchmod");
                 return -1;
             }
-            if (used_direct) *used_direct = 1;
-            stats_record_write_open(1);
+            if (used_direct) *used_direct = direct;
+            stats_record_write_open(direct);
             return fd;
         }
         if (!direct_io_fallback_errno(errno)) {
@@ -570,12 +579,13 @@ int open_write_existing_maybe_direct(const char *path, int *used_direct) {
             }
         }
         if (fd >= 0) {
+            int direct = ecopy_set_direct_io(fd) == 0;
             if (validate_opened_regular_file(fd, path) != 0) {
                 close(fd);
                 return -1;
             }
-            if (used_direct) *used_direct = 1;
-            stats_record_write_open(1);
+            if (used_direct) *used_direct = direct;
+            stats_record_write_open(direct);
             return fd;
         }
         if (!direct_io_fallback_errno(errno)) {
@@ -721,6 +731,9 @@ static int open_temp_created_once(int dir_fd,
     if (fd < 0) {
         return -1;
     }
+    if (direct && ecopy_set_direct_io(fd) != 0) {
+        direct = 0;
+    }
     if (validate_opened_temp_regular(fd, display_path) != 0) {
         close(fd);
         return -1;
@@ -826,6 +839,9 @@ static int open_final_created_once(int dir_fd,
     if (fd < 0) {
         return -1;
     }
+    if (direct && ecopy_set_direct_io(fd) != 0) {
+        direct = 0;
+    }
     if (validate_opened_temp_regular(fd, display_path) != 0) {
         close(fd);
         return -1;
@@ -898,12 +914,13 @@ int open_temp_write_existing_at_maybe_direct(int dir_fd,
     if (write_direct_io_enabled()) {
         fd = openat(dir_fd, tmp_name, O_WRONLY | O_DIRECT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
         if (fd >= 0) {
+            int direct = ecopy_set_direct_io(fd) == 0;
             if (validate_opened_temp_regular(fd, display_path) != 0) {
                 close(fd);
                 return -1;
             }
-            if (used_direct) *used_direct = 1;
-            stats_record_write_open(1);
+            if (used_direct) *used_direct = direct;
+            stats_record_write_open(direct);
             return fd;
         }
         if (!direct_io_fallback_errno(errno)) {

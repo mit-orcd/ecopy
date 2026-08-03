@@ -5,6 +5,7 @@
  * Copyright (c) 2026 Michel Erb — see LICENSE.
  */
 #define _GNU_SOURCE
+#include "compat.h"
 #include "verify.h"
 
 #include "config.h"
@@ -108,6 +109,9 @@ static uint64_t random_seed(void)
     if (getrandom(&seed, sizeof(seed), 0) == (ssize_t)sizeof(seed)) {
         return seed;
     }
+#elif defined(__APPLE__)
+    arc4random_buf(&seed, sizeof(seed));
+    return seed;
 #endif
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -130,6 +134,13 @@ void verify_configure(int metadata, int data, double percent,
     if (workers > 128) workers = 128;
     g_cfg.workers = workers;
     stats_set_verify_config(g_cfg.metadata, g_cfg.data, g_cfg.percent, g_cfg.seed);
+
+    if (!ECOPY_VERIFY_ATIME && g_cfg.metadata && copy_policy_preserve_times()) {
+        fprintf(stderr,
+                "ecopy: access times are copied but not verified on this "
+                "platform: reading a file updates its atime and there is no "
+                "way to read without doing so\n");
+    }
 }
 
 int verify_enabled(void) { return g_cfg.metadata || g_cfg.data; }
@@ -313,7 +324,7 @@ verify_meta_class_t verify_metadata_stat(const struct stat *expected,
     if ((actual->st_mode & S_IFMT) != (expected->st_mode & S_IFMT)) field = "type";
     else if (!is_dir && actual->st_size != expected->st_size) field = "size";
     else if ((actual->st_mode & 07777) != (expected->st_mode & 07777)) field = "mode";
-    else if (copy_policy_preserve_times() &&
+    else if (ECOPY_VERIFY_ATIME && copy_policy_preserve_times() &&
              !timestamp_equal(&actual->st_atim, &expected->st_atim)) field = "atime";
     else if (copy_policy_preserve_times() &&
              !timestamp_equal(&actual->st_mtim, &expected->st_mtim)) field = "mtime";
@@ -722,7 +733,12 @@ static int open_verify_data(const char *path)
         return -1;
     }
 #endif
-    if (!atomic_flag_test_and_set(&g_atime_warning)) {
+    /*
+     * Where reads cannot avoid moving atime at all, atime is excluded from the
+     * comparison up front (see verify_configure), so this warning would be
+     * noise: it is about the case where the perturbation was avoidable.
+     */
+    if (ECOPY_VERIFY_ATIME && !atomic_flag_test_and_set(&g_atime_warning)) {
         progress_interrupt();
         fprintf(stderr,
                 "ecopy: verification data reads may update atime because "

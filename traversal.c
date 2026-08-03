@@ -6,6 +6,7 @@
  */
 
 #define _GNU_SOURCE
+#include "compat.h"
 #include "traversal.h"
 #include "stats.h"
 #include "fs_util.h"
@@ -25,7 +26,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
+#ifdef ECOPY_HAVE_GETDENTS64
 #include <sys/syscall.h>
+#endif
 
 typedef struct dir_node {
     char src[PATH_MAX];
@@ -472,8 +475,9 @@ static __thread file_scratch_t g_file_scratch;
  * Raw getdents64 read-buffer size per traversal worker (bytes). A larger buffer
  * returns many dirents per syscall, cutting the syscall count on huge
  * directories. 0 disables the raw path and falls back to libc readdir. Set once
- * in traversal_start() from DIRECT_COPY_GETDENTS_BUF. Learned from ereport's
- * ecrawl, which uses the same technique for fast metadata crawls.
+ * in traversal_start() from DIRECT_COPY_GETDENTS_BUF, and pinned at 0 where
+ * getdents64 is unavailable. Learned from ereport's ecrawl, which uses the same
+ * technique for fast metadata crawls.
  */
 static size_t g_getdents_buf_bytes;
 
@@ -520,6 +524,7 @@ static file_scratch_t *file_scratch_get(int remote)
  * stream. `stream_fd` is a private dup of src_fd whose ownership passes to the
  * reader.
  */
+#ifdef ECOPY_HAVE_GETDENTS64
 struct ecopy_dirent64 {
     uint64_t       d_ino;
     int64_t        d_off;
@@ -527,6 +532,7 @@ struct ecopy_dirent64 {
     unsigned char  d_type;
     char           d_name[];
 };
+#endif
 
 typedef struct {
     int fd;          /* getdents path stream fd; -1 => libc fallback */
@@ -566,6 +572,7 @@ static int dirreader_next(dirreader_t *rd, const char **name_out)
         *name_out = de->d_name;
         return 1;
     }
+#ifdef ECOPY_HAVE_GETDENTS64
     for (;;) {
         if (rd->buf_off >= rd->buf_len) {
             long n = syscall(SYS_getdents64, rd->fd, rd->buf, rd->buf_cap);
@@ -581,6 +588,10 @@ static int dirreader_next(dirreader_t *rd, const char **name_out)
         *name_out = d->d_name;
         return 1;
     }
+#else
+    /* dirreader_open() never selects the raw path without getdents64. */
+    return -1;
+#endif
 }
 
 static void dirreader_close(dirreader_t *rd)
@@ -1058,12 +1069,16 @@ int traversal_start(const char *src_dir, const char *dst_dir) {
      * back to libc readdir. Default 256 KiB returns thousands of entries per
      * syscall on large directories. Clamp a nonzero value to a sane floor.
      */
+#ifdef ECOPY_HAVE_GETDENTS64
     {
         int v = env_int_or_default("DIRECT_COPY_GETDENTS_BUF", 262144, 0,
                                    64 * 1024 * 1024);
         if (v > 0 && v < 4096) v = 4096;
         g_getdents_buf_bytes = (size_t)v;
     }
+#else
+    g_getdents_buf_bytes = 0;
+#endif
 
     g_threads = calloc((size_t)g_traversal_workers, sizeof(*g_threads));
     if (!g_threads) {

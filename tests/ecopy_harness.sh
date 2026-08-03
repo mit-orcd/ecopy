@@ -95,10 +95,32 @@ run_ecopy_ssh() {
     env "${common_env[@]}" "${env_extra[@]}" "$bin" "$src" "ssh://localhost${dst_abs}"
 }
 
-# allocated_blocks <file> -> number of 512-byte blocks actually allocated.
-allocated_blocks() { stat -c %b "$1"; }
-logical_size()     { stat -c %s "$1"; }
-mode_bits()        { stat -c %a "$1"; }
+# stat(1) is one of the few tools whose format flags differ between GNU
+# coreutils and the BSD userland on macOS, so every field the cases need goes
+# through a wrapper. Timestamps elsewhere in this file are stamped with
+# `touch -t`, which both implementations accept, so touch needs no wrapper.
+if stat -c %s . >/dev/null 2>&1; then
+    allocated_blocks() { stat -c %b "$1"; }   # 512-byte blocks actually allocated
+    logical_size()     { stat -c %s "$1"; }
+    mode_bits()        { stat -c %a "$1"; }
+    inode_of()         { stat -c %i "$1"; }
+    link_count()       { stat -c %h "$1"; }
+    mtime_of()         { stat -c %Y "$1"; }
+    uid_of()           { stat -c %u "$1"; }
+    gid_of()           { stat -c %g "$1"; }
+    # Identity line used to prove verify-only left a target untouched.
+    stat_identity()    { stat -c '%n|%f|%u|%g|%s|%X|%Y' "$1"; }
+else
+    allocated_blocks() { stat -f %b "$1"; }
+    logical_size()     { stat -f %z "$1"; }
+    mode_bits()        { stat -f %Lp "$1"; }
+    inode_of()         { stat -f %i "$1"; }
+    link_count()       { stat -f %l "$1"; }
+    mtime_of()         { stat -f %m "$1"; }
+    uid_of()           { stat -f %u "$1"; }
+    gid_of()           { stat -f %g "$1"; }
+    stat_identity()    { stat -f '%N|%p|%u|%g|%z|%a|%m' "$1"; }
+fi
 
 # Does the working filesystem actually keep files sparse? If not, sparseness
 # assertions are skipped (content is still verified).
@@ -336,14 +358,14 @@ case_hardlink_preserved() {
         fail "hard-linked content mismatch"
     fi
     local ia ib ic
-    ia="$(stat -c %i "$d/a.bin")"; ib="$(stat -c %i "$d/b.bin")"; ic="$(stat -c %i "$d/sub/c.bin")"
+    ia="$(inode_of "$d/a.bin")"; ib="$(inode_of "$d/b.bin")"; ic="$(inode_of "$d/sub/c.bin")"
     if [[ "$ia" == "$ib" && "$ia" == "$ic" ]]; then
         ok "hard links share one inode on dst"
     else
         fail "hard links not preserved (distinct inodes: $ia $ib $ic)"
     fi
     local nl
-    nl="$(stat -c %h "$d/a.bin")"
+    nl="$(link_count "$d/a.bin")"
     if [[ "$nl" -ge 3 ]]; then
         ok "dst link count preserved ($nl)"
     else
@@ -368,8 +390,8 @@ case_ssh_symlink_hardlink() {
         fail "remote symlink not recreated correctly"
     fi
     local ia ic
-    ia="$(stat -c %i "$d/a.bin" 2>/dev/null)"
-    ic="$(stat -c %i "$d/sub/c.bin" 2>/dev/null)"
+    ia="$(inode_of "$d/a.bin" 2>/dev/null)"
+    ic="$(inode_of "$d/sub/c.bin" 2>/dev/null)"
     if [[ -n "$ia" && "$ia" == "$ic" ]]; then
         ok "remote hard link shares one inode"
     else
@@ -414,8 +436,8 @@ case_ssh_parallel_connections() {
             fail "N=$n: symlink not recreated correctly"
         fi
         local ia ic
-        ia="$(stat -c %i "$d/a.bin" 2>/dev/null)"
-        ic="$(stat -c %i "$d/sub/c.bin" 2>/dev/null)"
+        ia="$(inode_of "$d/a.bin" 2>/dev/null)"
+        ic="$(inode_of "$d/sub/c.bin" 2>/dev/null)"
         if [[ -n "$ia" && "$ia" == "$ic" ]]; then
             ok "N=$n: hard link shares one inode"
         else
@@ -621,7 +643,7 @@ case_local_no_preserve_times() {
     mkdir -p "$s/sub"
     printf 'keep content and mode\n' > "$s/sub/file.txt"
     chmod 0640 "$s/sub/file.txt"
-    touch -d '2001-02-03 04:05:06' "$s/sub/file.txt"
+    touch -t 200102030405.06 "$s/sub/file.txt"
 
     if ! env "${common_env[@]}" DIRECT_COPY_DISABLE_DIRECT_IO=1 \
              "$bin" --no-preserve-times "$s" "$d" >/dev/null 2>&1; then
@@ -630,7 +652,7 @@ case_local_no_preserve_times() {
     fi
     if cmp -s "$s/sub/file.txt" "$d/sub/file.txt" &&
        [[ "$(mode_bits "$d/sub/file.txt")" == "640" ]] &&
-       [[ "$(stat -c %Y "$s/sub/file.txt")" != "$(stat -c %Y "$d/sub/file.txt")" ]]; then
+       [[ "$(mtime_of "$s/sub/file.txt")" != "$(mtime_of "$d/sub/file.txt")" ]]; then
         ok "local no-preserve-times keeps content/mode but skips mtime"
     else
         fail "local no-preserve-times behavior mismatch"
@@ -679,8 +701,8 @@ case_ssh_loopback() {
     # and mtimes to validate its barrier/order rules.
     chmod 0710 "$s/tiny"
     chmod 0750 "$s/tiny/one"
-    touch -d '2002-03-04 05:06:07' "$s/tiny/one"
-    touch -d '2001-02-03 04:05:06' "$s/tiny"
+    touch -t 200203040506.07 "$s/tiny/one"
+    touch -t 200102030405.06 "$s/tiny"
     truncate -s 64M "$s/sparse.bin"
     dd if=/dev/urandom of="$s/sparse.bin" bs=1M count=2 conv=notrunc status=none
     dd if=/dev/urandom of="$s/sparse.bin" bs=1M count=2 seek=32 conv=notrunc status=none
@@ -709,8 +731,8 @@ case_ssh_loopback() {
     else
         fail "pooled directory mode mismatch over ssh"
     fi
-    if [[ "$(stat -c %Y "$s/tiny")" == "$(stat -c %Y "$d/tiny")" &&
-          "$(stat -c %Y "$s/tiny/one")" == "$(stat -c %Y "$d/tiny/one")" ]]; then
+    if [[ "$(mtime_of "$s/tiny")" == "$(mtime_of "$d/tiny")" &&
+          "$(mtime_of "$s/tiny/one")" == "$(mtime_of "$d/tiny/one")" ]]; then
         ok "pooled directory mtimes preserved over ssh"
     else
         fail "pooled directory mtime mismatch over ssh"
@@ -854,7 +876,7 @@ case_ssh_no_preserve_times() {
     printf 'keep my content\n' > "$s/sub/f.txt"
     chmod 0640 "$s/sub/f.txt"
     # Give the source a distinctly old mtime so "not preserved" is unambiguous.
-    touch -d '2001-02-03 04:05:06' "$s/sub/f.txt"
+    touch -t 200102030405.06 "$s/sub/f.txt"
 
     local -a env_extra=(DIRECT_COPY_LARGE_THRESHOLD_MB=1 ECOPY_REMOTE_CMD="$bin")
     if [[ "${ECOPY_HARNESS_REAL_SSH:-0}" != "1" ]]; then
@@ -872,7 +894,7 @@ case_ssh_no_preserve_times() {
     else
         fail "mode mismatch with --no-preserve-times"
     fi
-    if [[ "$(stat -c %Y "$s/sub/f.txt")" != "$(stat -c %Y "$d/sub/f.txt")" ]]; then
+    if [[ "$(mtime_of "$s/sub/f.txt")" != "$(mtime_of "$d/sub/f.txt")" ]]; then
         ok "mtime not carried over with --no-preserve-times"
     else
         fail "mtime unexpectedly preserved with --no-preserve-times"
@@ -1020,7 +1042,7 @@ case_verify_sparse_data_domain() {
     dd if=/dev/urandom of="$s/big.sparse" bs=1M count=2 seek=64  conv=notrunc status=none
     dd if=/dev/urandom of="$s/big.sparse" bs=1M count=2 seek=192 conv=notrunc status=none
     cp -a "$s" "$d"
-    find "$s" "$d" -exec touch -a -m -d @1700000000 {} +
+    find "$s" "$d" -exec touch -a -m -t 202311141322.20 {} +
 
     out="$("$bin" --verify-only --verify-data=1 --verify-seed=101 "$s" "$d" 2>&1)"; rc=$?
     scope="$(grep -E 'Verify scope' <<<"$out" | grep -oE '[0-9]+' | head -1)"
@@ -1038,7 +1060,7 @@ case_verify_sparse_data_domain() {
     # Corruption inside a data island is caught at full (data-domain) coverage.
     printf X | dd of="$d/big.sparse" bs=1 seek=$((64 * 1024 * 1024 + 4096)) \
         conv=notrunc status=none
-    touch -a -m -d @1700000000 "$s/big.sparse" "$d/big.sparse"
+    touch -a -m -t 202311141322.20 "$s/big.sparse" "$d/big.sparse"
     out="$("$bin" --verify-only --verify-data=100 --verify-seed=101 "$s" "$d" 2>&1)"; rc=$?
     if [[ "$rc" -ne 0 ]] && grep -q 'verification data mismatch' <<<"$out"; then
         ok "local sparse data-island corruption is detected at 100%"
@@ -1245,20 +1267,22 @@ case_verify_only() {
     chmod 0640 "$s/data.bin"
     cp -a "$s" "$d"
     local -a verify_paths=()
-    mapfile -t verify_paths < <(cd "$s" && find . -print | sort)
+    while IFS= read -r rel; do
+        verify_paths+=("$rel")
+    done < <(cd "$s" && find . -print | sort)
     content_before="$(for rel in "${verify_paths[@]}"; do
         [[ -f "$d/$rel" ]] && sha256sum "$d/$rel"
     done)"
     for rel in "${verify_paths[@]}"; do
-        touch -a -m -d @1700000000 "$s/$rel" "$d/$rel"
+        touch -a -m -t 202311141322.20 "$s/$rel" "$d/$rel"
     done
     before="$(for rel in "${verify_paths[@]}"; do
-        stat -c '%n|%f|%u|%g|%s|%X|%Y' "$d/$rel"
+        stat_identity "$d/$rel"
     done)"
     out="$("$bin" --verify-only --verify-workers=4 --verify-seed=77 \
               "$s" "$d" 2>&1)"; rc=$?
     after="$(for rel in "${verify_paths[@]}"; do
-        stat -c '%n|%f|%u|%g|%s|%X|%Y' "$d/$rel"
+        stat_identity "$d/$rel"
     done)"
     content_after="$(for rel in "${verify_paths[@]}"; do
         [[ -f "$d/$rel" ]] && sha256sum "$d/$rel"
@@ -1346,7 +1370,7 @@ case_verify_only() {
     local sf="$work/verify_one" tf="$work/verify_one_target"
     printf single-file > "$sf"
     cp -a "$sf" "$tf"
-    touch -a -m -d @1700000000 "$sf" "$tf"
+    touch -a -m -t 202311141322.20 "$sf" "$tf"
     if "$bin" --verify-only "$sf" "$tf" >/dev/null 2>&1; then
         ok "local single-file verify-only succeeds"
     else
@@ -1375,7 +1399,7 @@ case_verify_only() {
         remote_env+=(ECOPY_SSH="$repo_root/tests/fake_ssh.sh")
     fi
     cp -a "$s" "$rd"
-    find "$s" "$rd" -exec touch -a -m -d @1700000000 {} +
+    find "$s" "$rd" -exec touch -a -m -t 202311141322.20 {} +
     out="$(env "${remote_env[@]}" "$bin" --verify-only --verify-workers=4 \
               "$s" "ssh://localhost${rd}" 2>&1)"; rc=$?
     if [[ "$rc" -eq 0 ]] &&
@@ -1444,9 +1468,9 @@ case_uid_gid_override() {
     if [[ "$rc" -eq 0 ]] &&
        ! grep -Eq 'Ownership not preserved: [1-9]' <<<"$out" &&
        grep -q 'Verify failures   : 0' <<<"$out" &&
-       [[ "$(stat -c %u "$d/top.txt")" == "$myu" ]] &&
-       [[ "$(stat -c %g "$d/sub/b.txt")" == "$myg" ]] &&
-       [[ "$(stat -c %u "$d/top.txt")" == "$myu" ]]; then
+       [[ "$(uid_of "$d/top.txt")" == "$myu" ]] &&
+       [[ "$(gid_of "$d/sub/b.txt")" == "$myg" ]] &&
+       [[ "$(uid_of "$d/top.txt")" == "$myu" ]]; then
         ok "override to self applied and verified with 0 failures"
     else
         fail "override-to-self run: $(tr '\n' ' ' <<<"$out")"
@@ -1456,8 +1480,8 @@ case_uid_gid_override() {
     case_begin "uid-gid-override:uid-only-keeps-source-gid"
     local d2="$work/idov_uidonly"
     if env "${common_env[@]}" "$bin" --uid "$myu" "$s" "$d2" >/dev/null 2>&1 &&
-       [[ "$(stat -c %g "$s/top.txt")" == "$(stat -c %g "$d2/top.txt")" ]] &&
-       [[ "$(stat -c %u "$d2/top.txt")" == "$myu" ]]; then
+       [[ "$(gid_of "$s/top.txt")" == "$(gid_of "$d2/top.txt")" ]] &&
+       [[ "$(uid_of "$d2/top.txt")" == "$myu" ]]; then
         ok "--uid alone overrides uid and keeps source gid"
     else
         fail "--uid alone did not keep source gid"
@@ -1488,7 +1512,7 @@ case_uid_gid_override() {
     if [[ "$rc" -eq 0 ]] &&
        ! grep -Eq 'Ownership not preserved: [1-9]' <<<"$out" &&
        grep -q 'Verify failures   : 0' <<<"$out" &&
-       [[ "$(stat -c %u "$rd/top.txt")" == "$myu" ]]; then
+       [[ "$(uid_of "$rd/top.txt")" == "$myu" ]]; then
         ok "remote override to self applied and verified"
     else
         fail "remote override-to-self run: $(tr '\n' ' ' <<<"$out")"
@@ -1503,7 +1527,7 @@ case_uid_gid_override() {
     : > "$probe"
     for g in $(id -G) 12345 65534 1; do
         if [[ "$g" != "$myg" ]] && chgrp "$g" "$probe" 2>/dev/null &&
-           [[ "$(stat -c %g "$probe")" == "$g" ]]; then
+           [[ "$(gid_of "$probe")" == "$g" ]]; then
             altg="$g"; break
         fi
     done
@@ -1511,8 +1535,8 @@ case_uid_gid_override() {
     if [[ -n "$altg" ]]; then
         local d3="$work/idov_altgid"
         if env "${common_env[@]}" "$bin" --gid="$altg" "$s" "$d3" >/dev/null 2>&1 &&
-           [[ "$(stat -c %g "$d3/top.txt")" == "$altg" ]] &&
-           [[ "$(stat -c %g "$d3/sub/b.txt")" == "$altg" ]]; then
+           [[ "$(gid_of "$d3/top.txt")" == "$altg" ]] &&
+           [[ "$(gid_of "$d3/sub/b.txt")" == "$altg" ]]; then
             ok "explicit --gid applied to target objects"
         else
             fail "explicit --gid not applied (altg=$altg)"

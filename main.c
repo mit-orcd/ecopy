@@ -793,16 +793,29 @@ int main(int argc, char **argv) {
         } else {
             char dabs[PATH_MAX];
             char dnorm[PATH_MAX];
+            char requested_dir[PATH_MAX];
             if (to_abs_path(dst_arg, dabs, sizeof(dabs)) != 0 ||
                 normalize_abs_path_lexically(dabs, dnorm, sizeof(dnorm)) != 0) {
                 fprintf(stderr, "Target path too long: %s\n", dst_arg);
                 return 1;
             }
             if (trailing_slash) {
-                snprintf(dst_dir, sizeof(dst_dir), "%s", dnorm);
+                snprintf(requested_dir, sizeof(requested_dir), "%s", dnorm);
                 snprintf(final_name, sizeof(final_name), "%s", src_name);
             } else {
-                split_parent_name(dnorm, dst_dir, sizeof(dst_dir), final_name, sizeof(final_name));
+                split_parent_name(dnorm, requested_dir, sizeof(requested_dir),
+                                  final_name, sizeof(final_name));
+            }
+            /*
+             * Resolve the existing part of the destination directory the same
+             * way a directory-to-directory copy does. mkdir_p_dir() walks the
+             * path with O_NOFOLLOW and refuses symlinked components, so a
+             * lexical path would reject destinations reached through a
+             * symlinked ancestor (on macOS /tmp and /var are such symlinks).
+             */
+            if (to_canonical_requested_dir_path(requested_dir, dst_dir,
+                                                sizeof(dst_dir)) != 0) {
+                return 1;
             }
         }
 
