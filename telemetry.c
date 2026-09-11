@@ -41,9 +41,17 @@ static unsigned hist_index(uint64_t value)
     if (value == 0) return 0;
     unsigned exponent = 63u - (unsigned)__builtin_clzll(value);
     uint64_t base = UINT64_C(1) << exponent;
-    unsigned sub = exponent == 0
-                       ? 0
-                       : (unsigned)(((value - base) * HIST_SUBS) / base);
+    /* sub = ((value - base) * HIST_SUBS) / base with base = 2^exponent, so
+     * shifts give the identical floor result without a 64-bit division (and
+     * without the multiply overflowing for values >= 2^63). */
+    unsigned sub;
+    if (exponent == 0) {
+        sub = 0;
+    } else if (exponent >= HIST_SUB_BITS) {
+        sub = (unsigned)((value - base) >> (exponent - HIST_SUB_BITS));
+    } else {
+        sub = (unsigned)((value - base) << (HIST_SUB_BITS - exponent));
+    }
     if (sub >= HIST_SUBS) sub = HIST_SUBS - 1;
     return exponent * HIST_SUBS + sub;
 }
@@ -95,9 +103,12 @@ static uint64_t hist_percentile(const histogram_t *hist, unsigned percent)
 static uint64_t bytes_per_second(uint64_t bytes, uint64_t elapsed_ns)
 {
     if (bytes == 0 || elapsed_ns == 0) return 0;
-    long double value = (long double)bytes * 1000000000.0L /
-                        (long double)elapsed_ns;
-    return value >= (long double)UINT64_MAX ? UINT64_MAX : (uint64_t)value;
+    /* double (SSE2) instead of long double: the x87 fdiv this used to take
+     * is 30+ cycles and the uint64->x87 conversion branches; the result only
+     * ever feeds a log-scale histogram bucket, so 53 bits of mantissa is
+     * far more precision than needed. */
+    double value = (double)bytes * 1e9 / (double)elapsed_ns;
+    return value >= (double)UINT64_MAX ? UINT64_MAX : (uint64_t)value;
 }
 
 void telemetry_init(void)
