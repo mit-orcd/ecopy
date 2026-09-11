@@ -517,6 +517,19 @@ typedef struct {
 
 static __thread file_scratch_t g_file_scratch;
 
+/* Release this worker's scratch buffers (called at traversal thread exit). */
+static void file_scratch_free(void)
+{
+    file_scratch_t *s = &g_file_scratch;
+
+    free(s->batch);
+    free(s->names);
+    free(s->present);
+    free(s->dst_st);
+    free(s->getdents_buf);
+    memset(s, 0, sizeof(*s));
+}
+
 /*
  * Raw getdents64 read-buffer size per traversal worker (bytes). A larger buffer
  * returns many dirents per syscall, cutting the syscall count on huge
@@ -1061,6 +1074,7 @@ static void *traversal_worker_main(void *arg)
             }
             if (g_dir_done) {
                 pthread_mutex_unlock(&g_dir_lock);
+                file_scratch_free();
                 return NULL;
             }
             pthread_cond_wait(&g_dir_cond, &g_dir_lock);
