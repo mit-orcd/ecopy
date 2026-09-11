@@ -120,9 +120,9 @@ typedef struct {
 } speed_sample_t;
 
 typedef struct file_task {
-    char src[PATH_MAX];
-    char dst[PATH_MAX];
-    char name[PATH_MAX];
+    char *src;
+    char *dst;
+    char *name;
     dir_handle_t *dir;
     struct stat src_st;
     /*
@@ -131,7 +131,14 @@ typedef struct file_task {
      * (UINT64_MAX - enqueue seq) so the same max-heap yields FIFO order.
      */
     uint64_t sched_key;
+    size_t data_cap;        /* usable bytes in the flexible tail */
     struct file_task *next; /* freelist link only (queues are heaps) */
+    /*
+     * Exact-length src/dst/name strings, one allocation. The previous three
+     * PATH_MAX arrays cost ~12 KiB per queued file; with the default
+     * 262144-entry queue cap that pinned ~3.2 GiB for the whole run.
+     */
+    char data[];
 } file_task_t;
 
 typedef struct {

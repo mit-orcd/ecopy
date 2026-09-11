@@ -176,7 +176,6 @@ static int g_explicit_large_writers = 0;
 static int g_collect_wait_timing = 0;
 
 static uint64_t monotonic_ns(void);
-static void copy_path_field(char *dst, size_t dstsz, const char *src);
 static int copy_file_remote(file_task_t *task, uint64_t *payload_bytes);
 
 /* -------------------- runtime config -------------------- */
@@ -772,23 +771,6 @@ static inline int io_should_sample(void)
 {
     static __thread uint32_t io_sample_counter = 0;
     return (io_sample_counter++ % IO_SAMPLE_PERIOD) == 0u;
-}
-
-/*
- * Bounded string copy for per-file path fields. These are plain copies of
- * NUL-terminated paths; using snprintf("%s") for them dragged in the whole
- * vfprintf machinery, which was a visible cost on small-file trees.
- */
-static void copy_path_field(char *dst, size_t dstsz, const char *src)
-{
-    size_t n = src ? strlen(src) : 0;
-    if (n >= dstsz) {
-        n = dstsz - 1;
-    }
-    if (n > 0) {
-        memcpy(dst, src, n);
-    }
-    dst[n] = '\0';
 }
 
 /*
@@ -2323,17 +2305,55 @@ void workers_stop(void)
     g_workers = NULL;
 }
 
-static int build_child_path(char *out, size_t outsz,
-                            const char *parent, const char *name)
+/*
+ * file_task_t path strings live in one exact-length flexible tail instead of
+ * three PATH_MAX arrays, so a queued file costs ~300 B rather than ~12 KiB.
+ * The join rule is parent + optional '/' + name (no double slash when the
+ * parent already ends in '/').
+ */
+static size_t file_task_data_need(const dir_handle_t *dir, size_t name_len)
 {
-    size_t plen = strlen(parent);
-    const char *sep = (plen > 0 && parent[plen - 1] == '/') ? "" : "/";
-    int n = snprintf(out, outsz, "%s%s%s", parent, sep, name);
-    if (n < 0 || (size_t)n >= outsz) {
-        errno = ENAMETOOLONG;
-        return -1;
+    size_t src_plen = strlen(dir->src);
+    size_t dst_plen = strlen(dir->dst);
+    size_t src_sep = (src_plen > 0 && dir->src[src_plen - 1] == '/') ? 0 : 1;
+    size_t dst_sep = (dst_plen > 0 && dir->dst[dst_plen - 1] == '/') ? 0 : 1;
+
+    return (src_plen + src_sep + name_len + 1) +
+           (dst_plen + dst_sep + name_len + 1) +
+           (name_len + 1);
+}
+
+static void file_task_fill_paths(file_task_t *t,
+                                 const dir_handle_t *dir,
+                                 const char *name,
+                                 size_t name_len)
+{
+    size_t src_plen = strlen(dir->src);
+    size_t dst_plen = strlen(dir->dst);
+    size_t src_sep = (src_plen > 0 && dir->src[src_plen - 1] == '/') ? 0 : 1;
+    size_t dst_sep = (dst_plen > 0 && dir->dst[dst_plen - 1] == '/') ? 0 : 1;
+    char *p = t->data;
+
+    t->src = p;
+    memcpy(p, dir->src, src_plen);
+    p += src_plen;
+    if (src_sep) {
+        *p++ = '/';
     }
-    return 0;
+    memcpy(p, name, name_len + 1);
+    p += name_len + 1;
+
+    t->dst = p;
+    memcpy(p, dir->dst, dst_plen);
+    p += dst_plen;
+    if (dst_sep) {
+        *p++ = '/';
+    }
+    memcpy(p, name, name_len + 1);
+    p += name_len + 1;
+
+    t->name = p;
+    memcpy(p, name, name_len + 1);
 }
 
 /*
@@ -2371,28 +2391,33 @@ int workers_enqueue_batch(dir_handle_t *dir,
 
     for (size_t i = 0; i < count; i++) {
         file_task_t *t;
+        size_t name_len, need;
         if (!items[i].name || !items[i].src_st) {
             errno = EINVAL;
             goto fail;
         }
+        name_len = strlen(items[i].name);
+        need = file_task_data_need(dir, name_len);
+        t = NULL;
         if (spares) {
             t = spares;
             spares = t->next;
-        } else {
-            t = malloc(sizeof(*t));
+            if (t->data_cap < need) {
+                /* Right-sizing matters more than recycling a too-small node. */
+                free(t);
+                t = NULL;
+            }
+        }
+        if (!t) {
+            t = malloc(sizeof(*t) + need);
             if (!t) {
                 errno = ENOMEM;
                 goto fail;
             }
+            t->data_cap = need;
         }
 
-        copy_path_field(t->name, sizeof(t->name), items[i].name);
-        if (build_child_path(t->src, sizeof(t->src), dir->src, items[i].name) != 0 ||
-            build_child_path(t->dst, sizeof(t->dst), dir->dst, items[i].name) != 0) {
-            t->next = spares;
-            spares = t;
-            goto fail;
-        }
+        file_task_fill_paths(t, dir, items[i].name, name_len);
         dir_handle_retain(dir);
         t->dir = dir;
         t->src_st = *items[i].src_st;
