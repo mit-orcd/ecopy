@@ -132,6 +132,7 @@ typedef struct file_task {
      */
     uint64_t sched_key;
     size_t data_cap;        /* usable bytes in the flexible tail */
+    uint32_t src_len;       /* strlen of the src path, known at fill time */
     struct file_task *next; /* freelist link only (queues are heaps) */
     /*
      * Exact-length src/dst/name strings, one allocation. The previous three

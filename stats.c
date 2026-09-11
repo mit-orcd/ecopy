@@ -442,8 +442,10 @@ static void cfile_write_end(int s, uint64_t seq) {
     atomic_store_explicit(&g_cfile_slots[s].seq, seq + 2, memory_order_release);
 }
 
-void stats_set_current_file(const char *path, uint64_t total, int parallel) {
-    size_t n = path ? strlen(path) : 0;
+void stats_set_current_file(const char *path, size_t path_len, uint64_t total, int parallel) {
+    /* The caller already knows the path length (it built the string), so
+     * skip a per-file strlen of the full source path. */
+    size_t n = path ? path_len : 0;
     int s = cfile_slot();
     cfile_slot_t *slot = &g_cfile_slots[s];
     if (n >= PATH_MAX) {

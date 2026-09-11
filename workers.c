@@ -1175,7 +1175,7 @@ static int copy_file_sparse(file_task_t *task, uint64_t *payload_bytes)
     char tmp_name[PATH_MAX] = "";
 
     bufcap = (g_chunk_size > 0) ? (size_t)g_chunk_size : (size_t)(1024 * 1024);
-    stats_set_current_file(task->src, (uint64_t)size, 0);
+    stats_set_current_file(task->src, task->src_len, (uint64_t)size, 0);
 
     fd_in = open_read_at_buffered(task->dir->src_fd,
                                   task->name,
@@ -1286,7 +1286,7 @@ static int copy_file_serial_small(file_task_t *task, uint64_t *payload_bytes)
     copy_range_available = copy_file_range_enabled();
     size = task->src_st.st_size;
     bulk_end = (size / ALIGNMENT) * ALIGNMENT;
-    stats_set_current_file(task->src, (uint64_t)size, 0);
+    stats_set_current_file(task->src, task->src_len, (uint64_t)size, 0);
 
     fd_in = open_read_at_maybe_direct(task->dir->src_fd,
                                       task->name,
@@ -2007,8 +2007,9 @@ static work_claim_t dequeue_work(file_task_t **stash, int *stash_head,
              * it currently lives in another core's cache. Pull the fixed
              * part (and the first tail line with the path strings) into this
              * core's cache now so the per-file loop does not stall on the
-             * cross-core handoff. stash[0] is dispatched immediately, so
-             * prefetching it would have no lead time.
+             * cross-core handoff. Seven lines cover the fixed part plus the
+             * typical src+dst+name tail (~200-350 B). stash[0] is dispatched
+             * immediately, so prefetching it would have no lead time.
              */
             for (int k = 1; k < *stash_count; k++) {
                 const char *p = (const char *)stash[k];
@@ -2017,6 +2018,8 @@ static work_claim_t dequeue_work(file_task_t **stash, int *stash_head,
                 __builtin_prefetch(p + 128, 0, 3);
                 __builtin_prefetch(p + 192, 0, 3);
                 __builtin_prefetch(p + 256, 0, 3);
+                __builtin_prefetch(p + 320, 0, 3);
+                __builtin_prefetch(p + 384, 0, 3);
             }
             claim.kind = WORK_SMALL_FILE;
             claim.file_task = stash[(*stash_head)++];
@@ -2108,7 +2111,7 @@ static int copy_file_remote(file_task_t *task, uint64_t *payload_bytes)
     sshx_file_t *f = NULL;
 
     init_runtime_config();
-    stats_set_current_file(task->src, (uint64_t)size, 0);
+    stats_set_current_file(task->src, task->src_len, (uint64_t)size, 0);
 
     /* Non-sparse small files go in one fire-and-forget frame. Sparse files stay
      * on the streamed path so their holes are preserved on the far side. */
@@ -2443,6 +2446,7 @@ static void file_task_fill_paths(file_task_t *t,
     }
     memcpy(p, name, name_len + 1);
     p += name_len + 1;
+    t->src_len = (uint32_t)(src_plen + src_sep + name_len);
 
     t->dst = p;
     memcpy(p, dir->dst, dst_plen);
