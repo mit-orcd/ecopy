@@ -460,9 +460,16 @@ void stats_set_current_file(const char *path, uint64_t total, int parallel) {
     cfile_write_end(s, seq);
 }
 
-void stats_advance_current_file(uint64_t bytes) {
+/*
+ * Per-chunk progress for the serial small-file path. The shared
+ * a_bytes_copied cacheline ping-ponged between every worker when it was
+ * bumped once per chunk, so the global counter is now folded in by the
+ * caller through progress_add_small_bytes_batched() (TLS, flushed every
+ * 256 KB and at worker exit). What remains here is the thread-exclusive
+ * current-file slot bump, which is cheap.
+ */
+void stats_advance_current_file_slot(uint64_t bytes) {
     if (bytes > 0) note_first_payload();
-    hot_add(&a_bytes_copied, bytes);
     /* set_current_file always runs on this thread before any advance. */
     if (tls_cfile_slot >= 0) {
         hot_add(&g_cfile_slots[tls_cfile_slot].done, bytes);

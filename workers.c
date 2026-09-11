@@ -832,14 +832,7 @@ static void thread_io_buffer_release(void)
     g_tls_io_cap = 0;
 }
 
-static void record_progress_bytes(uint64_t bytes, int use_current_file_stats)
-{
-    if (use_current_file_stats) {
-        stats_advance_current_file(bytes);
-    } else {
-        stats_add_bytes(bytes);
-    }
-}
+static void record_progress_bytes(uint64_t bytes, int use_current_file_stats);
 
 /*
  * The large writers all bump the same global byte counter once per chunk. Once
@@ -850,7 +843,12 @@ static void record_progress_bytes(uint64_t bytes, int use_current_file_stats)
  */
 #define BYTES_FLUSH_THRESHOLD (16ULL * 1024 * 1024)
 
+/* Small-file chunks flush far below the large-path threshold so the 1 Hz
+ * rolling-rate sampler stays responsive on metadata-heavy runs. */
+#define SMALL_BYTES_FLUSH_THRESHOLD (256ULL * 1024)
+
 static __thread uint64_t g_tls_pending_bytes = 0;
+static __thread uint64_t g_tls_pending_small_bytes = 0;
 
 static void progress_add_bytes_batched(uint64_t bytes)
 {
@@ -861,11 +859,36 @@ static void progress_add_bytes_batched(uint64_t bytes)
     }
 }
 
+static void progress_add_small_bytes_batched(uint64_t bytes)
+{
+    g_tls_pending_small_bytes += bytes;
+    if (g_tls_pending_small_bytes >= SMALL_BYTES_FLUSH_THRESHOLD) {
+        stats_add_bytes(g_tls_pending_small_bytes);
+        g_tls_pending_small_bytes = 0;
+    }
+}
+
 static void progress_flush_bytes(void)
 {
     if (g_tls_pending_bytes > 0) {
         stats_add_bytes(g_tls_pending_bytes);
         g_tls_pending_bytes = 0;
+    }
+    if (g_tls_pending_small_bytes > 0) {
+        stats_add_bytes(g_tls_pending_small_bytes);
+        g_tls_pending_small_bytes = 0;
+    }
+}
+
+static void record_progress_bytes(uint64_t bytes, int use_current_file_stats)
+{
+    if (use_current_file_stats) {
+        /* The thread-exclusive slot bump stays per chunk; the shared global
+         * counter is batched to keep it off the contended cacheline. */
+        stats_advance_current_file_slot(bytes);
+        progress_add_small_bytes_batched(bytes);
+    } else {
+        stats_add_bytes(bytes);
     }
 }
 
@@ -2277,6 +2300,7 @@ static void *worker_main(void *arg)
         }
     }
 
+    progress_flush_bytes();
     thread_io_buffer_release();
     telemetry_flush_thread();
     return NULL;
