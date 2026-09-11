@@ -30,17 +30,24 @@
 #include <sys/syscall.h>
 #endif
 
+/*
+ * Directory queue nodes and finalize records carry heap-allocated, exact-length
+ * path strings rather than PATH_MAX arrays: trees with tens of millions of
+ * directories otherwise pin ~8 KiB per directory for the whole run (the
+ * finalize list is only released after the final metadata pass), which is what
+ * OOM-killed ecopy on such trees.
+ */
 typedef struct dir_node {
-    char src[PATH_MAX];
-    char dst[PATH_MAX];
+    char *src;
+    char *dst;
     struct stat src_st;
     int depth;
     struct dir_node *next;
 } dir_node_t;
 
 typedef struct dir_record {
-    char src[PATH_MAX];
-    char dst[PATH_MAX];
+    char *src;
+    char *dst;
     struct stat src_st;
     int depth;
 } dir_record_t;
@@ -228,6 +235,16 @@ static int open_or_create_target_dir_path(const char *path, mode_t mode)
     return fd;
 }
 
+static void free_dir_node(dir_node_t *n)
+{
+    if (!n) {
+        return;
+    }
+    free(n->src);
+    free(n->dst);
+    free(n);
+}
+
 static int push_dir_locked(const char *src,
                            const char *dst,
                            const struct stat *src_st,
@@ -238,9 +255,13 @@ static int push_dir_locked(const char *src,
         perror("calloc");
         return -1;
     }
-
-    snprintf(n->src, sizeof(n->src), "%s", src);
-    snprintf(n->dst, sizeof(n->dst), "%s", dst);
+    n->src = strdup(src);
+    n->dst = strdup(dst);
+    if (!n->src || !n->dst) {
+        perror("strdup");
+        free_dir_node(n);
+        return -1;
+    }
     n->src_st = *src_st;
     n->depth = depth;
 
@@ -254,12 +275,35 @@ static int push_dir_locked(const char *src,
     return 0;
 }
 
+/* Release every finalize record and the array. Caller holds g_finalize_lock. */
+static void free_finalize_dirs_locked(void)
+{
+    for (size_t i = 0; i < g_finalize_dir_count; i++) {
+        free(g_finalize_dirs[i].src);
+        free(g_finalize_dirs[i].dst);
+    }
+    free(g_finalize_dirs);
+    g_finalize_dirs = NULL;
+    g_finalize_dir_count = 0;
+    g_finalize_dir_cap = 0;
+}
+
 static int record_directory_for_finalize(const char *src,
                                          const char *dst,
                                          const struct stat *src_st,
                                          int depth)
 {
     dir_record_t *new_dirs;
+    dir_record_t *rec;
+    char *src_copy = strdup(src);
+    char *dst_copy = strdup(dst);
+
+    if (!src_copy || !dst_copy) {
+        free(src_copy);
+        free(dst_copy);
+        perror("strdup");
+        return -1;
+    }
 
     pthread_mutex_lock(&g_finalize_lock);
     if (g_finalize_dir_count == g_finalize_dir_cap) {
@@ -267,6 +311,8 @@ static int record_directory_for_finalize(const char *src,
         new_dirs = realloc(g_finalize_dirs, new_cap * sizeof(*g_finalize_dirs));
         if (!new_dirs) {
             pthread_mutex_unlock(&g_finalize_lock);
+            free(src_copy);
+            free(dst_copy);
             perror("realloc");
             return -1;
         }
@@ -274,11 +320,11 @@ static int record_directory_for_finalize(const char *src,
         g_finalize_dir_cap = new_cap;
     }
 
-    new_dirs = g_finalize_dirs;
-    snprintf(new_dirs[g_finalize_dir_count].src, sizeof(new_dirs[g_finalize_dir_count].src), "%s", src);
-    snprintf(new_dirs[g_finalize_dir_count].dst, sizeof(new_dirs[g_finalize_dir_count].dst), "%s", dst);
-    new_dirs[g_finalize_dir_count].src_st = *src_st;
-    new_dirs[g_finalize_dir_count].depth = depth;
+    rec = &g_finalize_dirs[g_finalize_dir_count];
+    rec->src = src_copy;
+    rec->dst = dst_copy;
+    rec->src_st = *src_st;
+    rec->depth = depth;
     g_finalize_dir_count++;
     pthread_mutex_unlock(&g_finalize_lock);
     return 0;
@@ -470,6 +516,19 @@ typedef struct {
 } file_scratch_t;
 
 static __thread file_scratch_t g_file_scratch;
+
+/* Release this worker's scratch buffers (called at traversal thread exit). */
+static void file_scratch_free(void)
+{
+    file_scratch_t *s = &g_file_scratch;
+
+    free(s->batch);
+    free(s->names);
+    free(s->present);
+    free(s->dst_st);
+    free(s->getdents_buf);
+    memset(s, 0, sizeof(*s));
+}
 
 /*
  * Raw getdents64 read-buffer size per traversal worker (bytes). A larger buffer
@@ -1015,6 +1074,7 @@ static void *traversal_worker_main(void *arg)
             }
             if (g_dir_done) {
                 pthread_mutex_unlock(&g_dir_lock);
+                file_scratch_free();
                 return NULL;
             }
             pthread_cond_wait(&g_dir_cond, &g_dir_lock);
@@ -1022,7 +1082,7 @@ static void *traversal_worker_main(void *arg)
         pthread_mutex_unlock(&g_dir_lock);
 
         process_directory_node(node);
-        free(node);
+        free_dir_node(node);
 
         pthread_mutex_lock(&g_dir_lock);
         g_dir_active--;
@@ -1042,10 +1102,7 @@ int traversal_start(const char *src_dir, const char *dst_dir) {
     g_status = 0;
     pthread_mutex_unlock(&g_status_lock);
     pthread_mutex_lock(&g_finalize_lock);
-    free(g_finalize_dirs);
-    g_finalize_dirs = NULL;
-    g_finalize_dir_count = 0;
-    g_finalize_dir_cap = 0;
+    free_finalize_dirs_locked();
     pthread_mutex_unlock(&g_finalize_lock);
     if (copy_path_checked(g_src_root, sizeof(g_src_root), src_dir, "Source root") != 0 ||
         copy_path_checked(g_dst_root, sizeof(g_dst_root), dst_dir, "Target root") != 0) {
@@ -1110,6 +1167,12 @@ int traversal_start(const char *src_dir, const char *dst_dir) {
             while (--i >= 0) {
                 pthread_join(g_threads[i], NULL);
             }
+            /* If no worker ever started, the queued root node is still here. */
+            pthread_mutex_lock(&g_dir_lock);
+            while (g_dir_head) {
+                free_dir_node(pop_dir_locked());
+            }
+            pthread_mutex_unlock(&g_dir_lock);
             free(g_threads);
             g_threads = NULL;
             return -1;
@@ -1139,10 +1202,7 @@ int traversal_finalize_metadata(void)
         stats_set_finalize_done();
     }
     pthread_mutex_lock(&g_finalize_lock);
-    free(g_finalize_dirs);
-    g_finalize_dirs = NULL;
-    g_finalize_dir_count = 0;
-    g_finalize_dir_cap = 0;
+    free_finalize_dirs_locked();
     pthread_mutex_unlock(&g_finalize_lock);
     return rc == 0 ? 0 : -1;
 }
