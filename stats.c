@@ -26,17 +26,21 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
  * "Current file" is only a progress-display hint, but every worker used to
  * serialize on g_lock (with a PATH_MAX copy inside the critical section) to
  * update one shared string. Each thread now owns a seqlock-guarded slot and
- * the progress reader scans for the first active one. Slot indices are
- * handed out once per thread; with more threads than slots, workers share a
- * slot (the display flips between their files; the seqlock claim below keeps
- * concurrent writers consistent).
+ * the progress reader scans for the first active one. The slot count matches
+ * the worker cap so every thread gets an exclusive slot; the header fields
+ * (seq/done/total) share one cache line per slot, keeping per-chunk done
+ * updates free of false sharing. If more threads than slots ever show up,
+ * the seqlock claim below still keeps shared-slot writers consistent.
  */
-#define CURRENT_FILE_SLOTS 64
-static _Atomic uint64_t a_cfile_seq[CURRENT_FILE_SLOTS]; /* odd = write in flight */
-static _Atomic uint64_t a_cfile_done[CURRENT_FILE_SLOTS];
-static uint64_t g_cfile_total[CURRENT_FILE_SLOTS];
-static int g_cfile_parallel[CURRENT_FILE_SLOTS];
-static char g_cfile_path[CURRENT_FILE_SLOTS][PATH_MAX];
+#define CURRENT_FILE_SLOTS 512
+typedef struct {
+    _Atomic uint64_t seq; /* odd = write in flight */
+    _Atomic uint64_t done;
+    uint64_t total;
+    int parallel;
+    char path[PATH_MAX];
+} __attribute__((aligned(64))) cfile_slot_t;
+static cfile_slot_t g_cfile_slots[CURRENT_FILE_SLOTS];
 static _Atomic int a_cfile_next;
 static _Thread_local int tls_cfile_slot = -1;
 static struct timespec g_rate_window_ts;
@@ -161,13 +165,7 @@ void stats_init(void) {
     pthread_mutex_lock(&g_lock);
     memset(&g_stats, 0, sizeof(g_stats));
     memset(g_speed_ring, 0, sizeof(g_speed_ring));
-    memset(g_cfile_path, 0, sizeof(g_cfile_path));
-    memset(g_cfile_total, 0, sizeof(g_cfile_total));
-    memset(g_cfile_parallel, 0, sizeof(g_cfile_parallel));
-    for (int i = 0; i < CURRENT_FILE_SLOTS; i++) {
-        atomic_store_explicit(&a_cfile_seq[i], 0, memory_order_relaxed);
-        atomic_store_explicit(&a_cfile_done[i], 0, memory_order_relaxed);
-    }
+    memset(g_cfile_slots, 0, sizeof(g_cfile_slots));
     atomic_store_explicit(&a_cfile_next, 0, memory_order_relaxed);
     g_speed_index = 0;
     g_rate_window_started = 0;
@@ -428,11 +426,11 @@ static int cfile_slot(void) {
 static uint64_t cfile_write_begin(int s) {
     uint64_t seq;
     for (;;) {
-        seq = atomic_load_explicit(&a_cfile_seq[s], memory_order_acquire);
+        seq = atomic_load_explicit(&g_cfile_slots[s].seq, memory_order_acquire);
         if (seq & 1) {
             continue;
         }
-        if (atomic_compare_exchange_weak_explicit(&a_cfile_seq[s], &seq, seq + 1,
+        if (atomic_compare_exchange_weak_explicit(&g_cfile_slots[s].seq, &seq, seq + 1,
                                                   memory_order_acquire,
                                                   memory_order_relaxed)) {
             return seq;
@@ -441,23 +439,24 @@ static uint64_t cfile_write_begin(int s) {
 }
 
 static void cfile_write_end(int s, uint64_t seq) {
-    atomic_store_explicit(&a_cfile_seq[s], seq + 2, memory_order_release);
+    atomic_store_explicit(&g_cfile_slots[s].seq, seq + 2, memory_order_release);
 }
 
 void stats_set_current_file(const char *path, uint64_t total, int parallel) {
     size_t n = path ? strlen(path) : 0;
     int s = cfile_slot();
+    cfile_slot_t *slot = &g_cfile_slots[s];
     if (n >= PATH_MAX) {
         n = PATH_MAX - 1;
     }
     uint64_t seq = cfile_write_begin(s);
     if (n > 0) {
-        memcpy(g_cfile_path[s], path, n);
+        memcpy(slot->path, path, n);
     }
-    g_cfile_path[s][n] = '\0';
-    g_cfile_total[s] = total;
-    g_cfile_parallel[s] = parallel;
-    atomic_store_explicit(&a_cfile_done[s], 0, memory_order_relaxed);
+    slot->path[n] = '\0';
+    slot->total = total;
+    slot->parallel = parallel;
+    atomic_store_explicit(&slot->done, 0, memory_order_relaxed);
     cfile_write_end(s, seq);
 }
 
@@ -466,7 +465,7 @@ void stats_advance_current_file(uint64_t bytes) {
     hot_add(&a_bytes_copied, bytes);
     /* set_current_file always runs on this thread before any advance. */
     if (tls_cfile_slot >= 0) {
-        hot_add(&a_cfile_done[tls_cfile_slot], bytes);
+        hot_add(&g_cfile_slots[tls_cfile_slot].done, bytes);
     }
 }
 
@@ -478,11 +477,12 @@ void stats_clear_current_file(const char *path) {
     if (s < 0) {
         return;
     }
+    cfile_slot_t *slot = &g_cfile_slots[s];
     uint64_t seq = cfile_write_begin(s);
-    g_cfile_path[s][0] = '\0';
-    g_cfile_total[s] = 0;
-    g_cfile_parallel[s] = 0;
-    atomic_store_explicit(&a_cfile_done[s], 0, memory_order_relaxed);
+    slot->path[0] = '\0';
+    slot->total = 0;
+    slot->parallel = 0;
+    atomic_store_explicit(&slot->done, 0, memory_order_relaxed);
     cfile_write_end(s, seq);
 }
 
@@ -693,20 +693,21 @@ void stats_get_progress_snapshot(progress_snapshot_t *snap) {
     snap->current_file_parallel = 0;
     snap->current_file[0] = '\0';
     for (int i = 0; i < CURRENT_FILE_SLOTS; i++) {
-        if (g_cfile_path[i][0] == '\0') {
+        cfile_slot_t *slot = &g_cfile_slots[i];
+        if (slot->path[0] == '\0') {
             continue;
         }
-        uint64_t seq1 = atomic_load_explicit(&a_cfile_seq[i], memory_order_acquire);
+        uint64_t seq1 = atomic_load_explicit(&slot->seq, memory_order_acquire);
         if (seq1 & 1) {
             continue;
         }
-        size_t len = strnlen(g_cfile_path[i], PATH_MAX - 1);
-        uint64_t total = g_cfile_total[i];
-        int parallel = g_cfile_parallel[i];
-        uint64_t done = hot_load(&a_cfile_done[i]);
+        size_t len = strnlen(slot->path, PATH_MAX - 1);
+        uint64_t total = slot->total;
+        int parallel = slot->parallel;
+        uint64_t done = hot_load(&slot->done);
         char path[PATH_MAX];
-        memcpy(path, g_cfile_path[i], len + 1);
-        uint64_t seq2 = atomic_load_explicit(&a_cfile_seq[i], memory_order_acquire);
+        memcpy(path, slot->path, len + 1);
+        uint64_t seq2 = atomic_load_explicit(&slot->seq, memory_order_acquire);
         if (seq1 != seq2) {
             continue;
         }
