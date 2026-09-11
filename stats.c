@@ -22,9 +22,23 @@ static stats_t g_stats;
 static speed_sample_t g_speed_ring[SPEED_SLOTS];
 static int g_speed_index = 0;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
-static char g_current_file[PATH_MAX];
-static uint64_t g_current_file_total = 0;
-static int g_current_file_parallel = 0;
+/*
+ * "Current file" is only a progress-display hint, but every worker used to
+ * serialize on g_lock (with a PATH_MAX copy inside the critical section) to
+ * update one shared string. Each thread now owns a seqlock-guarded slot and
+ * the progress reader scans for the first active one. Slot indices are
+ * handed out once per thread; with more threads than slots, workers share a
+ * slot (the display flips between their files; the seqlock claim below keeps
+ * concurrent writers consistent).
+ */
+#define CURRENT_FILE_SLOTS 64
+static _Atomic uint64_t a_cfile_seq[CURRENT_FILE_SLOTS]; /* odd = write in flight */
+static _Atomic uint64_t a_cfile_done[CURRENT_FILE_SLOTS];
+static uint64_t g_cfile_total[CURRENT_FILE_SLOTS];
+static int g_cfile_parallel[CURRENT_FILE_SLOTS];
+static char g_cfile_path[CURRENT_FILE_SLOTS][PATH_MAX];
+static _Atomic int a_cfile_next;
+static _Thread_local int tls_cfile_slot = -1;
 static struct timespec g_rate_window_ts;
 static uint64_t g_rate_window_bytes;
 static int g_rate_window_started;
@@ -37,7 +51,6 @@ static int g_rate_window_finished;
  * or the final report is taken.
  */
 static _Atomic uint64_t a_bytes_copied;
-static _Atomic uint64_t a_current_file_done;
 static _Atomic uint64_t a_read_syscalls;
 static _Atomic uint64_t a_read_ns;
 static _Atomic uint64_t a_write_syscalls;
@@ -49,6 +62,12 @@ static _Atomic uint64_t a_writer_data_wait_ns;
 static _Atomic uint64_t a_ready_queue_peak;
 static _Atomic uint64_t a_ready_queue_total;
 static _Atomic uint64_t a_ready_queue_samples;
+static _Atomic uint64_t a_files_seen;
+static _Atomic uint64_t a_files_copied;
+static _Atomic uint64_t a_read_direct_opens;
+static _Atomic uint64_t a_read_buffered_opens;
+static _Atomic uint64_t a_write_direct_opens;
+static _Atomic uint64_t a_write_buffered_opens;
 static _Atomic int a_first_payload_seen;
 static struct timespec g_first_payload_ts;
 
@@ -74,6 +93,12 @@ static void stats_load_hot(stats_t *s) {
     s->ready_queue_peak = hot_load(&a_ready_queue_peak);
     s->ready_queue_total = hot_load(&a_ready_queue_total);
     s->ready_queue_samples = hot_load(&a_ready_queue_samples);
+    s->files_seen = hot_load(&a_files_seen);
+    s->files_copied = hot_load(&a_files_copied);
+    s->read_direct_opens = hot_load(&a_read_direct_opens);
+    s->read_buffered_opens = hot_load(&a_read_buffered_opens);
+    s->write_direct_opens = hot_load(&a_write_direct_opens);
+    s->write_buffered_opens = hot_load(&a_write_buffered_opens);
 }
 
 static double ts_to_sec(const struct timespec *ts) {
@@ -136,15 +161,25 @@ void stats_init(void) {
     pthread_mutex_lock(&g_lock);
     memset(&g_stats, 0, sizeof(g_stats));
     memset(g_speed_ring, 0, sizeof(g_speed_ring));
-    memset(g_current_file, 0, sizeof(g_current_file));
-    g_current_file_total = 0;
-    g_current_file_parallel = 0;
+    memset(g_cfile_path, 0, sizeof(g_cfile_path));
+    memset(g_cfile_total, 0, sizeof(g_cfile_total));
+    memset(g_cfile_parallel, 0, sizeof(g_cfile_parallel));
+    for (int i = 0; i < CURRENT_FILE_SLOTS; i++) {
+        atomic_store_explicit(&a_cfile_seq[i], 0, memory_order_relaxed);
+        atomic_store_explicit(&a_cfile_done[i], 0, memory_order_relaxed);
+    }
+    atomic_store_explicit(&a_cfile_next, 0, memory_order_relaxed);
     g_speed_index = 0;
     g_rate_window_started = 0;
     g_rate_window_finished = 0;
     g_rate_window_bytes = 0;
     atomic_store_explicit(&a_bytes_copied, 0, memory_order_relaxed);
-    atomic_store_explicit(&a_current_file_done, 0, memory_order_relaxed);
+    atomic_store_explicit(&a_files_seen, 0, memory_order_relaxed);
+    atomic_store_explicit(&a_files_copied, 0, memory_order_relaxed);
+    atomic_store_explicit(&a_read_direct_opens, 0, memory_order_relaxed);
+    atomic_store_explicit(&a_read_buffered_opens, 0, memory_order_relaxed);
+    atomic_store_explicit(&a_write_direct_opens, 0, memory_order_relaxed);
+    atomic_store_explicit(&a_write_buffered_opens, 0, memory_order_relaxed);
     atomic_store_explicit(&a_read_syscalls, 0, memory_order_relaxed);
     atomic_store_explicit(&a_read_ns, 0, memory_order_relaxed);
     atomic_store_explicit(&a_write_syscalls, 0, memory_order_relaxed);
@@ -249,23 +284,11 @@ void stats_set_shutdown_done(void) {
 }
 
 void stats_record_read_open(int used_direct) {
-    pthread_mutex_lock(&g_lock);
-    if (used_direct) {
-        g_stats.read_direct_opens++;
-    } else {
-        g_stats.read_buffered_opens++;
-    }
-    pthread_mutex_unlock(&g_lock);
+    hot_add(used_direct ? &a_read_direct_opens : &a_read_buffered_opens, 1);
 }
 
 void stats_record_write_open(int used_direct) {
-    pthread_mutex_lock(&g_lock);
-    if (used_direct) {
-        g_stats.write_direct_opens++;
-    } else {
-        g_stats.write_buffered_opens++;
-    }
-    pthread_mutex_unlock(&g_lock);
+    hot_add(used_direct ? &a_write_direct_opens : &a_write_buffered_opens, 1);
 }
 
 void stats_record_queue_wait_ns(uint64_t ns) { pthread_mutex_lock(&g_lock); g_stats.queue_wait_ns += ns; pthread_mutex_unlock(&g_lock); }
@@ -289,8 +312,8 @@ void stats_record_ready_queue_depth(uint64_t depth) {
         /* cur reloaded with the current peak on failure; retry. */
     }
 }
-void stats_inc_files_seen(void){ pthread_mutex_lock(&g_lock); g_stats.files_seen++; pthread_mutex_unlock(&g_lock);} 
-void stats_inc_files_copied(void){ pthread_mutex_lock(&g_lock); g_stats.files_copied++; pthread_mutex_unlock(&g_lock);} 
+void stats_inc_files_seen(void){ hot_add(&a_files_seen, 1); }
+void stats_inc_files_copied(void){ hot_add(&a_files_copied, 1); } 
 void stats_inc_files_skipped(void){ pthread_mutex_lock(&g_lock); g_stats.files_skipped++; pthread_mutex_unlock(&g_lock);} 
 void stats_inc_dirs_seen(void){ pthread_mutex_lock(&g_lock); g_stats.dirs_seen++; pthread_mutex_unlock(&g_lock);} 
 void stats_inc_dirs_created(void){ pthread_mutex_lock(&g_lock); g_stats.dirs_created++; pthread_mutex_unlock(&g_lock);} 
@@ -391,39 +414,76 @@ void stats_record_verify_categories(uint64_t metadata, uint64_t data,
     pthread_mutex_unlock(&g_lock);
 }
 
+static int cfile_slot(void) {
+    int s = tls_cfile_slot;
+    if (s < 0) {
+        s = atomic_fetch_add_explicit(&a_cfile_next, 1, memory_order_relaxed) %
+            CURRENT_FILE_SLOTS;
+        tls_cfile_slot = s;
+    }
+    return s;
+}
+
+/* Claim slot s for writing (even -> odd seq transition excludes other writers). */
+static uint64_t cfile_write_begin(int s) {
+    uint64_t seq;
+    for (;;) {
+        seq = atomic_load_explicit(&a_cfile_seq[s], memory_order_acquire);
+        if (seq & 1) {
+            continue;
+        }
+        if (atomic_compare_exchange_weak_explicit(&a_cfile_seq[s], &seq, seq + 1,
+                                                  memory_order_acquire,
+                                                  memory_order_relaxed)) {
+            return seq;
+        }
+    }
+}
+
+static void cfile_write_end(int s, uint64_t seq) {
+    atomic_store_explicit(&a_cfile_seq[s], seq + 2, memory_order_release);
+}
+
 void stats_set_current_file(const char *path, uint64_t total, int parallel) {
-    /* Plain bounded copy: snprintf("%s") here pulled in the vfprintf machinery
-     * on every file, which was a visible cost on small-file trees. */
     size_t n = path ? strlen(path) : 0;
-    pthread_mutex_lock(&g_lock);
-    if (n >= sizeof(g_current_file)) {
-        n = sizeof(g_current_file) - 1;
+    int s = cfile_slot();
+    if (n >= PATH_MAX) {
+        n = PATH_MAX - 1;
     }
+    uint64_t seq = cfile_write_begin(s);
     if (n > 0) {
-        memcpy(g_current_file, path, n);
+        memcpy(g_cfile_path[s], path, n);
     }
-    g_current_file[n] = '\0';
-    atomic_store_explicit(&a_current_file_done, 0, memory_order_relaxed);
-    g_current_file_total = total;
-    g_current_file_parallel = parallel;
-    pthread_mutex_unlock(&g_lock);
+    g_cfile_path[s][n] = '\0';
+    g_cfile_total[s] = total;
+    g_cfile_parallel[s] = parallel;
+    atomic_store_explicit(&a_cfile_done[s], 0, memory_order_relaxed);
+    cfile_write_end(s, seq);
 }
 
 void stats_advance_current_file(uint64_t bytes) {
     if (bytes > 0) note_first_payload();
-    hot_add(&a_current_file_done, bytes);
     hot_add(&a_bytes_copied, bytes);
+    /* set_current_file always runs on this thread before any advance. */
+    if (tls_cfile_slot >= 0) {
+        hot_add(&a_cfile_done[tls_cfile_slot], bytes);
+    }
 }
 
 void stats_clear_current_file(const char *path) {
-    pthread_mutex_lock(&g_lock);
-    if (!path || strcmp(g_current_file, path) == 0) {
-        memset(g_current_file, 0, sizeof(g_current_file));
-        atomic_store_explicit(&a_current_file_done, 0, memory_order_relaxed);
-        g_current_file_total = 0;
-        g_current_file_parallel = 0;
+    /* The slot only ever holds this thread's current file, so the path match
+     * the shared buffer needed is unnecessary here. */
+    (void)path;
+    int s = tls_cfile_slot;
+    if (s < 0) {
+        return;
     }
-    pthread_mutex_unlock(&g_lock);
+    uint64_t seq = cfile_write_begin(s);
+    g_cfile_path[s][0] = '\0';
+    g_cfile_total[s] = 0;
+    g_cfile_parallel[s] = 0;
+    atomic_store_explicit(&a_cfile_done[s], 0, memory_order_relaxed);
+    cfile_write_end(s, seq);
 }
 
 void stats_record_speed_sample(void) {
@@ -434,7 +494,7 @@ void stats_record_speed_sample(void) {
     g_speed_ring[g_speed_index].ts = now;
     g_speed_ring[g_speed_index].bytes_copied = bytes_copied;
     g_speed_ring[g_speed_index].bytes_completed = bytes_copied + g_stats.bytes_skipped;
-    g_speed_ring[g_speed_index].files_completed = g_stats.files_copied + g_stats.files_skipped;
+    g_speed_ring[g_speed_index].files_completed = hot_load(&a_files_copied) + g_stats.files_skipped;
     g_speed_ring[g_speed_index].valid = 1;
     g_speed_index = (g_speed_index + 1) % SPEED_SLOTS;
     if (!g_rate_window_started && bytes_copied > 0) {
@@ -598,7 +658,7 @@ static double stats_rolling_files_per_sec(void) {
             found = 1; best_age = age; old_files = g_speed_ring[i].files_completed; old_ts = g_speed_ring[i].ts;
         }
     }
-    uint64_t cur_files = g_stats.files_copied + g_stats.files_skipped;
+    uint64_t cur_files = hot_load(&a_files_copied) + g_stats.files_skipped;
     pthread_mutex_unlock(&g_lock);
     if (!found) return 0.0;
     double dt = diff_sec(&now, &old_ts);
@@ -609,20 +669,16 @@ static double stats_rolling_files_per_sec(void) {
 void stats_get_progress_snapshot(progress_snapshot_t *snap) {
     if (!snap) return;
     uint64_t bytes_copied = hot_load(&a_bytes_copied);
-    uint64_t current_file_done = hot_load(&a_current_file_done);
     pthread_mutex_lock(&g_lock);
     snap->bytes_copied = bytes_copied;
     snap->bytes_completed = bytes_copied + g_stats.bytes_skipped;
-    snap->files_seen = g_stats.files_seen;
-    snap->files_copied = g_stats.files_copied;
+    snap->files_seen = hot_load(&a_files_seen);
+    snap->files_copied = hot_load(&a_files_copied);
     snap->files_skipped = g_stats.files_skipped;
     snap->dirs_seen = g_stats.dirs_seen;
     snap->dirs_created = g_stats.dirs_created;
     snap->planned_copy_bytes = g_stats.planned_copy_bytes;
     snap->traversal_done = g_stats.traversal_done;
-    snap->current_file_done = current_file_done;
-    snap->current_file_total = g_current_file_total;
-    snap->current_file_parallel = g_current_file_parallel;
     snap->verify_objects = g_stats.verify_objects;
     snap->verify_bytes = g_stats.verify_bytes;
     snap->verify_scope_bytes = g_stats.verify_scope_bytes;
@@ -630,8 +686,36 @@ void stats_get_progress_snapshot(progress_snapshot_t *snap) {
                            g_stats.verify_data_enabled;
     snap->verify_only = g_stats.verify_only;
     snap->copy_complete = g_stats.copy_complete;
-    snprintf(snap->current_file, sizeof(snap->current_file), "%s", g_current_file);
     pthread_mutex_unlock(&g_lock);
+    /* Show the first active worker slot, seqlock-consistently. */
+    snap->current_file_done = 0;
+    snap->current_file_total = 0;
+    snap->current_file_parallel = 0;
+    snap->current_file[0] = '\0';
+    for (int i = 0; i < CURRENT_FILE_SLOTS; i++) {
+        if (g_cfile_path[i][0] == '\0') {
+            continue;
+        }
+        uint64_t seq1 = atomic_load_explicit(&a_cfile_seq[i], memory_order_acquire);
+        if (seq1 & 1) {
+            continue;
+        }
+        size_t len = strnlen(g_cfile_path[i], PATH_MAX - 1);
+        uint64_t total = g_cfile_total[i];
+        int parallel = g_cfile_parallel[i];
+        uint64_t done = hot_load(&a_cfile_done[i]);
+        char path[PATH_MAX];
+        memcpy(path, g_cfile_path[i], len + 1);
+        uint64_t seq2 = atomic_load_explicit(&a_cfile_seq[i], memory_order_acquire);
+        if (seq1 != seq2) {
+            continue;
+        }
+        memcpy(snap->current_file, path, len + 1);
+        snap->current_file_total = total;
+        snap->current_file_parallel = parallel;
+        snap->current_file_done = done;
+        break;
+    }
     snap->rolling_gibs = stats_rolling_gibs();
     snap->rolling_completed_gibs = stats_rolling_completed_gibs();
     snap->rolling_files_per_sec = stats_rolling_files_per_sec();
