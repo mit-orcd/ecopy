@@ -93,6 +93,15 @@ typedef struct large_file_ctx {
     large_buffer_t *ready_tail;
     uint64_t free_count;
     uint64_t ready_count;
+    /*
+     * Readers parked on free_cond / writers parked on ready_cond, maintained
+     * under lock around the waits. The buffer handoff signals fire only when
+     * someone is actually parked: at GiB/s chunk rates a per-buffer signal
+     * with no waiter is a wasted futex wake, and with several producers the
+     * first wake already lets the woken side drain the whole list.
+     */
+    int free_waiters;
+    int ready_waiters;
     pthread_t *reader_threads;
     pthread_t *writer_threads;
     int reader_count;
@@ -1552,7 +1561,9 @@ static void *large_reader_main(void *arg)
         pthread_mutex_lock(&ctx->lock);
         while (!ctx->failed && !ctx->free_head && ctx->next_read_offset < ctx->bulk_end) {
             uint64_t wait_start_ns = g_collect_wait_timing ? monotonic_ns() : 0;
+            ctx->free_waiters++;
             pthread_cond_wait(&ctx->free_cond, &ctx->lock);
+            ctx->free_waiters--;
             if (g_collect_wait_timing) {
                 stats_record_reader_buffer_wait_ns(monotonic_ns() - wait_start_ns);
             }
@@ -1641,10 +1652,13 @@ static void *large_reader_main(void *arg)
         if (io_should_sample()) {
             stats_record_ready_queue_depth(ctx->ready_count);
         }
-        pthread_cond_signal(&ctx->ready_cond);
+        if (ctx->ready_waiters > 0) {
+            pthread_cond_signal(&ctx->ready_cond);
+        }
         pthread_mutex_unlock(&ctx->lock);
     }
 
+    stats_flush_io_op_counts();
     return NULL;
 }
 
@@ -1658,7 +1672,9 @@ static void *large_writer_main(void *arg)
         pthread_mutex_lock(&ctx->lock);
         while (!ctx->failed && !ctx->ready_head && !ctx->read_done) {
             uint64_t wait_start_ns = g_collect_wait_timing ? monotonic_ns() : 0;
+            ctx->ready_waiters++;
             pthread_cond_wait(&ctx->ready_cond, &ctx->lock);
+            ctx->ready_waiters--;
             if (g_collect_wait_timing) {
                 stats_record_writer_data_wait_ns(monotonic_ns() - wait_start_ns);
             }
@@ -1718,7 +1734,9 @@ static void *large_writer_main(void *arg)
             }
             enqueue_buffer(&ctx->free_head, &ctx->free_tail, buf);
             ctx->free_count++;
-            pthread_cond_signal(&ctx->free_cond);
+            if (ctx->free_waiters > 0) {
+                pthread_cond_signal(&ctx->free_cond);
+            }
             pthread_mutex_unlock(&ctx->lock);
 
             if (failed) {
@@ -1728,6 +1746,7 @@ static void *large_writer_main(void *arg)
     }
 
     progress_flush_bytes();
+    stats_flush_io_op_counts();
     return NULL;
 }
 
@@ -1834,6 +1853,7 @@ static void *large_finalizer_main(void *arg)
 {
     large_file_ctx_t *ctx = (large_file_ctx_t *)arg;
     finish_large_file_ctx(ctx);
+    stats_flush_io_op_counts();
     return NULL;
 }
 
@@ -2369,6 +2389,7 @@ static void *worker_main(void *arg)
     }
 
     progress_flush_bytes();
+    stats_flush_io_op_counts();
     thread_io_buffer_release();
     telemetry_flush_thread();
     return NULL;

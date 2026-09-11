@@ -292,8 +292,39 @@ void stats_record_write_open(int used_direct) {
 void stats_record_queue_wait_ns(uint64_t ns) { pthread_mutex_lock(&g_lock); g_stats.queue_wait_ns += ns; pthread_mutex_unlock(&g_lock); }
 void stats_record_read_io(uint64_t ns) { hot_add(&a_read_syscalls, 1); hot_add(&a_read_ns, ns); }
 void stats_record_write_io(uint64_t ns) { hot_add(&a_write_syscalls, 1); hot_add(&a_write_ns, ns); }
-void stats_record_read_op(void) { hot_add(&a_read_syscalls, 1); }
-void stats_record_write_op(void) { hot_add(&a_write_syscalls, 1); }
+/*
+ * The per-op syscall counters were bumped on shared cachelines once per
+ * read/write call — at GiB/s chunk rates that is thousands of contended
+ * atomics per second per counter. Accumulate per thread and fold in every
+ * IO_OP_FLUSH_THRESHOLD ops (and at thread exit via the flush below).
+ */
+#define IO_OP_FLUSH_THRESHOLD 64
+
+static __thread uint64_t tls_read_ops = 0;
+static __thread uint64_t tls_write_ops = 0;
+
+void stats_record_read_op(void) {
+    if (++tls_read_ops >= IO_OP_FLUSH_THRESHOLD) {
+        hot_add(&a_read_syscalls, tls_read_ops);
+        tls_read_ops = 0;
+    }
+}
+void stats_record_write_op(void) {
+    if (++tls_write_ops >= IO_OP_FLUSH_THRESHOLD) {
+        hot_add(&a_write_syscalls, tls_write_ops);
+        tls_write_ops = 0;
+    }
+}
+void stats_flush_io_op_counts(void) {
+    if (tls_read_ops > 0) {
+        hot_add(&a_read_syscalls, tls_read_ops);
+        tls_read_ops = 0;
+    }
+    if (tls_write_ops > 0) {
+        hot_add(&a_write_syscalls, tls_write_ops);
+        tls_write_ops = 0;
+    }
+}
 void stats_record_read_time(uint64_t ns) { hot_add(&a_read_ns, ns); }
 void stats_record_write_time(uint64_t ns) { hot_add(&a_write_ns, ns); }
 void stats_record_copy_file_range_io(uint64_t ns) { pthread_mutex_lock(&g_lock); g_stats.copy_file_range_syscalls++; g_stats.copy_file_range_ns += ns; pthread_mutex_unlock(&g_lock); }

@@ -36,6 +36,7 @@ void stats_record_write_io(uint64_t ns);
  */
 void stats_record_read_op(void);
 void stats_record_write_op(void);
+void stats_flush_io_op_counts(void);
 void stats_record_read_time(uint64_t ns);
 void stats_record_write_time(uint64_t ns);
 void stats_record_copy_file_range_io(uint64_t ns);
