@@ -96,10 +96,10 @@ void dir_handle_release(dir_handle_t *dir)
     }
 
     if (dir->src_fd >= 0) {
-        close(dir->src_fd);
+        ecopy_close_nocancel(dir->src_fd);
     }
     if (dir->dst_fd >= 0) {
-        close(dir->dst_fd);
+        ecopy_close_nocancel(dir->dst_fd);
     }
     pthread_mutex_destroy(&dir->lock);
     free(dir);
@@ -179,12 +179,12 @@ static void note_chown_not_preserved(void)
 }
 
 static int open_existing_regular_for_chmod(const char *path) {
-    int fd = open(path, O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    int fd = ecopy_openat_nocancel(AT_FDCWD, path, O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0);
     if (fd < 0 && errno == EACCES) {
-        fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+        fd = ecopy_openat_nocancel(AT_FDCWD, path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0);
     }
     if (fd < 0 && errno == EACCES) {
-        fd = open(path, O_WRONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+        fd = ecopy_openat_nocancel(AT_FDCWD, path, O_WRONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0);
     }
     return fd;
 }
@@ -201,25 +201,25 @@ static int add_owner_rw_to_existing_regular(const char *path) {
 
     if (fstat(fd, &st) != 0) {
         saved_errno = errno;
-        close(fd);
+        ecopy_close_nocancel(fd);
         errno = saved_errno;
         return -1;
     }
     if (!S_ISREG(st.st_mode)) {
-        close(fd);
+        ecopy_close_nocancel(fd);
         errno = S_ISDIR(st.st_mode) ? EISDIR : EINVAL;
         return -1;
     }
 
-    if (fchmod(fd, copy_data_mode(st.st_mode)) != 0) {
+    if (ecopy_fchmod_nocancel(fd, copy_data_mode(st.st_mode)) != 0) {
         saved_errno = errno;
         stats_inc_metadata_error();
-        close(fd);
+        ecopy_close_nocancel(fd);
         errno = saved_errno;
         return -1;
     }
 
-    close(fd);
+    ecopy_close_nocancel(fd);
     return 0;
 }
 
@@ -344,7 +344,7 @@ int open_read_maybe_direct(const char *path, int *used_direct) {
     if (used_direct) *used_direct = 0;
 
     if (read_direct_io_enabled()) {
-        fd = open(path, O_RDONLY | O_DIRECT);
+        fd = ecopy_openat_nocancel(AT_FDCWD, path, O_RDONLY | O_DIRECT, 0);
         if (fd >= 0) {
             int direct = ecopy_set_direct_io(fd) == 0;
             if (used_direct) *used_direct = direct;
@@ -358,7 +358,7 @@ int open_read_maybe_direct(const char *path, int *used_direct) {
         }
     }
 
-    fd = open(path, O_RDONLY);
+    fd = ecopy_openat_nocancel(AT_FDCWD, path, O_RDONLY, 0);
     if (fd < 0) {
         progress_interrupt();
         perror(path);
@@ -377,11 +377,11 @@ int open_read_at_maybe_direct(int dir_fd,
     if (used_direct) *used_direct = 0;
 
     if (read_direct_io_enabled()) {
-        fd = openat(dir_fd, name, O_RDONLY | O_DIRECT | O_CLOEXEC | O_NOFOLLOW);
+        fd = ecopy_openat_nocancel(dir_fd, name, O_RDONLY | O_DIRECT | O_CLOEXEC | O_NOFOLLOW, 0);
         if (fd >= 0) {
             int direct = ecopy_set_direct_io(fd) == 0;
             if (validate_opened_source_file(fd, display_path, expected_st) != 0) {
-                close(fd);
+                ecopy_close_nocancel(fd);
                 return -1;
             }
             if (used_direct) *used_direct = direct;
@@ -395,14 +395,14 @@ int open_read_at_maybe_direct(int dir_fd,
         }
     }
 
-    fd = openat(dir_fd, name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    fd = ecopy_openat_nocancel(dir_fd, name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW, 0);
     if (fd < 0) {
         progress_interrupt();
         perror(display_path);
         return -1;
     }
     if (validate_opened_source_file(fd, display_path, expected_st) != 0) {
-        close(fd);
+        ecopy_close_nocancel(fd);
         return -1;
     }
     stats_record_read_open(0);
@@ -414,14 +414,14 @@ int open_read_at_buffered(int dir_fd,
                           const char *display_path,
                           const struct stat *expected_st)
 {
-    int fd = openat(dir_fd, name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    int fd = ecopy_openat_nocancel(dir_fd, name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW, 0);
     if (fd < 0) {
         progress_interrupt();
         perror(display_path);
         return -1;
     }
     if (validate_opened_source_file(fd, display_path, expected_st) != 0) {
-        close(fd);
+        ecopy_close_nocancel(fd);
         return -1;
     }
     stats_record_read_open(0);
@@ -496,11 +496,11 @@ int open_write_maybe_direct(const char *path, mode_t mode, int *used_direct) {
     }
 
     if (write_direct_io_enabled()) {
-        fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, open_mode);
+        fd = ecopy_openat_nocancel(AT_FDCWD, path, O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, open_mode);
         if (fd < 0 && errno == EACCES) {
             int saved_errno = errno;
             if (add_owner_rw_to_existing_regular(path) == 0) {
-                fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, open_mode);
+                fd = ecopy_openat_nocancel(AT_FDCWD, path, O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, open_mode);
             } else {
                 errno = saved_errno;
             }
@@ -508,13 +508,13 @@ int open_write_maybe_direct(const char *path, mode_t mode, int *used_direct) {
         if (fd >= 0) {
             int direct = ecopy_set_direct_io(fd) == 0;
             if (validate_opened_regular_file(fd, path) != 0) {
-                close(fd);
+                ecopy_close_nocancel(fd);
                 return -1;
             }
-            if (fchmod(fd, open_mode) != 0) {
+            if (ecopy_fchmod_nocancel(fd, open_mode) != 0) {
                 int saved_errno = errno;
                 stats_inc_metadata_error();
-                close(fd);
+                ecopy_close_nocancel(fd);
                 errno = saved_errno;
                 progress_interrupt();
                 perror("fchmod");
@@ -530,11 +530,11 @@ int open_write_maybe_direct(const char *path, mode_t mode, int *used_direct) {
         }
     }
 
-    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, open_mode);
+    fd = ecopy_openat_nocancel(AT_FDCWD, path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, open_mode);
     if (fd < 0 && errno == EACCES) {
         int saved_errno = errno;
         if (add_owner_rw_to_existing_regular(path) == 0) {
-            fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, open_mode);
+            fd = ecopy_openat_nocancel(AT_FDCWD, path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, open_mode);
         } else {
             errno = saved_errno;
         }
@@ -544,13 +544,13 @@ int open_write_maybe_direct(const char *path, mode_t mode, int *used_direct) {
         return -1;
     }
     if (validate_opened_regular_file(fd, path) != 0) {
-        close(fd);
+        ecopy_close_nocancel(fd);
         return -1;
     }
-    if (fchmod(fd, open_mode) != 0) {
+    if (ecopy_fchmod_nocancel(fd, open_mode) != 0) {
         int saved_errno = errno;
         stats_inc_metadata_error();
-        close(fd);
+        ecopy_close_nocancel(fd);
         errno = saved_errno;
         progress_interrupt();
         perror("fchmod");
@@ -569,11 +569,11 @@ int open_write_existing_maybe_direct(const char *path, int *used_direct) {
     }
 
     if (write_direct_io_enabled()) {
-        fd = open(path, O_WRONLY | O_DIRECT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+        fd = ecopy_openat_nocancel(AT_FDCWD, path, O_WRONLY | O_DIRECT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0);
         if (fd < 0 && errno == EACCES) {
             int saved_errno = errno;
             if (add_owner_rw_to_existing_regular(path) == 0) {
-                fd = open(path, O_WRONLY | O_DIRECT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+                fd = ecopy_openat_nocancel(AT_FDCWD, path, O_WRONLY | O_DIRECT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0);
             } else {
                 errno = saved_errno;
             }
@@ -581,7 +581,7 @@ int open_write_existing_maybe_direct(const char *path, int *used_direct) {
         if (fd >= 0) {
             int direct = ecopy_set_direct_io(fd) == 0;
             if (validate_opened_regular_file(fd, path) != 0) {
-                close(fd);
+                ecopy_close_nocancel(fd);
                 return -1;
             }
             if (used_direct) *used_direct = direct;
@@ -594,11 +594,11 @@ int open_write_existing_maybe_direct(const char *path, int *used_direct) {
         }
     }
 
-    fd = open(path, O_WRONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    fd = ecopy_openat_nocancel(AT_FDCWD, path, O_WRONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0);
     if (fd < 0 && errno == EACCES) {
         int saved_errno = errno;
         if (add_owner_rw_to_existing_regular(path) == 0) {
-            fd = open(path, O_WRONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+            fd = ecopy_openat_nocancel(AT_FDCWD, path, O_WRONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0);
         } else {
             errno = saved_errno;
         }
@@ -608,7 +608,7 @@ int open_write_existing_maybe_direct(const char *path, int *used_direct) {
         return -1;
     }
     if (validate_opened_regular_file(fd, path) != 0) {
-        close(fd);
+        ecopy_close_nocancel(fd);
         return -1;
     }
     stats_record_write_open(0);
@@ -622,11 +622,11 @@ int open_write_existing_buffered(const char *path) {
         return -1;
     }
 
-    fd = open(path, O_WRONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    fd = ecopy_openat_nocancel(AT_FDCWD, path, O_WRONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0);
     if (fd < 0 && errno == EACCES) {
         int saved_errno = errno;
         if (add_owner_rw_to_existing_regular(path) == 0) {
-            fd = open(path, O_WRONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+            fd = ecopy_openat_nocancel(AT_FDCWD, path, O_WRONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0);
         } else {
             errno = saved_errno;
         }
@@ -636,7 +636,7 @@ int open_write_existing_buffered(const char *path) {
         return -1;
     }
     if (validate_opened_regular_file(fd, path) != 0) {
-        close(fd);
+        ecopy_close_nocancel(fd);
         return -1;
     }
     stats_record_write_open(0);
@@ -727,7 +727,7 @@ static int open_temp_created_once(int dir_fd,
         flags |= O_DIRECT;
     }
 
-    fd = openat(dir_fd, tmp_name, flags, open_mode);
+    fd = ecopy_openat_nocancel(dir_fd, tmp_name, flags, open_mode);
     if (fd < 0) {
         return -1;
     }
@@ -735,13 +735,13 @@ static int open_temp_created_once(int dir_fd,
         direct = 0;
     }
     if (validate_opened_temp_regular(fd, display_path) != 0) {
-        close(fd);
+        ecopy_close_nocancel(fd);
         return -1;
     }
-    if (fchmod(fd, open_mode) != 0) {
+    if (ecopy_fchmod_nocancel(fd, open_mode) != 0) {
         int saved_errno = errno;
         stats_inc_metadata_error();
-        close(fd);
+        ecopy_close_nocancel(fd);
         errno = saved_errno;
         progress_interrupt();
         perror("fchmod");
@@ -825,7 +825,7 @@ static int open_final_created_once(int dir_fd,
         flags |= O_DIRECT;
     }
 
-    fd = openat(dir_fd, name, flags, open_mode);
+    fd = ecopy_openat_nocancel(dir_fd, name, flags, open_mode);
     if (fd < 0 && errno == EACCES) {
         /*
          * An existing destination that is not owner-writable cannot be opened
@@ -833,7 +833,7 @@ static int open_final_created_once(int dir_fd,
          * the metadata pass) and retry once.
          */
         if (fchmodat(dir_fd, name, open_mode, 0) == 0) {
-            fd = openat(dir_fd, name, flags, open_mode);
+            fd = ecopy_openat_nocancel(dir_fd, name, flags, open_mode);
         }
     }
     if (fd < 0) {
@@ -843,13 +843,13 @@ static int open_final_created_once(int dir_fd,
         direct = 0;
     }
     if (validate_opened_temp_regular(fd, display_path) != 0) {
-        close(fd);
+        ecopy_close_nocancel(fd);
         return -1;
     }
-    if (fchmod(fd, open_mode) != 0) {
+    if (ecopy_fchmod_nocancel(fd, open_mode) != 0) {
         int saved_errno = errno;
         stats_inc_metadata_error();
-        close(fd);
+        ecopy_close_nocancel(fd);
         errno = saved_errno;
         progress_interrupt();
         perror("fchmod");
@@ -912,11 +912,11 @@ int open_temp_write_existing_at_maybe_direct(int dir_fd,
     if (used_direct) *used_direct = 0;
 
     if (write_direct_io_enabled()) {
-        fd = openat(dir_fd, tmp_name, O_WRONLY | O_DIRECT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+        fd = ecopy_openat_nocancel(dir_fd, tmp_name, O_WRONLY | O_DIRECT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0);
         if (fd >= 0) {
             int direct = ecopy_set_direct_io(fd) == 0;
             if (validate_opened_temp_regular(fd, display_path) != 0) {
-                close(fd);
+                ecopy_close_nocancel(fd);
                 return -1;
             }
             if (used_direct) *used_direct = direct;
@@ -937,14 +937,14 @@ int open_temp_write_existing_at_buffered(int dir_fd,
                                          const char *tmp_name,
                                          const char *display_path)
 {
-    int fd = openat(dir_fd, tmp_name, O_WRONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    int fd = ecopy_openat_nocancel(dir_fd, tmp_name, O_WRONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0);
     if (fd < 0) {
         progress_interrupt();
         perror(display_path);
         return -1;
     }
     if (validate_opened_temp_regular(fd, display_path) != 0) {
-        close(fd);
+        ecopy_close_nocancel(fd);
         return -1;
     }
     stats_record_write_open(0);
@@ -1005,7 +1005,7 @@ static int preserve_fd_metadata_impl(int fd,
         if (want_gid == g_self_gid) want_gid = (gid_t)-1;
         int cerr = 0;
         if (want_uid != (uid_t)-1 || want_gid != (gid_t)-1) {
-            if (fchown(fd, want_uid, want_gid) != 0) cerr = errno;
+            if (ecopy_fchown_nocancel(fd, want_uid, want_gid) != 0) cerr = errno;
         }
         int unpreserved = chown_uid_unpreservable(src_st) ||
                           (!gid_settable(src_st->st_gid) && src_st->st_gid != g_self_gid);
@@ -1024,7 +1024,7 @@ static int preserve_fd_metadata_impl(int fd,
     }
 
     if ((known_mode < 0 || (mode_t)known_mode != (src_st->st_mode & 07777)) &&
-        fchmod(fd, src_st->st_mode & 07777) != 0) {
+        ecopy_fchmod_nocancel(fd, src_st->st_mode & 07777) != 0) {
         progress_interrupt();
         if (path_for_warning && *path_for_warning) {
             fprintf(stderr, "%s: ", path_for_warning);
@@ -1056,7 +1056,7 @@ int preserve_fd_metadata(int fd, const char *path_for_warning, const struct stat
 }
 
 int preserve_path_metadata(const char *dst, const struct stat *src_st) {
-    int fd = open(dst, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    int fd = ecopy_openat_nocancel(AT_FDCWD, dst, O_RDONLY | O_CLOEXEC | O_NOFOLLOW, 0);
     if (fd < 0) {
         progress_interrupt();
         stats_inc_metadata_error();
@@ -1069,7 +1069,7 @@ int preserve_path_metadata(const char *dst, const struct stat *src_st) {
     }
 
     int rc = preserve_fd_metadata(fd, dst, src_st);
-    close(fd);
+    ecopy_close_nocancel(fd);
     return rc;
 }
 
@@ -1080,7 +1080,7 @@ int preserve_path_metadata_at(int dir_fd,
                               mode_t expected_type)
 {
     struct stat st;
-    int fd = openat(dir_fd, name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    int fd = ecopy_openat_nocancel(dir_fd, name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0);
     if (fd < 0) {
         progress_interrupt();
         stats_inc_metadata_error();
@@ -1094,7 +1094,7 @@ int preserve_path_metadata_at(int dir_fd,
 
     if (fstat(fd, &st) != 0) {
         int saved_errno = errno;
-        close(fd);
+        ecopy_close_nocancel(fd);
         errno = saved_errno;
         progress_interrupt();
         perror(display_path);
@@ -1102,7 +1102,7 @@ int preserve_path_metadata_at(int dir_fd,
         return -1;
     }
     if ((st.st_mode & S_IFMT) != expected_type) {
-        close(fd);
+        ecopy_close_nocancel(fd);
         progress_interrupt();
         fprintf(stderr, "Target exists but is not the expected type: %s\n", display_path);
         stats_inc_metadata_error();
@@ -1111,7 +1111,7 @@ int preserve_path_metadata_at(int dir_fd,
     }
 
     int rc = preserve_fd_metadata(fd, display_path, src_st);
-    close(fd);
+    ecopy_close_nocancel(fd);
     return rc;
 }
 

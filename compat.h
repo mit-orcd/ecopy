@@ -180,4 +180,59 @@ static inline int ecopy_clear_direct_io(int fd)
 #endif
 }
 
+/*
+ * Non-cancellable variants of the remaining per-file syscalls. glibc's
+ * open/openat/close/ftruncate/fchmod/fchown are deferred cancellation
+ * points, so every call is bracketed with
+ * __pthread_enable_asynccancel/__pthread_disable_asynccancel bookkeeping —
+ * measurable when a worker opens and closes millions of files. ecopy threads
+ * are never cancelled (only joined), so on Linux the syscalls are issued
+ * directly; errno is still set by the syscall() wrapper on error. On Darwin
+ * syscall(2) is deprecated and there is no supported non-cancellable entry
+ * point, so these are simply the plain libc calls.
+ *
+ * ecopy_openat_nocancel() always takes a mode argument (pass 0 when O_CREAT
+ * is absent) and plain open() sites become openat(AT_FDCWD, ...), which is
+ * what glibc's open() resolves to on modern kernels anyway.
+ *
+ * ecopy_close_nocancel() must never be retried on EINTR: after a raw close
+ * syscall the fd state is undefined (Linux releases the fd even when EINTR
+ * is returned), so callers keep the existing no-retry close discipline.
+ */
+#ifdef __linux__
+#include <sys/syscall.h>
+
+static inline int ecopy_openat_nocancel(int dirfd, const char *path,
+                                        int flags, mode_t mode)
+{
+    return (int)syscall(SYS_openat, dirfd, path, flags, mode);
+}
+
+static inline int ecopy_close_nocancel(int fd)
+{
+    return (int)syscall(SYS_close, fd);
+}
+
+static inline int ecopy_ftruncate_nocancel(int fd, off_t len)
+{
+    return (int)syscall(SYS_ftruncate, fd, len);
+}
+
+static inline int ecopy_fchmod_nocancel(int fd, mode_t mode)
+{
+    return (int)syscall(SYS_fchmod, fd, mode);
+}
+
+static inline int ecopy_fchown_nocancel(int fd, uid_t uid, gid_t gid)
+{
+    return (int)syscall(SYS_fchown, fd, uid, gid);
+}
+#else
+#define ecopy_openat_nocancel    openat
+#define ecopy_close_nocancel     close
+#define ecopy_ftruncate_nocancel ftruncate
+#define ecopy_fchmod_nocancel    fchmod
+#define ecopy_fchown_nocancel    fchown
+#endif
+
 #endif /* ECOPY_COMPAT_H */

@@ -1001,7 +1001,7 @@ static int copy_tail_buffered_at(int src_dir_fd,
 
     int fd_out = open_temp_write_existing_at_buffered(dst_dir_fd, tmp_name, dst);
     if (fd_out < 0) {
-        close(fd_in);
+        ecopy_close_nocancel(fd_in);
         return -1;
     }
 
@@ -1010,8 +1010,8 @@ static int copy_tail_buffered_at(int src_dir_fd,
 
     int rc = copy_tail_buffered_fds(fd_in, fd_out, start, end, use_current_file_stats);
 
-    close(fd_in);
-    close(fd_out);
+    ecopy_close_nocancel(fd_in);
+    ecopy_close_nocancel(fd_out);
     return rc;
 }
 
@@ -1176,7 +1176,7 @@ static int copy_file_sparse(file_task_t *task, uint64_t *payload_bytes)
     if (out_direct) {
         /* Reopen the temp buffered: hole boundaries are not guaranteed to be
          * O_DIRECT aligned, and sparse files do not need direct I/O. */
-        close(fd_out);
+        ecopy_close_nocancel(fd_out);
         fd_out = open_temp_write_existing_at_buffered(task->dir->dst_fd, tmp_name, task->dst);
         if (fd_out < 0) {
             fd_out = -1;
@@ -1200,7 +1200,7 @@ static int copy_file_sparse(file_task_t *task, uint64_t *payload_bytes)
 
     /* Set the exact final size so a trailing hole is preserved and the file is
      * never shorter than the source. */
-    if (ftruncate(fd_out, size) != 0) {
+    if (ecopy_ftruncate_nocancel(fd_out, size) != 0) {
         perror("ftruncate");
         goto out;
     }
@@ -1208,7 +1208,7 @@ static int copy_file_sparse(file_task_t *task, uint64_t *payload_bytes)
     if (finalize_copied_file_fd(fd_out, task->dst, &task->src_st) != 0) {
         goto out;
     }
-    if (close(fd_out) != 0) {
+    if (ecopy_close_nocancel(fd_out) != 0) {
         fd_out = -1;
         perror(task->dst);
         goto out;
@@ -1223,10 +1223,10 @@ static int copy_file_sparse(file_task_t *task, uint64_t *payload_bytes)
 
 out:
     if (fd_in >= 0) {
-        close(fd_in);
+        ecopy_close_nocancel(fd_in);
     }
     if (fd_out >= 0) {
-        close(fd_out);
+        ecopy_close_nocancel(fd_out);
     }
     if (target_created) {
         unlink_temp_at(task->dir->dst_fd, tmp_name);
@@ -1295,7 +1295,7 @@ static int copy_file_serial_small(file_task_t *task, uint64_t *payload_bytes)
     }
     target_created = 1;
 
-    if (ftruncate(fd_out, size) != 0) {
+    if (ecopy_ftruncate_nocancel(fd_out, size) != 0) {
         perror("ftruncate");
         goto out;
     }
@@ -1385,7 +1385,7 @@ static int copy_file_serial_small(file_task_t *task, uint64_t *payload_bytes)
         if (finalize_copied_file_fd(fd_out, task->dst, &task->src_st) != 0) {
             goto out;
         }
-        if (close(fd_out) != 0) {
+        if (ecopy_close_nocancel(fd_out) != 0) {
             fd_out = -1;
             perror(task->dst);
             goto out;
@@ -1400,7 +1400,7 @@ static int copy_file_serial_small(file_task_t *task, uint64_t *payload_bytes)
         goto out;
     }
 
-    close(fd_out);
+    ecopy_close_nocancel(fd_out);
     fd_out = -1;
 
     if (copy_tail_buffered_at(task->dir->src_fd,
@@ -1433,10 +1433,10 @@ static int copy_file_serial_small(file_task_t *task, uint64_t *payload_bytes)
 
 out:
     if (fd_in >= 0) {
-        close(fd_in);
+        ecopy_close_nocancel(fd_in);
     }
     if (fd_out >= 0) {
-        close(fd_out);
+        ecopy_close_nocancel(fd_out);
     }
     if (target_created) {
         /*
@@ -1681,7 +1681,7 @@ static void finish_large_file_ctx(large_file_ctx_t *ctx)
             rc = -1;
         } else if (finalize_copied_file_fd(ctx->fd_out, ctx->dst, &ctx->src_st) != 0) {
             rc = -1;
-        } else if (close(ctx->fd_out) != 0) {
+        } else if (ecopy_close_nocancel(ctx->fd_out) != 0) {
             ctx->fd_out = -1;
             perror(ctx->dst);
             rc = -1;
@@ -1716,10 +1716,10 @@ static void finish_large_file_ctx(large_file_ctx_t *ctx)
     }
 
     if (ctx->fd_in >= 0) {
-        close(ctx->fd_in);
+        ecopy_close_nocancel(ctx->fd_in);
     }
     if (ctx->fd_out >= 0) {
-        close(ctx->fd_out);
+        ecopy_close_nocancel(ctx->fd_out);
     }
     if (rc != 0) {
         unlink_temp_at(ctx->dir->dst_fd, ctx->tmp_name);
@@ -1826,7 +1826,7 @@ static int start_large_file_copy(file_task_t *task)
          * case fall back to sizing with ftruncate() only.
          */
         if (workers_file_is_sparse(&ctx->src_st)) {
-            if (ftruncate(ctx->fd_out, ctx->src_st.st_size) != 0) {
+            if (ecopy_ftruncate_nocancel(ctx->fd_out, ctx->src_st.st_size) != 0) {
                 perror("ftruncate");
                 goto fail;
             }
@@ -1835,7 +1835,7 @@ static int start_large_file_copy(file_task_t *task)
                 perror("fallocate");
                 goto fail;
             }
-            if (ftruncate(ctx->fd_out, ctx->src_st.st_size) != 0) {
+            if (ecopy_ftruncate_nocancel(ctx->fd_out, ctx->src_st.st_size) != 0) {
                 perror("ftruncate");
                 goto fail;
             }
@@ -1901,10 +1901,10 @@ fail_started:
 
 fail:
     if (ctx->fd_in >= 0) {
-        close(ctx->fd_in);
+        ecopy_close_nocancel(ctx->fd_in);
     }
     if (ctx->fd_out >= 0) {
-        close(ctx->fd_out);
+        ecopy_close_nocancel(ctx->fd_out);
     }
     unlink_temp_at(ctx->dir ? ctx->dir->dst_fd : AT_FDCWD, ctx->tmp_name);
     dir_handle_release(ctx->dir);
@@ -2041,17 +2041,17 @@ static int copy_file_remote_putfile(file_task_t *task, off_t size)
     buf = thread_io_buffer((size_t)(size > 0 ? size : 1));
     if (!buf) {
         fprintf(stderr, "thread_io_buffer failed\n");
-        close(fd_in);
+        ecopy_close_nocancel(fd_in);
         return -1;
     }
 
     while (pos < size) {
         ssize_t r = pread_nocancel(fd_in, (char *)buf + pos, (size_t)(size - pos), pos);
-        if (r < 0) { perror("pread"); close(fd_in); return -1; }
+        if (r < 0) { perror("pread"); ecopy_close_nocancel(fd_in); return -1; }
         if (r == 0) break; /* file shrank under us; send what we have */
         pos += r;
     }
-    close(fd_in);
+    ecopy_close_nocancel(fd_in);
 
     if (sshx_putfile(task->dst, &task->src_st, task->dir->src_mode,
                      buf, (size_t)pos,
@@ -2180,7 +2180,7 @@ out:
         sshx_file_abort(f);
     }
     if (fd_in >= 0) {
-        close(fd_in);
+        ecopy_close_nocancel(fd_in);
     }
     stats_clear_current_file(task->src);
     return rc;
