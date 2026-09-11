@@ -1978,6 +1978,23 @@ static work_claim_t dequeue_work(file_task_t **stash, int *stash_head,
                 pthread_cond_signal(&g_space_cond);
                 total_slots_used++;
             }
+            /*
+             * The stash is drained over the next several file copies, and
+             * each task struct was last written by a traversal thread, i.e.
+             * it currently lives in another core's cache. Pull the fixed
+             * part (and the first tail line with the path strings) into this
+             * core's cache now so the per-file loop does not stall on the
+             * cross-core handoff. stash[0] is dispatched immediately, so
+             * prefetching it would have no lead time.
+             */
+            for (int k = 1; k < *stash_count; k++) {
+                const char *p = (const char *)stash[k];
+                __builtin_prefetch(p, 0, 3);
+                __builtin_prefetch(p + 64, 0, 3);
+                __builtin_prefetch(p + 128, 0, 3);
+                __builtin_prefetch(p + 192, 0, 3);
+                __builtin_prefetch(p + 256, 0, 3);
+            }
             claim.kind = WORK_SMALL_FILE;
             claim.file_task = stash[(*stash_head)++];
             break;
