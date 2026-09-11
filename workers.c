@@ -896,6 +896,14 @@ static int copy_file_range_with_progress(int fd_in,
     return 0;
 }
 
+/*
+ * Alignment-tail copy (the last size % ALIGNMENT bytes of a direct-I/O file,
+ * or the whole file when it is smaller than one aligned chunk). Offset-based
+ * pread/pwrite_nocancel keep this path free of the lseek pair and of glibc's
+ * per-syscall cancellation bookkeeping; timing is sampled like the bulk loop
+ * instead of paying four clock_gettime calls per chunk. Small-file trees run
+ * almost entirely through here, so the per-call overhead matters.
+ */
 static int copy_tail_buffered_fds(int fd_in,
                                  int fd_out,
                                  off_t start,
@@ -904,16 +912,6 @@ static int copy_tail_buffered_fds(int fd_in,
 {
     if (start >= end) {
         return 0;
-    }
-
-    if (lseek(fd_in, start, SEEK_SET) < 0) {
-        perror("lseek src");
-        return -1;
-    }
-
-    if (lseek(fd_out, start, SEEK_SET) < 0) {
-        perror("lseek dst");
-        return -1;
     }
 
     {
@@ -926,9 +924,13 @@ static int copy_tail_buffered_fds(int fd_in,
             size_t len = (size_t)this_len_off;
             off_t chunk_start = pos;
 
-            uint64_t read_start_ns = monotonic_ns();
-            ssize_t r = read(fd_in, buf, len);
-            stats_record_read_io(monotonic_ns() - read_start_ns);
+            int r_timed = io_should_sample();
+            uint64_t read_start_ns = r_timed ? monotonic_ns() : 0;
+            ssize_t r = pread_nocancel(fd_in, buf, len, pos);
+            stats_record_read_op();
+            if (r_timed) {
+                stats_record_read_time((monotonic_ns() - read_start_ns) * IO_SAMPLE_PERIOD);
+            }
             if (r < 0) {
                 perror("read tail");
                 return -1;
@@ -940,9 +942,14 @@ static int copy_tail_buffered_fds(int fd_in,
             {
                 size_t done = 0;
                 while (done < (size_t)r) {
-                    uint64_t write_start_ns = monotonic_ns();
-                    ssize_t w = write(fd_out, buf + done, (size_t)r - done);
-                    stats_record_write_io(monotonic_ns() - write_start_ns);
+                    int w_timed = io_should_sample();
+                    uint64_t write_start_ns = w_timed ? monotonic_ns() : 0;
+                    ssize_t w = pwrite_nocancel(fd_out, buf + done, (size_t)r - done,
+                                                pos + (off_t)done);
+                    stats_record_write_op();
+                    if (w_timed) {
+                        stats_record_write_time((monotonic_ns() - write_start_ns) * IO_SAMPLE_PERIOD);
+                    }
                     if (w < 0) {
                         perror("write tail");
                         return -1;
