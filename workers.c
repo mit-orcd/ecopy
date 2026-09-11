@@ -527,13 +527,22 @@ static int heap_reserve(task_heap_t *h, size_t need)
     return 0;
 }
 
+/*
+ * The heaps are 4-ary: depth is log4(n) instead of log2(n) and the four
+ * children of a node occupy one or two adjacent cache lines, so sift-down
+ * costs about half the dependent cache misses of the binary version at the
+ * queue depths a big tree actually reaches (100k+ entries). Pop ordering is
+ * unchanged: always the highest sched_key.
+ */
+#define HEAP_ARITY 4
+
 /* Push a task whose sched_key is set. Capacity must be reserved by the caller. */
 static void heap_push(task_heap_t *h, file_task_t *t)
 {
     size_t i = h->len++;
     uint64_t key = t->sched_key;
     while (i > 0) {
-        size_t parent = (i - 1) / 2;
+        size_t parent = (i - 1) / HEAP_ARITY;
         if (h->items[parent].key >= key) {
             break;
         }
@@ -553,17 +562,20 @@ static file_task_t *heap_pop_max(task_heap_t *h)
         size_t i = 0;
         uint64_t key = node.key;
         for (;;) {
-            size_t l = 2 * i + 1;
-            size_t r = 2 * i + 2;
+            size_t child = HEAP_ARITY * i + 1;
             size_t best = i;
             uint64_t best_key = key;
-            if (l < h->len && h->items[l].key > best_key) {
-                best = l;
-                best_key = h->items[l].key;
-            }
-            if (r < h->len && h->items[r].key > best_key) {
-                best = r;
-                best_key = h->items[r].key;
+            if (child < h->len) {
+                size_t last = child + (HEAP_ARITY - 1);
+                if (last >= h->len) {
+                    last = h->len - 1;
+                }
+                for (; child <= last; child++) {
+                    if (h->items[child].key > best_key) {
+                        best = child;
+                        best_key = h->items[child].key;
+                    }
+                }
             }
             if (best == i) {
                 break;
