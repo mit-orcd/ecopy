@@ -138,6 +138,13 @@ static pthread_cond_t  g_queue_cond = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t  g_space_cond = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t  g_large_done_cond = PTHREAD_COND_INITIALIZER;
 /*
+ * Number of worker threads parked in pthread_cond_wait(&g_queue_cond),
+ * incremented/decremented around the wait under g_queue_lock. The enqueue
+ * side reads it under the same lock to skip futex wakes nobody can consume
+ * and to cap how many workers a batch wakes.
+ */
+static int              g_queue_waiters;
+/*
  * Dispatch queues are max-heaps keyed by file_task_t.sched_key (see enqueue),
  * so the backlog drains biggest-data-first rather than FIFO. The small/large
  * split is unchanged (it selects the execution path and slot budget); only the
@@ -2033,7 +2040,9 @@ static work_claim_t dequeue_work(file_task_t **stash, int *stash_head,
 
         {
             uint64_t wait_start_ns = g_collect_wait_timing ? monotonic_ns() : 0;
+            g_queue_waiters++;
             pthread_cond_wait(&g_queue_cond, &g_queue_lock);
+            g_queue_waiters--;
             if (g_collect_wait_timing) {
                 stats_record_queue_wait_ns(monotonic_ns() - wait_start_ns);
             }
@@ -2642,7 +2651,21 @@ int workers_enqueue_batch(dir_handle_t *dir,
                 }
             }
 
-            for (int i = 0; i < large_wake + small_wake; i++) {
+            /*
+             * One woken worker batch-claims up to SMALL_CLAIM_BATCH small
+             * tasks, so signaling once per enqueued task over-wakes ~8x:
+             * every signal that finds a waiter is a futex wake plus the
+             * woken thread's lock reacquisition. Wake only as many workers
+             * as can actually claim, and only when someone is parked.
+             * Under-waking cannot strand work: any worker returning from a
+             * copy pops the heap again before it would wait.
+             */
+            int wakes = large_wake +
+                        (small_wake + SMALL_CLAIM_BATCH - 1) / SMALL_CLAIM_BATCH;
+            if (wakes > g_queue_waiters) {
+                wakes = g_queue_waiters;
+            }
+            for (int i = 0; i < wakes; i++) {
                 pthread_cond_signal(&g_queue_cond);
             }
         }

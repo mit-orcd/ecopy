@@ -71,6 +71,9 @@ static uint64_t g_pending_count;
 static uint64_t g_pending_peak;
 static pthread_mutex_t g_queue_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_queue_cv = PTHREAD_COND_INITIALIZER;
+/* Feeder threads parked on g_queue_cv, maintained under g_queue_lock so
+ * producers can skip the futex wake when the pipeline has nobody waiting. */
+static int g_queue_cv_waiters;
 static _Atomic uint64_t g_run_queue_depth;
 static _Atomic uint64_t g_run_active;
 static atomic_flag g_atime_warning = ATOMIC_FLAG_INIT;
@@ -235,8 +238,12 @@ int verify_queue_file(const char *src, const char *dst,
     if (item) {
         item->durable = durable ? 1 : 0;
         append_queued_item_locked(item);
-        /* Wake the feeder (a no-op when the pipeline is not running). */
-        pthread_cond_signal(&g_queue_cv);
+        /* Wake the feeder (a no-op when the pipeline is not running). The
+         * feeder's 250 ms timed wait is also its generation-flush tick, so
+         * skipping the wake when it is not parked only defers the flush. */
+        if (g_queue_cv_waiters > 0) {
+            pthread_cond_signal(&g_queue_cv);
+        }
     }
     pthread_mutex_unlock(&g_queue_lock);
     return item ? 0 : -1;
@@ -1176,11 +1183,14 @@ static void *verify_feeder_main(void *arg)
                 ts.tv_sec += 1;
                 ts.tv_nsec -= 1000000000L;
             }
+            g_queue_cv_waiters++;
             if (pthread_cond_timedwait(&g_queue_cv, &g_queue_lock, &ts) ==
                 ETIMEDOUT) {
+                g_queue_cv_waiters--;
                 timed_out = 1;
                 break;
             }
+            g_queue_cv_waiters--;
         }
         verify_item_t *batch = g_head;
         g_head = g_tail = NULL;
