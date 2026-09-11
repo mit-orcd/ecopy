@@ -143,11 +143,20 @@ static pthread_cond_t  g_large_done_cond = PTHREAD_COND_INITIALIZER;
  * split is unchanged (it selects the execution path and slot budget); only the
  * ordering within each queue changed. Both are guarded by g_queue_lock; len is
  * the queue depth reported to progress and used for backpressure.
+ *
+ * Heap entries carry the ordering key inline: sift comparisons previously
+ * dereferenced file_task_t pointers (scattered, cache-line-sized structs) at
+ * every level, which made heap_pop_max the top CPU consumer under perf.
  */
 typedef struct {
-    file_task_t **items;
-    size_t        len;
-    size_t        cap;
+    uint64_t     key;
+    file_task_t *task;
+} task_heap_entry_t;
+
+typedef struct {
+    task_heap_entry_t *items;
+    size_t             len;
+    size_t             cap;
 } task_heap_t;
 static task_heap_t     g_small_heap;
 static task_heap_t     g_large_heap;
@@ -509,7 +518,7 @@ static int heap_reserve(task_heap_t *h, size_t need)
     while (ncap < need) {
         ncap *= 2;
     }
-    file_task_t **ni = realloc(h->items, ncap * sizeof(*ni));
+    task_heap_entry_t *ni = realloc(h->items, ncap * sizeof(*ni));
     if (!ni) {
         return -1;
     }
@@ -525,35 +534,36 @@ static void heap_push(task_heap_t *h, file_task_t *t)
     uint64_t key = t->sched_key;
     while (i > 0) {
         size_t parent = (i - 1) / 2;
-        if (h->items[parent]->sched_key >= key) {
+        if (h->items[parent].key >= key) {
             break;
         }
         h->items[i] = h->items[parent];
         i = parent;
     }
-    h->items[i] = t;
+    h->items[i].key = key;
+    h->items[i].task = t;
 }
 
 /* Remove and return the highest-key task. Caller ensures h->len > 0. */
 static file_task_t *heap_pop_max(task_heap_t *h)
 {
-    file_task_t *top = h->items[0];
-    file_task_t *node = h->items[--h->len];
-    h->items[h->len] = NULL;
+    file_task_t *top = h->items[0].task;
+    task_heap_entry_t node = h->items[--h->len];
     if (h->len > 0) {
         size_t i = 0;
-        uint64_t key = node->sched_key;
+        uint64_t key = node.key;
         for (;;) {
             size_t l = 2 * i + 1;
             size_t r = 2 * i + 2;
             size_t best = i;
             uint64_t best_key = key;
-            if (l < h->len && h->items[l]->sched_key > best_key) {
+            if (l < h->len && h->items[l].key > best_key) {
                 best = l;
-                best_key = h->items[l]->sched_key;
+                best_key = h->items[l].key;
             }
-            if (r < h->len && h->items[r]->sched_key > best_key) {
+            if (r < h->len && h->items[r].key > best_key) {
                 best = r;
+                best_key = h->items[r].key;
             }
             if (best == i) {
                 break;
@@ -1897,10 +1907,28 @@ static int total_worker_slots_used_locked(void)
     return (int)g_small_workers_active + (int)(g_large_workers_active * (uint64_t)g_large_worker_count);
 }
 
-static work_claim_t dequeue_work(void)
+/*
+ * Small-file claims are refilled in batches: a worker pops up to
+ * SMALL_CLAIM_BATCH tasks under one g_queue_lock acquisition into a local
+ * stash and only re-enters the scheduler when the stash is empty, cutting
+ * lock round-trips and heap sift traffic per dispatched file. Stash entries
+ * are consumed in pop order, so biggest-first dispatch is unchanged. Stashed
+ * tasks stay counted in g_small_workers_active until completed, so slot
+ * accounting and the shutdown condition are unaffected.
+ */
+#define SMALL_CLAIM_BATCH 8
+
+static work_claim_t dequeue_work(file_task_t **stash, int *stash_head,
+                                 int *stash_count)
 {
     work_claim_t claim;
     memset(&claim, 0, sizeof(claim));
+
+    if (*stash_head < *stash_count) {
+        claim.kind = WORK_SMALL_FILE;
+        claim.file_task = stash[(*stash_head)++];
+        return claim;
+    }
 
     pthread_mutex_lock(&g_queue_lock);
 
@@ -1920,10 +1948,19 @@ static work_claim_t dequeue_work(void)
         if (g_small_heap.len > 0 &&
             (int)g_small_workers_active < g_small_worker_limit &&
             total_slots_used + 1 <= g_worker_count) {
+            *stash_head = 0;
+            *stash_count = 0;
+            while (*stash_count < SMALL_CLAIM_BATCH &&
+                   g_small_heap.len > 0 &&
+                   (int)g_small_workers_active < g_small_worker_limit &&
+                   total_slots_used + 1 <= g_worker_count) {
+                stash[(*stash_count)++] = heap_pop_max(&g_small_heap);
+                g_small_workers_active++;
+                pthread_cond_signal(&g_space_cond);
+                total_slots_used++;
+            }
             claim.kind = WORK_SMALL_FILE;
-            claim.file_task = heap_pop_max(&g_small_heap);
-            g_small_workers_active++;
-            pthread_cond_signal(&g_space_cond);
+            claim.file_task = stash[(*stash_head)++];
             break;
         }
 
@@ -2117,12 +2154,16 @@ out:
 
 static void *worker_main(void *arg)
 {
+    file_task_t *stash[SMALL_CLAIM_BATCH];
+    int stash_head = 0;
+    int stash_count = 0;
+
     /* Bind this worker to one SSH connection of the pool so a streamed file's
      * OPEN/WRITE/COMMIT frames all land on the same server (a no-op locally). */
     sshx_bind_thread((int)(intptr_t)arg);
 
     for (;;) {
-        work_claim_t claim = dequeue_work();
+        work_claim_t claim = dequeue_work(stash, &stash_head, &stash_count);
         if (claim.kind == WORK_NONE) {
             break;
         }
@@ -2278,12 +2319,12 @@ void workers_stop(void)
      * drains both heaps to empty) and release the heap backing arrays.
      */
     for (size_t i = 0; i < g_small_heap.len; i++) {
-        dir_handle_release(g_small_heap.items[i]->dir);
-        free(g_small_heap.items[i]);
+        dir_handle_release(g_small_heap.items[i].task->dir);
+        free(g_small_heap.items[i].task);
     }
     for (size_t i = 0; i < g_large_heap.len; i++) {
-        dir_handle_release(g_large_heap.items[i]->dir);
-        free(g_large_heap.items[i]);
+        dir_handle_release(g_large_heap.items[i].task->dir);
+        free(g_large_heap.items[i].task);
     }
     free(g_small_heap.items);
     g_small_heap.items = NULL;
