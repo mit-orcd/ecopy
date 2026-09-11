@@ -57,6 +57,12 @@ mkdir -p "$tmp/src_atomic" "$tmp/dst_atomic"
 printf 'old-destination\n' > "$tmp/dst_atomic/file.txt"
 chmod 0444 "$tmp/dst_atomic/file.txt"
 printf 'new-source-data\n' > "$tmp/src_atomic/file.txt"
+# Both files are 16 bytes, so the copy must not rely on mtime alone to tell
+# them apart: on filesystems with jiffy-granular mtimes (e.g. XFS) the two
+# printfs above can land in the same tick, making size+mtime match and the
+# file eligible for the up-to-date skip. Pin the destination to an
+# unambiguously old mtime so the overwrite path is always exercised.
+touch -t 200102030405.06 "$tmp/dst_atomic/file.txt"
 run_ecopy "$tmp/src_atomic" "$tmp/dst_atomic" >/dev/null
 if [[ "$(cat "$tmp/dst_atomic/file.txt")" != "new-source-data" ]]; then
     echo "readonly overwrite did not replace through temp file" >&2
