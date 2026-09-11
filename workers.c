@@ -132,6 +132,29 @@ static off_t g_ssh_putfile_max = 0;   /* max size streamed as one PUTFILE frame 
 
 #define MAX_LARGE_BUFFER_BUDGET_MB 8192
 
+/*
+ * Batched pipeline handoff: readers/writers claim up to this many chunk
+ * buffers per lock hold and signal once per batch instead of once per buffer.
+ * At 1 MiB chunks and multi-GiB/s per-file rates the per-buffer
+ * lock + cond_signal + wake cycle dominated the large-file profile (~46%
+ * pthread sync on a 9 GiB/s wire-bound fstor007 run). The effective batch is
+ * additionally capped at a quarter of the inflight pool so one thread cannot
+ * monopolize the buffers of a small pool.
+ */
+#define LARGE_PIPE_BATCH_MAX 4
+
+static int large_pipe_batch(void)
+{
+    int b = g_large_file_inflight / 4;
+    if (b < 1) {
+        b = 1;
+    }
+    if (b > LARGE_PIPE_BATCH_MAX) {
+        b = LARGE_PIPE_BATCH_MAX;
+    }
+    return b;
+}
+
 /* -------------------- scheduler state -------------------- */
 
 static pthread_mutex_t g_queue_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -1550,13 +1573,13 @@ out:
 static void *large_reader_main(void *arg)
 {
     large_file_ctx_t *ctx = (large_file_ctx_t *)arg;
+    const int batch_max = large_pipe_batch();
 
     for (;;) {
-        large_buffer_t *buf;
-        off_t offset;
-        off_t remain;
-        off_t this_len_off;
-        size_t len;
+        large_buffer_t *batch[LARGE_PIPE_BATCH_MAX];
+        int n = 0;
+        int read_failed = 0;
+        int i;
 
         pthread_mutex_lock(&ctx->lock);
         while (!ctx->failed && !ctx->free_head && ctx->next_read_offset < ctx->bulk_end) {
@@ -1579,66 +1602,65 @@ static void *large_reader_main(void *arg)
             break;
         }
 
-        buf = dequeue_buffer(&ctx->free_head, &ctx->free_tail);
-        if (ctx->free_count > 0) {
-            ctx->free_count--;
+        /* Claim up to batch_max free buffers and assign their read ranges in
+         * a single lock hold. */
+        while (n < batch_max && ctx->free_head && ctx->next_read_offset < ctx->bulk_end) {
+            off_t offset;
+            off_t remain;
+            off_t this_len_off;
+            large_buffer_t *b = dequeue_buffer(&ctx->free_head, &ctx->free_tail);
+            if (ctx->free_count > 0) {
+                ctx->free_count--;
+            }
+            offset = ctx->next_read_offset;
+            remain = ctx->bulk_end - offset;
+            this_len_off = (remain >= g_chunk_size) ? g_chunk_size : remain;
+            b->offset = offset;
+            b->len = (size_t)this_len_off;
+            ctx->next_read_offset += this_len_off;
+            batch[n++] = b;
         }
-        offset = ctx->next_read_offset;
-        remain = ctx->bulk_end - offset;
-        this_len_off = (remain >= g_chunk_size) ? g_chunk_size : remain;
-        len = (size_t)this_len_off;
-        ctx->next_read_offset += this_len_off;
         pthread_mutex_unlock(&ctx->lock);
 
-        {
+        for (i = 0; i < n; i++) {
             int timed = io_should_sample();
             uint64_t read_start_ns = timed ? monotonic_ns() : 0;
-            ssize_t r = pread_nocancel(ctx->fd_in, buf->data, len, offset);
+            ssize_t r = pread_nocancel(ctx->fd_in, batch[i]->data, batch[i]->len,
+                                       batch[i]->offset);
             stats_record_read_op();
             if (timed) {
                 stats_record_read_time((monotonic_ns() - read_start_ns) * IO_SAMPLE_PERIOD);
             }
             if (r < 0) {
                 perror("pread");
-                pthread_mutex_lock(&ctx->lock);
-                mark_large_file_failed_locked(ctx);
-                enqueue_buffer(&ctx->free_head, &ctx->free_tail, buf);
-                ctx->free_count++;
-                ctx->active_readers--;
-                if (ctx->active_readers == 0) {
-                    ctx->read_done = 1;
-                }
-                pthread_mutex_unlock(&ctx->lock);
+                read_failed = 1;
                 break;
             }
-            if ((size_t)r != len) {
+            if ((size_t)r != batch[i]->len) {
                 fprintf(stderr, "short pread at off %lld: expected %zu got %zd\n",
-                        (long long)offset, len, r);
-                pthread_mutex_lock(&ctx->lock);
-                mark_large_file_failed_locked(ctx);
-                enqueue_buffer(&ctx->free_head, &ctx->free_tail, buf);
-                ctx->free_count++;
-                ctx->active_readers--;
-                if (ctx->active_readers == 0) {
-                    ctx->read_done = 1;
-                }
-                pthread_mutex_unlock(&ctx->lock);
+                        (long long)batch[i]->offset, batch[i]->len, r);
+                read_failed = 1;
                 break;
             }
-        }
-
-        buf->offset = offset;
-        buf->len = len;
-        /* With O_DIRECT the source never enters the page cache, so dropping it
-         * is a wasted syscall per chunk; only advise for buffered reads. */
-        if (!ctx->in_direct) {
-            advise_source_consumed(ctx->fd_in, offset, (off_t)len);
+            /* With O_DIRECT the source never enters the page cache, so dropping it
+             * is a wasted syscall per chunk; only advise for buffered reads. */
+            if (!ctx->in_direct) {
+                advise_source_consumed(ctx->fd_in, batch[i]->offset, (off_t)batch[i]->len);
+            }
         }
 
         pthread_mutex_lock(&ctx->lock);
+        if (read_failed) {
+            mark_large_file_failed_locked(ctx);
+        }
         if (ctx->failed) {
-            enqueue_buffer(&ctx->free_head, &ctx->free_tail, buf);
-            ctx->free_count++;
+            /* The file is being torn down; return every buffer we hold to the
+             * free list so finish_large_file_ctx() can reclaim it (only the
+             * free/ready lists are freed). */
+            for (i = 0; i < n; i++) {
+                enqueue_buffer(&ctx->free_head, &ctx->free_tail, batch[i]);
+                ctx->free_count++;
+            }
             pthread_cond_broadcast(&ctx->free_cond);
             ctx->active_readers--;
             if (ctx->active_readers == 0) {
@@ -1647,8 +1669,10 @@ static void *large_reader_main(void *arg)
             pthread_mutex_unlock(&ctx->lock);
             break;
         }
-        enqueue_buffer(&ctx->ready_head, &ctx->ready_tail, buf);
-        ctx->ready_count++;
+        for (i = 0; i < n; i++) {
+            enqueue_buffer(&ctx->ready_head, &ctx->ready_tail, batch[i]);
+            ctx->ready_count++;
+        }
         if (io_should_sample()) {
             stats_record_ready_queue_depth(ctx->ready_count);
         }
@@ -1665,9 +1689,13 @@ static void *large_reader_main(void *arg)
 static void *large_writer_main(void *arg)
 {
     large_file_ctx_t *ctx = (large_file_ctx_t *)arg;
+    const int batch_max = large_pipe_batch();
 
     for (;;) {
-        large_buffer_t *buf;
+        large_buffer_t *batch[LARGE_PIPE_BATCH_MAX];
+        int n = 0;
+        int failed = 0;
+        int i;
 
         pthread_mutex_lock(&ctx->lock);
         while (!ctx->failed && !ctx->ready_head && !ctx->read_done) {
@@ -1686,26 +1714,28 @@ static void *large_writer_main(void *arg)
             break;
         }
 
-        buf = dequeue_buffer(&ctx->ready_head, &ctx->ready_tail);
-        if (ctx->ready_count > 0) {
-            ctx->ready_count--;
+        /* Drain up to batch_max ready buffers in a single lock hold. */
+        while (n < batch_max && ctx->ready_head) {
+            batch[n++] = dequeue_buffer(&ctx->ready_head, &ctx->ready_tail);
+            if (ctx->ready_count > 0) {
+                ctx->ready_count--;
+            }
         }
         if (io_should_sample()) {
             stats_record_ready_queue_depth(ctx->ready_count);
         }
         pthread_mutex_unlock(&ctx->lock);
 
-        {
+        for (i = 0; i < n; i++) {
             size_t done = 0;
-            int failed = 0;
 
-            while (done < buf->len) {
+            while (done < batch[i]->len) {
                 int timed = io_should_sample();
                 uint64_t write_start_ns = timed ? monotonic_ns() : 0;
                 ssize_t w = pwrite_nocancel(ctx->fd_out,
-                                            (char *)buf->data + done,
-                                            buf->len - done,
-                                            buf->offset + (off_t)done);
+                                            (char *)batch[i]->data + done,
+                                            batch[i]->len - done,
+                                            batch[i]->offset + (off_t)done);
                 stats_record_write_op();
                 if (timed) {
                     stats_record_write_time((monotonic_ns() - write_start_ns) * IO_SAMPLE_PERIOD);
@@ -1717,31 +1747,36 @@ static void *large_writer_main(void *arg)
                 }
                 if (w == 0) {
                     fprintf(stderr, "zero pwrite at off %lld\n",
-                            (long long)(buf->offset + (off_t)done));
+                            (long long)(batch[i]->offset + (off_t)done));
                     failed = 1;
                     break;
                 }
                 done += (size_t)w;
             }
-
-            if (!failed) {
-                progress_add_bytes_batched((uint64_t)buf->len);
-            }
-
-            pthread_mutex_lock(&ctx->lock);
-            if (failed) {
-                mark_large_file_failed_locked(ctx);
-            }
-            enqueue_buffer(&ctx->free_head, &ctx->free_tail, buf);
-            ctx->free_count++;
-            if (ctx->free_waiters > 0) {
-                pthread_cond_signal(&ctx->free_cond);
-            }
-            pthread_mutex_unlock(&ctx->lock);
-
             if (failed) {
                 break;
             }
+            progress_add_bytes_batched((uint64_t)batch[i]->len);
+        }
+
+        pthread_mutex_lock(&ctx->lock);
+        if (failed) {
+            mark_large_file_failed_locked(ctx);
+        }
+        /* Return the whole batch (written or not) to the free list so the
+         * readers get one coalesced wake and finish_large_file_ctx() reclaims
+         * every buffer. */
+        for (i = 0; i < n; i++) {
+            enqueue_buffer(&ctx->free_head, &ctx->free_tail, batch[i]);
+            ctx->free_count++;
+        }
+        if (ctx->free_waiters > 0) {
+            pthread_cond_signal(&ctx->free_cond);
+        }
+        pthread_mutex_unlock(&ctx->lock);
+
+        if (failed) {
+            break;
         }
     }
 
