@@ -42,6 +42,20 @@
 #define VERIFY_PIPELINE_OPS_DEFAULT 4096
 
 /*
+ * Bound on the verify intake queue (files awaiting the checker pool). Each
+ * queued item carries two heap path strings (~300+ B), so an unbounded queue
+ * grows without limit whenever verification is slower than the copy/scan
+ * side — on a 1.25e9-file run with 30 TiB to hash that exceeded 200 GiB and
+ * tripped the OOM killer. Producers block once this many items are pending.
+ * 256k items ~= 100 MB worst case and is far more slack than the checker pool
+ * (workers x 4 slots) can ever keep busy. Override with
+ * DIRECT_COPY_VERIFY_QUEUE_MAX.
+ */
+#define VERIFY_QUEUE_MAX_DEFAULT 262144
+#define VERIFY_QUEUE_MAX_MIN 1024
+#define VERIFY_QUEUE_MAX_LIMIT 100000000
+
+/*
  * Dispatch ordering. When 1 (default), copy workers drain the backlog
  * biggest-allocated-data-first so large files start streaming and fill
  * bandwidth as soon as the crawler discovers them (weight is

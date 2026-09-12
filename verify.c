@@ -38,18 +38,8 @@ typedef struct verify_item {
     int skipped;
     int is_dir;
     int durable;
-    int arena_owned;
-    int dst_heap;
     struct verify_item *next;
 } verify_item_t;
-
-#define VERIFY_ARENA_CHUNK_SIZE (1024u * 1024u)
-typedef struct verify_arena_chunk {
-    struct verify_arena_chunk *next;
-    size_t used;
-    max_align_t align;
-    unsigned char data[VERIFY_ARENA_CHUNK_SIZE];
-} verify_arena_chunk_t;
 
 typedef struct {
     int metadata;
@@ -65,15 +55,26 @@ static verify_item_t *g_head;          /* file intake list (fed to the pool) */
 static verify_item_t *g_tail;
 static verify_item_t *g_dir_head;      /* directory items, held until finish */
 static verify_item_t *g_dir_tail;
-static verify_arena_chunk_t *g_arena_head;
-static verify_arena_chunk_t *g_arena_tail;
 static uint64_t g_pending_count;
 static uint64_t g_pending_peak;
+/*
+ * Bound on the file intake list. Items carry two full path strings, so an
+ * unbounded intake grows ~300+ B per queued file; on a billion-file run whose
+ * verify side is slower than the scan side (e.g. 30 TiB at 170 MiB/s) that
+ * grew to >200 GiB and tripped the OOM killer. Producers block on g_space_cv
+ * once the intake reaches this many items. Directory items are exempt: they
+ * are held until finish by design, so bounding them could deadlock.
+ * Override with DIRECT_COPY_VERIFY_QUEUE_MAX.
+ */
+static uint64_t g_verify_queue_max = VERIFY_QUEUE_MAX_DEFAULT;
 static pthread_mutex_t g_queue_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_queue_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t g_space_cv = PTHREAD_COND_INITIALIZER;
 /* Feeder threads parked on g_queue_cv, maintained under g_queue_lock so
  * producers can skip the futex wake when the pipeline has nobody waiting. */
 static int g_queue_cv_waiters;
+/* Producers parked on g_space_cv, same waiter-gating pattern. */
+static int g_space_waiters;
 static _Atomic uint64_t g_run_queue_depth;
 static _Atomic uint64_t g_run_active;
 static atomic_flag g_atime_warning = ATOMIC_FLAG_INIT;
@@ -136,6 +137,22 @@ void verify_configure(int metadata, int data, double percent,
     if (workers < 1) workers = 1;
     if (workers > 128) workers = 128;
     g_cfg.workers = workers;
+    {
+        const char *env = getenv("DIRECT_COPY_VERIFY_QUEUE_MAX");
+        if (env && *env) {
+            char *end = NULL;
+            errno = 0;
+            unsigned long long v = strtoull(env, &end, 10);
+            if (errno || end == env || *end ||
+                v < VERIFY_QUEUE_MAX_MIN || v > VERIFY_QUEUE_MAX_LIMIT) {
+                fprintf(stderr,
+                        "Warning: DIRECT_COPY_VERIFY_QUEUE_MAX=%s is invalid; using default %d.\n",
+                        env, VERIFY_QUEUE_MAX_DEFAULT);
+            } else {
+                g_verify_queue_max = (uint64_t)v;
+            }
+        }
+    }
     stats_set_verify_config(g_cfg.metadata, g_cfg.data, g_cfg.percent, g_cfg.seed);
 
     if (!ECOPY_VERIFY_ATIME && g_cfg.metadata && copy_policy_preserve_times()) {
@@ -177,48 +194,6 @@ static verify_item_t *make_item(const char *src, const char *dst,
     return item;
 }
 
-static verify_item_t *make_queued_item_locked(const char *src, const char *dst,
-                                              const struct stat *src_st,
-                                              int skipped, int is_dir)
-{
-    size_t src_len = strlen(src) + 1;
-    size_t dst_len = strlen(dst) + 1;
-    size_t align = _Alignof(verify_item_t);
-    size_t item_size = sizeof(verify_item_t) + src_len + dst_len;
-    size_t offset;
-
-    if (item_size > VERIFY_ARENA_CHUNK_SIZE) {
-        errno = ENAMETOOLONG;
-        return NULL;
-    }
-    if (!g_arena_tail) {
-        g_arena_tail = calloc(1, sizeof(*g_arena_tail));
-        if (!g_arena_tail) return NULL;
-        g_arena_head = g_arena_tail;
-    }
-    offset = (g_arena_tail->used + align - 1) & ~(align - 1);
-    if (offset + item_size > VERIFY_ARENA_CHUNK_SIZE) {
-        verify_arena_chunk_t *chunk = calloc(1, sizeof(*chunk));
-        if (!chunk) return NULL;
-        g_arena_tail->next = chunk;
-        g_arena_tail = chunk;
-        offset = 0;
-    }
-
-    verify_item_t *item = (verify_item_t *)(void *)(g_arena_tail->data + offset);
-    memset(item, 0, sizeof(*item));
-    item->src = (char *)(item + 1);
-    item->dst = item->src + src_len;
-    memcpy(item->src, src, src_len);
-    memcpy(item->dst, dst, dst_len);
-    item->src_st = *src_st;
-    item->skipped = skipped;
-    item->is_dir = is_dir;
-    item->arena_owned = 1;
-    g_arena_tail->used = offset + item_size;
-    return item;
-}
-
 static void append_queued_item_locked(verify_item_t *item)
 {
     if (g_tail) g_tail->next = item;
@@ -233,20 +208,32 @@ int verify_queue_file(const char *src, const char *dst,
 {
     verify_item_t *item;
     if (!verify_enabled() || (skipped && !g_cfg.include_skipped)) return 0;
+    /* Allocate before taking the lock: make_item() touches no shared state. */
+    item = make_item(src, dst, src_st, skipped, 0);
+    if (!item) return -1;
+    item->durable = durable ? 1 : 0;
     pthread_mutex_lock(&g_queue_lock);
-    item = make_queued_item_locked(src, dst, src_st, skipped, 0);
-    if (item) {
-        item->durable = durable ? 1 : 0;
-        append_queued_item_locked(item);
-        /* Wake the feeder (a no-op when the pipeline is not running). The
-         * feeder's 250 ms timed wait is also its generation-flush tick, so
-         * skipping the wake when it is not parked only defers the flush. */
-        if (g_queue_cv_waiters > 0) {
-            pthread_cond_signal(&g_queue_cv);
-        }
+    /*
+     * Backpressure: block while the intake list is full. Only the pipelined
+     * feeder drains the list, so never block when it is not (or no longer)
+     * running — the non-pipelined drain (verify_run_queued) consumes whatever
+     * accumulates afterwards, and those paths queue only a handful of items.
+     */
+    while (g_feeder_started && !g_feeder_stop &&
+           g_pending_count >= g_verify_queue_max) {
+        g_space_waiters++;
+        pthread_cond_wait(&g_space_cv, &g_queue_lock);
+        g_space_waiters--;
+    }
+    append_queued_item_locked(item);
+    /* Wake the feeder (a no-op when the pipeline is not running). The
+     * feeder's 250 ms timed wait is also its generation-flush tick, so
+     * skipping the wake when it is not parked only defers the flush. */
+    if (g_queue_cv_waiters > 0) {
+        pthread_cond_signal(&g_queue_cv);
     }
     pthread_mutex_unlock(&g_queue_lock);
-    return item ? 0 : -1;
+    return 0;
 }
 
 int verify_queue_directory(const char *src, const char *dst,
@@ -254,8 +241,8 @@ int verify_queue_directory(const char *src, const char *dst,
 {
     verify_item_t *item;
     if (!g_cfg.metadata) return 0;
+    item = make_item(src, dst, src_st, 0, 1);
     pthread_mutex_lock(&g_queue_lock);
-    item = make_queued_item_locked(src, dst, src_st, 0, 1);
     if (item) {
         /* Directory metadata is finalized deepest-first at the end of the run,
          * so these items are held on a separate list and only released in
@@ -279,9 +266,8 @@ int verify_retarget_path(const char *old_dst, const char *new_dst)
                 rc = -1;
                 break;
             }
-            if (!item->arena_owned || item->dst_heap) free(item->dst);
+            free(item->dst);
             item->dst = replacement;
-            item->dst_heap = 1;
         }
     }
     pthread_mutex_unlock(&g_queue_lock);
@@ -942,22 +928,9 @@ static verify_pool_t g_pipe_pool;
 static void free_item(verify_item_t *item)
 {
     if (!item) return;
-    if (item->arena_owned) {
-        if (item->dst_heap) free(item->dst);
-        return;
-    }
     free(item->src);
     free(item->dst);
     free(item);
-}
-
-static void free_arena(verify_arena_chunk_t *arena)
-{
-    while (arena) {
-        verify_arena_chunk_t *next = arena->next;
-        free(arena);
-        arena = next;
-    }
 }
 
 static void *verify_pool_worker(void *arg)
@@ -1113,7 +1086,6 @@ int verify_run_queued(int remote)
 {
     verify_item_t *item;
     verify_item_t *tail;
-    verify_arena_chunk_t *arena;
     int failed;
     pthread_mutex_lock(&g_queue_lock);
     item = g_head;
@@ -1124,17 +1096,17 @@ int verify_run_queued(int remote)
         if (tail) tail->next = g_dir_head;
         else item = g_dir_head;
     }
-    arena = g_arena_head;
     g_head = g_tail = NULL;
     g_dir_head = g_dir_tail = NULL;
-    g_arena_head = g_arena_tail = NULL;
     stats_set_verify_pending_peak(g_pending_peak);
     g_pending_count = 0;
     g_pending_peak = 0;
+    if (g_space_waiters > 0) {
+        pthread_cond_broadcast(&g_space_cv);
+    }
     pthread_mutex_unlock(&g_queue_lock);
 
     failed = run_pool_list(item, remote) != 0;
-    free_arena(arena);
     if (remote && verify_enabled() && sshx_barrier_all(0) != 0) {
         failed = 1;
     }
@@ -1155,7 +1127,10 @@ static int pipeline_flush_gen(verify_item_t **head, verify_item_t **tail,
     while (it) {
         verify_item_t *next = it->next;
         it->next = NULL;
-        if (verify_pool_submit(&g_pipe_pool, it) != 0) rc = -1;
+        if (verify_pool_submit(&g_pipe_pool, it) != 0) {
+            free_item(it);
+            rc = -1;
+        }
         it = next;
     }
     *head = *tail = NULL;
@@ -1203,6 +1178,7 @@ static void *verify_feeder_main(void *arg)
             batch->next = NULL;
             if (batch->durable) {
                 if (verify_pool_submit(&g_pipe_pool, batch) != 0) {
+                    free_item(batch);
                     g_feeder_failed = 1;
                 }
             } else {
@@ -1217,6 +1193,9 @@ static void *verify_feeder_main(void *arg)
         if (stolen) {
             pthread_mutex_lock(&g_queue_lock);
             g_pending_count -= stolen;
+            if (g_space_waiters > 0) {
+                pthread_cond_broadcast(&g_space_cv);
+            }
             pthread_mutex_unlock(&g_queue_lock);
         }
 
@@ -1265,7 +1244,7 @@ int verify_pipeline_start(int remote)
 int verify_pipeline_finish(int remote, int include_dirs)
 {
     verify_item_t *dirs;
-    verify_arena_chunk_t *arena;
+    verify_item_t *leftover;
     int failed;
 
     if (!g_feeder_started) return 0;
@@ -1292,9 +1271,13 @@ int verify_pipeline_finish(int remote, int include_dirs)
         verify_item_t *next = dirs->next;
         dirs->next = NULL;
         if (include_dirs) {
-            if (verify_pool_submit(&g_pipe_pool, dirs) != 0) failed = 1;
+            if (verify_pool_submit(&g_pipe_pool, dirs) != 0) {
+                free_item(dirs);
+                failed = 1;
+            }
+        } else {
+            free_item(dirs);
         }
-        /* Arena-owned items need no free; the arena is released below. */
         dirs = next;
     }
 
@@ -1302,13 +1285,21 @@ int verify_pipeline_finish(int remote, int include_dirs)
     if (remote && sshx_barrier_all(0) != 0) failed = 1;
 
     pthread_mutex_lock(&g_queue_lock);
-    arena = g_arena_head;
+    leftover = g_head;
     g_head = g_tail = NULL;
-    g_arena_head = g_arena_tail = NULL;
     g_pending_count = 0;
     g_pending_peak = 0;
+    if (g_space_waiters > 0) {
+        pthread_cond_broadcast(&g_space_cv);
+    }
     pthread_mutex_unlock(&g_queue_lock);
-    free_arena(arena);
+    /* The intake is normally empty here (the feeder drained it before
+     * stopping); free defensively rather than leaking stragglers. */
+    while (leftover) {
+        verify_item_t *next = leftover->next;
+        free_item(leftover);
+        leftover = next;
+    }
 
     return failed ? -1 : 0;
 }
@@ -1424,19 +1415,18 @@ int verify_run_tree(const char *src, const char *dst, int remote,
 void verify_queue_clear(void)
 {
     verify_item_t *item;
-    verify_arena_chunk_t *arena;
     pthread_mutex_lock(&g_queue_lock);
     item = g_head;
-    arena = g_arena_head;
     g_head = g_tail = NULL;
-    g_arena_head = g_arena_tail = NULL;
     g_pending_count = 0;
     g_pending_peak = 0;
+    if (g_space_waiters > 0) {
+        pthread_cond_broadcast(&g_space_cv);
+    }
     pthread_mutex_unlock(&g_queue_lock);
     while (item) {
         verify_item_t *next = item->next;
         free_item(item);
         item = next;
     }
-    free_arena(arena);
 }
