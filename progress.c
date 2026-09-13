@@ -26,6 +26,10 @@ static pthread_t g_monitor_thread;
 static int g_monitor_stop = 0;
 static int g_monitor_running = 0;
 static int g_monitor_tty = 0;
+/* Set from the -v flag at progress_start(): verbose keeps the full
+ * internals line (queue depths, verify worker counts, current-file path);
+ * the default line carries only what a normal user acts on. */
+static int g_progress_verbose = 0;
 static pthread_mutex_t g_monitor_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_monitor_cond = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t g_output_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -137,10 +141,6 @@ static void format_file_rate(double files_per_sec, char *out, size_t out_sz)
 
 static void build_progress_line(char *out, size_t out_sz) {
     progress_snapshot_t snap;
-    uint64_t sq = workers_small_queue_depth();
-    uint64_t sa = workers_small_active_count();
-    uint64_t lq = workers_large_queue_depth();
-    uint64_t la = workers_large_active_count();
     char elapsed_buf[32];
     char remaining_buf[32];
     char copied_buf[32];
@@ -167,12 +167,18 @@ static void build_progress_line(char *out, size_t out_sz) {
                               : 0.0;
         format_bytes_adaptive(snap.verify_bytes, verified_buf,
                               sizeof(verified_buf));
-        snprintf(out, out_sz,
-                 "verify: %" PRIu64 " objects, %s sampled, %.3f%% coverage | "
-                 "vq:%" PRIu64 " va:%" PRIu64 "/%d | el:%s",
-                 snap.verify_objects, verified_buf, coverage,
-                 verify_queue_depth(), verify_active_count(),
-                 verify_worker_count(), elapsed_buf);
+        if (g_progress_verbose) {
+            snprintf(out, out_sz,
+                     "verify: %" PRIu64 " objects, %s sampled, %.3f%% coverage | "
+                     "vq:%" PRIu64 " va:%" PRIu64 "/%d | el:%s",
+                     snap.verify_objects, verified_buf, coverage,
+                     verify_queue_depth(), verify_active_count(),
+                     verify_worker_count(), elapsed_buf);
+        } else {
+            snprintf(out, out_sz,
+                     "verify: %" PRIu64 " objects, %s sampled, %.3f%% coverage | el:%s",
+                     snap.verify_objects, verified_buf, coverage, elapsed_buf);
+        }
         trim_to_width(out, get_terminal_width());
         return;
     }
@@ -181,19 +187,35 @@ static void build_progress_line(char *out, size_t out_sz) {
     format_rate_adaptive(bytes_per_sec, rate_buf, sizeof(rate_buf));
     format_file_rate(snap.rolling_files_per_sec, file_rate_buf, sizeof(file_rate_buf));
 
-    int n = snprintf(out, out_sz,
-        "%s payload, %s, %s, %" PRIu64 "/%" PRIu64 " files, %" PRIu64 " dirs | sq:%" PRIu64 " sa:%" PRIu64 " lq:%" PRIu64 " la:%" PRIu64 " | el:%s",
-        copied_buf,
-        rate_buf,
-        file_rate_buf,
-        snap.files_copied + snap.files_skipped,
-        snap.files_seen,
-        snap.dirs_seen,
-        sq,
-        sa,
-        lq,
-        la,
-        elapsed_buf);
+    int n;
+    if (g_progress_verbose) {
+        uint64_t sq = workers_small_queue_depth();
+        uint64_t sa = workers_small_active_count();
+        uint64_t lq = workers_large_queue_depth();
+        uint64_t la = workers_large_active_count();
+        n = snprintf(out, out_sz,
+            "%s payload, %s, %s, %" PRIu64 "/%" PRIu64 " files, %" PRIu64 " dirs | sq:%" PRIu64 " sa:%" PRIu64 " lq:%" PRIu64 " la:%" PRIu64 " | el:%s",
+            copied_buf,
+            rate_buf,
+            file_rate_buf,
+            snap.files_copied + snap.files_skipped,
+            snap.files_seen,
+            snap.dirs_seen,
+            sq,
+            sa,
+            lq,
+            la,
+            elapsed_buf);
+    } else {
+        n = snprintf(out, out_sz,
+            "%s payload, %s, %s, %" PRIu64 "/%" PRIu64 " files | el:%s",
+            copied_buf,
+            rate_buf,
+            file_rate_buf,
+            snap.files_copied + snap.files_skipped,
+            snap.files_seen,
+            elapsed_buf);
+    }
 
     if (snap.traversal_done && snap.planned_copy_bytes > snap.bytes_copied && snap.rolling_gibs > 0.0 && n > 0 && (size_t)n < out_sz) {
         uint64_t remaining_bytes = snap.planned_copy_bytes - snap.bytes_copied;
@@ -216,15 +238,23 @@ static void build_progress_line(char *out, size_t out_sz) {
         char verify_sampled_buf[32];
         format_bytes_adaptive(snap.verify_bytes, verify_sampled_buf,
                               sizeof(verify_sampled_buf));
-        n += snprintf(out + n, out_sz - (size_t)n,
-            " | vfy: %s, %" PRIu64 " obj, va:%" PRIu64 "/%d",
-            verify_sampled_buf,
-            snap.verify_objects,
-            verify_active_count(),
-            verify_worker_count());
+        if (g_progress_verbose) {
+            n += snprintf(out + n, out_sz - (size_t)n,
+                " | vfy: %s, %" PRIu64 " obj, va:%" PRIu64 "/%d",
+                verify_sampled_buf,
+                snap.verify_objects,
+                verify_active_count(),
+                verify_worker_count());
+        } else {
+            n += snprintf(out + n, out_sz - (size_t)n,
+                " | vfy: %s, %" PRIu64 " obj",
+                verify_sampled_buf,
+                snap.verify_objects);
+        }
     }
 
-    if (snap.current_file_total > 0 && n > 0 && (size_t)n < out_sz) {
+    /* The current-file segment is the noisiest part of the line; verbose only. */
+    if (g_progress_verbose && snap.current_file_total > 0 && n > 0 && (size_t)n < out_sz) {
         double pct = 100.0 * (double)snap.current_file_done / (double)snap.current_file_total;
         format_bytes_adaptive(snap.current_file_done, current_done_buf, sizeof(current_done_buf));
         format_bytes_adaptive(snap.current_file_total, current_total_buf, sizeof(current_total_buf));
@@ -274,10 +304,11 @@ static void *monitor_main(void *arg) {
     return NULL;
 }
 
-int progress_start(void) {
+int progress_start(int verbose) {
     pthread_mutex_lock(&g_monitor_lock);
     g_monitor_stop = 0;
     g_monitor_tty = isatty(STDOUT_FILENO);
+    g_progress_verbose = verbose ? 1 : 0;
     g_monitor_running = 1;
     pthread_mutex_unlock(&g_monitor_lock);
 

@@ -857,7 +857,7 @@ int main(int argc, char **argv) {
                    verify_workers, verify_metadata ? "yes" : "no",
                    verify_data ? "yes" : "no", verify_pct);
         }
-        if (progress_start() != 0) {
+        if (progress_start(verbose) != 0) {
             sshx_disconnect();
             return 1;
         }
@@ -878,7 +878,7 @@ int main(int argc, char **argv) {
     if (verbose) {
         workers_print_startup_config();
     }
-    if (progress_start() != 0) { workers_stop(); sshx_disconnect(); return 1; }
+    if (progress_start(verbose) != 0) { workers_stop(); sshx_disconnect(); return 1; }
 
     /*
      * Overlap verification with copy for directory trees: start the verify pool
