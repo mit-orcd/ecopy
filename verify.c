@@ -173,6 +173,20 @@ int verify_worker_count(void) { return g_cfg.workers; }
 uint64_t verify_queue_depth(void) { return atomic_load(&g_run_queue_depth); }
 uint64_t verify_active_count(void) { return atomic_load(&g_run_active); }
 
+/*
+ * Total outstanding verify work: intake backlog + pool queue + active items.
+ * Display-only; the single g_queue_lock acquisition per monitor tick is
+ * negligible against the queue's normal traffic.
+ */
+uint64_t verify_outstanding_count(void)
+{
+    pthread_mutex_lock(&g_queue_lock);
+    uint64_t pending = g_pending_count;
+    pthread_mutex_unlock(&g_queue_lock);
+    return pending + atomic_load(&g_run_queue_depth) +
+           atomic_load(&g_run_active);
+}
+
 static verify_item_t *make_item(const char *src, const char *dst,
                                 const struct stat *src_st, int skipped,
                                 int is_dir)

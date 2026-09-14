@@ -58,6 +58,7 @@ void verify_queue_clear(void);
 int verify_worker_count(void);
 uint64_t verify_queue_depth(void);
 uint64_t verify_active_count(void);
+uint64_t verify_outstanding_count(void);
 
 typedef enum {
     VERIFY_META_OK = 0,        /* source and target metadata match */
