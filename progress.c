@@ -147,6 +147,49 @@ static void format_file_rate(double files_per_sec, int bytes_flowing,
     }
 }
 
+/*
+ * Display-side verify throughput. build_progress_line() runs only on the
+ * single monitor thread, so plain static state needs no synchronization.
+ * Re-sampled at most once per second so the figure is stable; between
+ * samples the last rate is returned.
+ */
+static double verify_obj_rate(uint64_t verify_objects)
+{
+    static uint64_t prev_objs;
+    static struct timespec prev_ts;
+    static double rate;
+    static int primed;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (!primed) {
+        primed = 1;
+        prev_objs = verify_objects;
+        prev_ts = now;
+        return 0.0;
+    }
+    double dt = (double)(now.tv_sec - prev_ts.tv_sec) +
+                (double)(now.tv_nsec - prev_ts.tv_nsec) / 1e9;
+    if (dt >= 1.0) {
+        rate = (double)(verify_objects - prev_objs) / dt;
+        prev_objs = verify_objects;
+        prev_ts = now;
+    }
+    return rate;
+}
+
+static void format_obj_rate(double objs_per_sec, char *out, size_t out_sz)
+{
+    if (objs_per_sec >= 10.0) {
+        snprintf(out, out_sz, "%.0f obj/s", objs_per_sec);
+    } else if (objs_per_sec >= 1.0) {
+        snprintf(out, out_sz, "%.1f obj/s", objs_per_sec);
+    } else if (objs_per_sec > 0.0) {
+        snprintf(out, out_sz, "%.2f obj/s", objs_per_sec);
+    } else {
+        snprintf(out, out_sz, "0 obj/s");
+    }
+}
+
 static void build_progress_line(char *out, size_t out_sz) {
     progress_snapshot_t snap;
     char elapsed_buf[32];
@@ -169,23 +212,27 @@ static void build_progress_line(char *out, size_t out_sz) {
      */
     if (snap.verify_enabled && (snap.verify_only || snap.copy_complete)) {
         char verified_buf[32];
+        char vrate_buf[24];
         double coverage = snap.verify_scope_bytes
                               ? 100.0 * (double)snap.verify_bytes /
                                     (double)snap.verify_scope_bytes
                               : 0.0;
         format_bytes_adaptive(snap.verify_bytes, verified_buf,
                               sizeof(verified_buf));
+        format_obj_rate(verify_obj_rate(snap.verify_objects), vrate_buf,
+                        sizeof(vrate_buf));
         if (g_progress_verbose) {
             snprintf(out, out_sz,
-                     "verify: %" PRIu64 " objects, %s sampled, %.3f%% coverage | "
+                     "verify: %" PRIu64 " objects, %s sampled, %.3f%% coverage, %s | "
                      "vq:%" PRIu64 " va:%" PRIu64 "/%d | el:%s",
-                     snap.verify_objects, verified_buf, coverage,
+                     snap.verify_objects, verified_buf, coverage, vrate_buf,
                      verify_queue_depth(), verify_active_count(),
                      verify_worker_count(), elapsed_buf);
         } else {
             snprintf(out, out_sz,
-                     "verify: %" PRIu64 " objects, %s sampled, %.3f%% coverage | el:%s",
-                     snap.verify_objects, verified_buf, coverage, elapsed_buf);
+                     "verify: %" PRIu64 " objects, %s sampled, %.3f%% coverage, %s | el:%s",
+                     snap.verify_objects, verified_buf, coverage, vrate_buf,
+                     elapsed_buf);
         }
         trim_to_width(out, get_terminal_width());
         return;
@@ -245,20 +292,25 @@ static void build_progress_line(char *out, size_t out_sz) {
      */
     if (snap.verify_enabled && !snap.verify_only && n > 0 && (size_t)n < out_sz) {
         char verify_sampled_buf[32];
+        char vrate_buf[24];
         format_bytes_adaptive(snap.verify_bytes, verify_sampled_buf,
                               sizeof(verify_sampled_buf));
+        format_obj_rate(verify_obj_rate(snap.verify_objects), vrate_buf,
+                        sizeof(vrate_buf));
         if (g_progress_verbose) {
             n += snprintf(out + n, out_sz - (size_t)n,
-                " | vfy: %s, %" PRIu64 " obj, va:%" PRIu64 "/%d",
+                " | vfy: %s, %" PRIu64 " obj, %s, va:%" PRIu64 "/%d",
                 verify_sampled_buf,
                 snap.verify_objects,
+                vrate_buf,
                 verify_active_count(),
                 verify_worker_count());
         } else {
             n += snprintf(out + n, out_sz - (size_t)n,
-                " | vfy: %s, %" PRIu64 " obj",
+                " | vfy: %s, %" PRIu64 " obj, %s",
                 verify_sampled_buf,
-                snap.verify_objects);
+                snap.verify_objects,
+                vrate_buf);
         }
     }
 
