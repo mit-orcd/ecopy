@@ -128,14 +128,22 @@ static void format_rate_adaptive(double bytes_per_sec, char *out, size_t out_sz)
     }
 }
 
-static void format_file_rate(double files_per_sec, char *out, size_t out_sz)
+static void format_file_rate(double files_per_sec, int bytes_flowing,
+                             char *out, size_t out_sz)
 {
     if (files_per_sec >= 100.0) {
         snprintf(out, out_sz, "%.0f files/s", files_per_sec);
     } else if (files_per_sec >= 10.0) {
         snprintf(out, out_sz, "%.1f files/s", files_per_sec);
-    } else {
+    } else if (files_per_sec >= 0.005) {
         snprintf(out, out_sz, "%.2f files/s", files_per_sec);
+    } else if (bytes_flowing) {
+        /* No file completed within the 10 s rate window (large-file phase)
+         * but payload is moving: print an upper bound instead of a
+         * stall-looking "0.00". */
+        snprintf(out, out_sz, "<0.1 files/s");
+    } else {
+        snprintf(out, out_sz, "0.00 files/s");
     }
 }
 
@@ -185,7 +193,8 @@ static void build_progress_line(char *out, size_t out_sz) {
     format_bytes_adaptive(snap.bytes_completed, copied_buf, sizeof(copied_buf));
     bytes_per_sec = snap.rolling_completed_gibs * 1024.0 * 1024.0 * 1024.0;
     format_rate_adaptive(bytes_per_sec, rate_buf, sizeof(rate_buf));
-    format_file_rate(snap.rolling_files_per_sec, file_rate_buf, sizeof(file_rate_buf));
+    format_file_rate(snap.rolling_files_per_sec, bytes_per_sec > 0.0,
+                     file_rate_buf, sizeof(file_rate_buf));
 
     int n;
     if (g_progress_verbose) {
