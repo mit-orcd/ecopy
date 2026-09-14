@@ -22,6 +22,16 @@
  */
 #define LARGE_FILE_THRESHOLD_MB 10
 
+/*
+ * Files smaller than this open buffered even when direct I/O is enabled:
+ * O_DIRECT is a pure loss for small files (synchronous aligned NFS RPCs, no
+ * readahead, attr revalidation per open), while for large streams it avoids
+ * the page-cache dirty-throttle cliff. Matches the small/large dispatch
+ * threshold by default; override with DIRECT_COPY_DIRECT_IO_MIN_SIZE_MB
+ * (0 = direct I/O for all sizes).
+ */
+#define DIRECT_IO_MIN_SIZE_MB_DEFAULT 10
+
 #define MAX_WORKER_SLOTS 256
 #define SMALL_WORKER_SLOTS 32
 #define LARGE_FILE_WORKERS 6

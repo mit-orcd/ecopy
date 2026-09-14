@@ -9,6 +9,7 @@
 #include "compat.h"
 #include "fs_util.h"
 #include "copy_policy.h"
+#include "config.h"
 #include "stats.h"
 #include "progress.h"
 
@@ -335,6 +336,48 @@ int write_direct_io_enabled(void)
     return g_write_direct_io_enabled;
 }
 
+/*
+ * Direct I/O pays off only for large transfers: it avoids the page-cache
+ * dirty-throttle cliff when many GiB/s flow for a long time. For small
+ * files it is a pure loss — O_DIRECT reads on NFS force cache invalidation
+ * and synchronous aligned RPCs (no readahead, no cached attrs), and aligned
+ * direct writes cost more than a page-cache copy at small sizes. Measured
+ * on a 133k-file NFS->NVMe tree: buffered smalls run +56% files/s and -36%
+ * wall. Files below this size open buffered even when direct I/O is on.
+ * Default matches the small/large dispatch threshold; 0 restores
+ * direct-everything.
+ */
+static pthread_once_t g_direct_io_min_size_once = PTHREAD_ONCE_INIT;
+static off_t g_direct_io_min_size_value;
+
+static void init_direct_io_min_size(void)
+{
+    const char *env = getenv("DIRECT_COPY_DIRECT_IO_MIN_SIZE_MB");
+    long mb = DIRECT_IO_MIN_SIZE_MB_DEFAULT;
+    if (env && *env) {
+        char *end = NULL;
+        long parsed = strtol(env, &end, 10);
+        /* Unparsable input keeps the default; an explicit 0 disables the
+         * gate (direct I/O for all sizes). */
+        mb = (end == env) ? DIRECT_IO_MIN_SIZE_MB_DEFAULT : parsed;
+    }
+    if (mb < 0) mb = 0;
+    if (mb > 1024L * 1024L) mb = 1024L * 1024L;
+    g_direct_io_min_size_value = (off_t)mb * 1024 * 1024;
+}
+
+static off_t direct_io_min_size(void)
+{
+    pthread_once(&g_direct_io_min_size_once, init_direct_io_min_size);
+    return g_direct_io_min_size_value;
+}
+
+static int direct_io_worthwhile(off_t size)
+{
+    off_t min_size = direct_io_min_size();
+    return min_size == 0 || size >= min_size;
+}
+
 int open_read_maybe_direct(const char *path, int *used_direct) {
     int fd;
     if (used_direct) *used_direct = 0;
@@ -372,7 +415,8 @@ int open_read_at_maybe_direct(int dir_fd,
     int fd;
     if (used_direct) *used_direct = 0;
 
-    if (read_direct_io_enabled()) {
+    if (read_direct_io_enabled() &&
+        (!expected_st || direct_io_worthwhile(expected_st->st_size))) {
         fd = ecopy_openat_nocancel(dir_fd, name, O_RDONLY | O_DIRECT | O_CLOEXEC | O_NOFOLLOW, 0);
         if (fd >= 0) {
             int direct = ecopy_set_direct_io(fd) == 0;
@@ -758,12 +802,14 @@ static int open_temp_created_once(int dir_fd,
 int create_temp_write_at_maybe_direct(int dir_fd,
                                       const char *display_path,
                                       mode_t mode,
+                                      off_t data_size,
                                       char *tmp_name,
                                       size_t tmp_name_sz,
                                       int *used_direct)
 {
     mode_t open_mode = copy_data_mode(mode);
     int attempt;
+    int try_direct = write_direct_io_enabled() && direct_io_worthwhile(data_size);
 
     if (used_direct) {
         *used_direct = 0;
@@ -778,7 +824,7 @@ int create_temp_write_at_maybe_direct(int dir_fd,
             return -1;
         }
 
-        if (write_direct_io_enabled()) {
+        if (try_direct) {
             fd = open_temp_created_once(dir_fd, tmp_name, display_path, open_mode, 1, used_direct);
             if (fd >= 0) {
                 return fd;
@@ -874,6 +920,7 @@ int create_final_write_at_maybe_direct(int dir_fd,
                                        const char *name,
                                        const char *display_path,
                                        mode_t mode,
+                                       off_t data_size,
                                        int *used_direct)
 {
     mode_t open_mode = copy_data_mode(mode);
@@ -883,7 +930,7 @@ int create_final_write_at_maybe_direct(int dir_fd,
         *used_direct = 0;
     }
 
-    if (write_direct_io_enabled()) {
+    if (write_direct_io_enabled() && direct_io_worthwhile(data_size)) {
         fd = open_final_created_once(dir_fd, name, display_path, open_mode, 1, used_direct);
         if (fd >= 0) {
             return fd;

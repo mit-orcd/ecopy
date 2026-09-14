@@ -42,6 +42,7 @@ int open_write_existing_buffered(const char *path);
 int create_temp_write_at_maybe_direct(int dir_fd,
                                       const char *display_path,
                                       mode_t mode,
+                                      off_t data_size,
                                       char *tmp_name,
                                       size_t tmp_name_sz,
                                       int *used_direct);
@@ -49,6 +50,7 @@ int create_final_write_at_maybe_direct(int dir_fd,
                                        const char *name,
                                        const char *display_path,
                                        mode_t mode,
+                                       off_t data_size,
                                        int *used_direct);
 int open_temp_write_existing_at_maybe_direct(int dir_fd,
                                              const char *tmp_name,

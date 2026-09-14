@@ -1283,6 +1283,7 @@ static int copy_file_sparse(file_task_t *task, uint64_t *payload_bytes)
     fd_out = create_temp_write_at_maybe_direct(task->dir->dst_fd,
                                                task->dst,
                                                task->src_st.st_mode & 07777,
+                                               task->src_st.st_size,
                                                tmp_name,
                                                sizeof(tmp_name),
                                                &out_direct);
@@ -1397,12 +1398,14 @@ static int copy_file_serial_small(file_task_t *task, uint64_t *payload_bytes)
                                                     task->name,
                                                     task->dst,
                                                     task->src_st.st_mode & 07777,
+                                                    task->src_st.st_size,
                                                     &out_direct);
         write_name = task->name;
     } else {
         fd_out = create_temp_write_at_maybe_direct(task->dir->dst_fd,
                                                    task->dst,
                                                    task->src_st.st_mode & 07777,
+                                                   task->src_st.st_size,
                                                    tmp_name,
                                                    sizeof(tmp_name),
                                                    &out_direct);
@@ -1941,6 +1944,7 @@ static int start_large_file_copy(file_task_t *task)
     ctx->fd_out = create_temp_write_at_maybe_direct(ctx->dir->dst_fd,
                                                     ctx->dst,
                                                     ctx->src_st.st_mode & 07777,
+                                                    ctx->src_st.st_size,
                                                     ctx->tmp_name,
                                                     sizeof(ctx->tmp_name),
                                                     &ctx->out_direct);
