@@ -46,9 +46,9 @@ static void usage(const char *prog) {
             "       --verify-metadata checks type/size/mode/uid/gid/timestamps.\n"
             "       --verify-data[=PERCENT] checks sampled 4 KiB blocks (default 1%%).\n"
             "       --verify-skipped also checks files skipped as unchanged.\n"
-            "       --verify-seed=N makes block selection reproducible (default random).\n"
+            "       --verify-seed N makes block selection reproducible (default random).\n"
             "       --verify-only compares source and target without modifying either.\n"
-            "       --verify-workers=N sets checker parallelism 1-128\n"
+            "       --verify-workers N sets checker parallelism 1-128\n"
             "                       (default min(cpus,16), min(cpus,8) for ssh://).\n"
             "       --uid N forces the target owner uid of every object (else source uid).\n"
             "       --gid N forces the target group gid of every object (else source gid).\n"
@@ -619,23 +619,29 @@ int main(int argc, char **argv) {
                 verify_skipped = 1;
             } else if (strcmp(argv[i], "--verify-only") == 0) {
                 verify_only = 1;
-            } else if (strncmp(argv[i], "--verify-workers=", 17) == 0) {
+            } else if (strcmp(argv[i], "--verify-workers") == 0 ||
+                       strncmp(argv[i], "--verify-workers=", 17) == 0) {
+                const char *val = argv[i][16] == '=' ? argv[i] + 17
+                                                     : (i + 1 < argc ? argv[++i] : NULL);
                 char *end = NULL;
-                long value = strtol(argv[i] + 17, &end, 10);
-                if (!end || end == argv[i] + 17 || *end ||
+                long value = val ? strtol(val, &end, 10) : 0;
+                if (!val || !end || end == val || *end ||
                     value < 1 || value > 128) {
                     fprintf(stderr, "ecopy: invalid verification worker count: %s\n",
-                            argv[i] + 17);
+                            val ? val : "(missing)");
                     return 1;
                 }
                 verify_workers = (int)value;
-            } else if (strncmp(argv[i], "--verify-seed=", 14) == 0) {
+            } else if (strcmp(argv[i], "--verify-seed") == 0 ||
+                       strncmp(argv[i], "--verify-seed=", 14) == 0) {
+                const char *val = argv[i][13] == '=' ? argv[i] + 14
+                                                     : (i + 1 < argc ? argv[++i] : NULL);
                 char *end = NULL;
                 errno = 0;
-                unsigned long long value = strtoull(argv[i] + 14, &end, 0);
-                if (errno || end == argv[i] + 14 || *end) {
+                unsigned long long value = val ? strtoull(val, &end, 0) : 0;
+                if (!val || errno || end == val || *end) {
                     fprintf(stderr, "ecopy: invalid verification seed: %s\n",
-                            argv[i] + 14);
+                            val ? val : "(missing)");
                     return 1;
                 }
                 verify_seed_value = (uint64_t)value;
