@@ -1518,6 +1518,7 @@ static int copy_file_serial_small(file_task_t *task, uint64_t *payload_bytes)
         }
         target_created = 0;
         rc = 0;
+        if (payload_bytes) *payload_bytes = (uint64_t)size;
         goto out;
     }
 
