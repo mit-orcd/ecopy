@@ -196,6 +196,16 @@ void stats_init(void) {
 }
 
 static void note_first_payload(void) {
+    /*
+     * Fast path: once the timestamp is published (state 2) a single acquire
+     * load of a line that stays read-mostly suffices. The previous version
+     * ran the CAS unconditionally — a `lock cmpxchg` is a full cacheline
+     * RMW even when the comparison fails, so every chunk of every file on
+     * every worker hammered this one line.
+     */
+    if (atomic_load_explicit(&a_first_payload_seen, memory_order_acquire) == 2) {
+        return;
+    }
     int expected = 0;
     if (atomic_compare_exchange_strong_explicit(&a_first_payload_seen, &expected, 1,
                                                 memory_order_acquire,
@@ -281,17 +291,6 @@ void stats_set_shutdown_done(void) {
     pthread_mutex_unlock(&g_lock);
 }
 
-void stats_record_read_open(int used_direct) {
-    hot_add(used_direct ? &a_read_direct_opens : &a_read_buffered_opens, 1);
-}
-
-void stats_record_write_open(int used_direct) {
-    hot_add(used_direct ? &a_write_direct_opens : &a_write_buffered_opens, 1);
-}
-
-void stats_record_queue_wait_ns(uint64_t ns) { pthread_mutex_lock(&g_lock); g_stats.queue_wait_ns += ns; pthread_mutex_unlock(&g_lock); }
-void stats_record_read_io(uint64_t ns) { hot_add(&a_read_syscalls, 1); hot_add(&a_read_ns, ns); }
-void stats_record_write_io(uint64_t ns) { hot_add(&a_write_syscalls, 1); hot_add(&a_write_ns, ns); }
 /*
  * The per-op syscall counters were bumped on shared cachelines once per
  * read/write call — at GiB/s chunk rates that is thousands of contended
@@ -302,6 +301,54 @@ void stats_record_write_io(uint64_t ns) { hot_add(&a_write_syscalls, 1); hot_add
 
 static __thread uint64_t tls_read_ops = 0;
 static __thread uint64_t tls_write_ops = 0;
+
+/*
+ * Per-file open counters get the same TLS treatment: one shared-cacheline
+ * RMW per file per counter showed up in the small-file profile. Folded in
+ * at IO_OP_FLUSH_THRESHOLD and at thread exit via stats_flush_io_op_counts(),
+ * so final totals stay exact.
+ */
+static __thread uint64_t tls_read_direct_opens = 0;
+static __thread uint64_t tls_read_buffered_opens = 0;
+static __thread uint64_t tls_write_direct_opens = 0;
+static __thread uint64_t tls_write_buffered_opens = 0;
+
+/* files-copied folds in at a lower threshold so the 5 Hz rolling files/s
+ * display stays responsive on metadata-heavy runs. */
+#define FILES_FLUSH_THRESHOLD 32
+static __thread uint64_t tls_files_copied = 0;
+
+void stats_record_read_open(int used_direct) {
+    if (used_direct) {
+        if (++tls_read_direct_opens >= IO_OP_FLUSH_THRESHOLD) {
+            hot_add(&a_read_direct_opens, tls_read_direct_opens);
+            tls_read_direct_opens = 0;
+        }
+    } else {
+        if (++tls_read_buffered_opens >= IO_OP_FLUSH_THRESHOLD) {
+            hot_add(&a_read_buffered_opens, tls_read_buffered_opens);
+            tls_read_buffered_opens = 0;
+        }
+    }
+}
+
+void stats_record_write_open(int used_direct) {
+    if (used_direct) {
+        if (++tls_write_direct_opens >= IO_OP_FLUSH_THRESHOLD) {
+            hot_add(&a_write_direct_opens, tls_write_direct_opens);
+            tls_write_direct_opens = 0;
+        }
+    } else {
+        if (++tls_write_buffered_opens >= IO_OP_FLUSH_THRESHOLD) {
+            hot_add(&a_write_buffered_opens, tls_write_buffered_opens);
+            tls_write_buffered_opens = 0;
+        }
+    }
+}
+
+void stats_record_queue_wait_ns(uint64_t ns) { pthread_mutex_lock(&g_lock); g_stats.queue_wait_ns += ns; pthread_mutex_unlock(&g_lock); }
+void stats_record_read_io(uint64_t ns) { hot_add(&a_read_syscalls, 1); hot_add(&a_read_ns, ns); }
+void stats_record_write_io(uint64_t ns) { hot_add(&a_write_syscalls, 1); hot_add(&a_write_ns, ns); }
 
 void stats_record_read_op(void) {
     if (++tls_read_ops >= IO_OP_FLUSH_THRESHOLD) {
@@ -324,6 +371,26 @@ void stats_flush_io_op_counts(void) {
         hot_add(&a_write_syscalls, tls_write_ops);
         tls_write_ops = 0;
     }
+    if (tls_read_direct_opens > 0) {
+        hot_add(&a_read_direct_opens, tls_read_direct_opens);
+        tls_read_direct_opens = 0;
+    }
+    if (tls_read_buffered_opens > 0) {
+        hot_add(&a_read_buffered_opens, tls_read_buffered_opens);
+        tls_read_buffered_opens = 0;
+    }
+    if (tls_write_direct_opens > 0) {
+        hot_add(&a_write_direct_opens, tls_write_direct_opens);
+        tls_write_direct_opens = 0;
+    }
+    if (tls_write_buffered_opens > 0) {
+        hot_add(&a_write_buffered_opens, tls_write_buffered_opens);
+        tls_write_buffered_opens = 0;
+    }
+    if (tls_files_copied > 0) {
+        hot_add(&a_files_copied, tls_files_copied);
+        tls_files_copied = 0;
+    }
 }
 void stats_record_read_time(uint64_t ns) { hot_add(&a_read_ns, ns); }
 void stats_record_write_time(uint64_t ns) { hot_add(&a_write_ns, ns); }
@@ -342,7 +409,12 @@ void stats_record_ready_queue_depth(uint64_t depth) {
     }
 }
 void stats_inc_files_seen(void){ hot_add(&a_files_seen, 1); }
-void stats_inc_files_copied(void){ hot_add(&a_files_copied, 1); } 
+void stats_inc_files_copied(void){
+    if (++tls_files_copied >= FILES_FLUSH_THRESHOLD) {
+        hot_add(&a_files_copied, tls_files_copied);
+        tls_files_copied = 0;
+    }
+} 
 void stats_inc_files_skipped(void){ pthread_mutex_lock(&g_lock); g_stats.files_skipped++; pthread_mutex_unlock(&g_lock);} 
 void stats_inc_dirs_seen(void){ pthread_mutex_lock(&g_lock); g_stats.dirs_seen++; pthread_mutex_unlock(&g_lock);} 
 void stats_inc_dirs_created(void){ pthread_mutex_lock(&g_lock); g_stats.dirs_created++; pthread_mutex_unlock(&g_lock);} 
@@ -443,6 +515,20 @@ void stats_record_verify_categories(uint64_t metadata, uint64_t data,
     pthread_mutex_unlock(&g_lock);
 }
 
+/*
+ * The current-file slots exist only to feed the verbose on-TTY progress
+ * line. When the display cannot show them (output redirected, or no -v),
+ * skip the per-file seqlock claim and PATH_MAX slot memcpy entirely —
+ * they cost ~5% of a small-file run. Default enabled so early files are
+ * visible; progress_start() reconciles with the actual display mode.
+ */
+static _Atomic int g_cfile_display_enabled = 1;
+
+void stats_set_current_file_display(int enabled) {
+    atomic_store_explicit(&g_cfile_display_enabled, enabled ? 1 : 0,
+                          memory_order_relaxed);
+}
+
 static int cfile_slot(void) {
     int s = tls_cfile_slot;
     if (s < 0) {
@@ -474,6 +560,9 @@ static void cfile_write_end(int s, uint64_t seq) {
 }
 
 void stats_set_current_file(const char *path, size_t path_len, uint64_t total, int parallel) {
+    if (!atomic_load_explicit(&g_cfile_display_enabled, memory_order_relaxed)) {
+        return;
+    }
     /* The caller already knows the path length (it built the string), so
      * skip a per-file strlen of the full source path. */
     size_t n = path ? path_len : 0;
@@ -513,6 +602,9 @@ void stats_clear_current_file(const char *path) {
     /* The slot only ever holds this thread's current file, so the path match
      * the shared buffer needed is unnecessary here. */
     (void)path;
+    if (!atomic_load_explicit(&g_cfile_display_enabled, memory_order_relaxed)) {
+        return;
+    }
     int s = tls_cfile_slot;
     if (s < 0) {
         return;
@@ -766,6 +858,9 @@ void stats_get_progress_snapshot(progress_snapshot_t *snap) {
 
 void stats_get_final(stats_t *out) {
     if (!out) return;
+    /* Fold in this thread's TLS counters too; worker threads already
+     * flushed at exit, but the calling thread may carry stragglers. */
+    stats_flush_io_op_counts();
     pthread_mutex_lock(&g_lock);
     *out = g_stats;
     pthread_mutex_unlock(&g_lock);
@@ -774,6 +869,7 @@ void stats_get_final(stats_t *out) {
 
 void stats_print_final(int verbose) {
     stats_t s;
+    stats_flush_io_op_counts();
     pthread_mutex_lock(&g_lock);
     s = g_stats;
     pthread_mutex_unlock(&g_lock);

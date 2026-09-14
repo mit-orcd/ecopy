@@ -309,6 +309,9 @@ int progress_start(int verbose) {
     g_monitor_stop = 0;
     g_monitor_tty = isatty(STDOUT_FILENO);
     g_progress_verbose = verbose ? 1 : 0;
+    /* Current-file slots only feed the verbose on-TTY line; otherwise the
+     * per-file seqlock claim + PATH_MAX slot memcpy is pure overhead. */
+    stats_set_current_file_display(g_progress_verbose && g_monitor_tty);
     g_monitor_running = 1;
     pthread_mutex_unlock(&g_monitor_lock);
 

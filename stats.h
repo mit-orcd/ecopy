@@ -90,6 +90,8 @@ void stats_record_verify_categories(uint64_t metadata, uint64_t data,
                                     uint64_t malformed, uint64_t ownership);
 
 void stats_set_current_file(const char *path, size_t path_len, uint64_t total, int parallel);
+/* Enable/disable current-file slot maintenance (verbose on-TTY display only). */
+void stats_set_current_file_display(int enabled);
 void stats_advance_current_file_slot(uint64_t bytes);
 void stats_clear_current_file(const char *path);
 
