@@ -243,6 +243,14 @@ static void build_progress_line(char *out, size_t out_sz) {
     format_file_rate(snap.rolling_files_per_sec, bytes_per_sec > 0.0,
                      file_rate_buf, sizeof(file_rate_buf));
 
+    /* Distinguish skipping (unchanged re-run) from real transfers. */
+    char skip_buf[40];
+    skip_buf[0] = '\0';
+    if (snap.files_skipped > 0) {
+        snprintf(skip_buf, sizeof(skip_buf), " (%" PRIu64 " skipped)",
+                 snap.files_skipped);
+    }
+
     int n;
     if (g_progress_verbose) {
         uint64_t sq = workers_small_queue_depth();
@@ -250,12 +258,13 @@ static void build_progress_line(char *out, size_t out_sz) {
         uint64_t lq = workers_large_queue_depth();
         uint64_t la = workers_large_active_count();
         n = snprintf(out, out_sz,
-            "%s payload, %s, %s, %" PRIu64 "/%" PRIu64 " files, %" PRIu64 " dirs | sq:%" PRIu64 " sa:%" PRIu64 " lq:%" PRIu64 " la:%" PRIu64 " | el:%s",
+            "%s payload, %s, %s, %" PRIu64 "/%" PRIu64 " files%s, %" PRIu64 " dirs | sq:%" PRIu64 " sa:%" PRIu64 " lq:%" PRIu64 " la:%" PRIu64 " | el:%s",
             copied_buf,
             rate_buf,
             file_rate_buf,
             snap.files_copied + snap.files_skipped,
             snap.files_seen,
+            skip_buf,
             snap.dirs_seen,
             sq,
             sa,
@@ -264,12 +273,13 @@ static void build_progress_line(char *out, size_t out_sz) {
             elapsed_buf);
     } else {
         n = snprintf(out, out_sz,
-            "%s payload, %s, %s, %" PRIu64 "/%" PRIu64 " files | el:%s",
+            "%s payload, %s, %s, %" PRIu64 "/%" PRIu64 " files%s | el:%s",
             copied_buf,
             rate_buf,
             file_rate_buf,
             snap.files_copied + snap.files_skipped,
             snap.files_seen,
+            skip_buf,
             elapsed_buf);
     }
 
