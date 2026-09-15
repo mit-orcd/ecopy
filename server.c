@@ -2047,6 +2047,10 @@ int server_main(const char *root, int read_only)
         fprintf(stderr, "ecopy --server: root must be an absolute path\n");
         return 1;
     }
+    /* sshd's stdin/stdout pipes into this process; enlarge them independently
+     * of the client-side ecopy↔ssh pipes. Harmless if not a pipe (tests). */
+    ecopy_grow_pipe(STDIN_FILENO);
+    ecopy_grow_pipe(STDOUT_FILENO);
     /* Remember our identity so apply_meta can skip no-op chown RPCs, and clear
      * the umask so O_CREAT lands the exact mode (no follow-up fchmod needed). */
     g_euid = geteuid();

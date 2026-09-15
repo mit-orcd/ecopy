@@ -235,4 +235,24 @@ static inline int ecopy_fchown_nocancel(int fd, uid_t uid, gid_t gid)
 #define ecopy_fchown_nocancel    fchown
 #endif
 
+/*
+ * Enlarge an anonymous pipe. Linux default capacity is 64 KiB; 1 MiB batches
+ * more between ecopy and ssh/sshd and cuts pipe-mutex spinning. No-op if fd
+ * is not a pipe, F_SETPIPE_SZ is missing (macOS), or the kernel caps the
+ * request at /proc/sys/fs/pipe-max-size.
+ */
+#ifndef ECOPY_PIPE_SZ
+#define ECOPY_PIPE_SZ (1024 * 1024)
+#endif
+
+static inline void ecopy_grow_pipe(int fd)
+{
+#ifdef F_SETPIPE_SZ
+    if (fd >= 0)
+        (void)fcntl(fd, F_SETPIPE_SZ, ECOPY_PIPE_SZ);
+#else
+    (void)fd;
+#endif
+}
+
 #endif /* ECOPY_COMPAT_H */

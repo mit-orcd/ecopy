@@ -443,6 +443,9 @@ static int spawn_ssh(const ssh_target_t *t, const char *remote_command,
 
     if (pipe(inpipe) != 0) { perror("pipe"); return -1; }
     if (pipe(outpipe) != 0) { perror("pipe"); close(inpipe[0]); close(inpipe[1]); return -1; }
+    /* One fd per pipe is enough; capacity is a property of the pipe object. */
+    ecopy_grow_pipe(inpipe[0]);
+    ecopy_grow_pipe(outpipe[0]);
 
     pid_t pid = fork();
     if (pid < 0) {
