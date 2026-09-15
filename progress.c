@@ -245,8 +245,11 @@ static void build_progress_line(char *out, size_t out_sz) {
         trim_to_width(out, get_terminal_width());
         return;
     }
-    format_bytes_adaptive(snap.bytes_completed, copied_buf, sizeof(copied_buf));
-    bytes_per_sec = snap.rolling_completed_gibs * 1024.0 * 1024.0 * 1024.0;
+    /* Payload + rate are copied bytes only. Skips are cheap metadata checks
+     * and must not inflate GiB/s (a skip-heavy re-run otherwise shows tens
+     * of GiB/s). File counts still include skips; "(N skipped)" flags them. */
+    format_bytes_adaptive(snap.bytes_copied, copied_buf, sizeof(copied_buf));
+    bytes_per_sec = snap.rolling_gibs * 1024.0 * 1024.0 * 1024.0;
     format_rate_adaptive(bytes_per_sec, rate_buf, sizeof(rate_buf));
     format_file_rate(snap.rolling_files_per_sec, bytes_per_sec > 0.0,
                      file_rate_buf, sizeof(file_rate_buf));
