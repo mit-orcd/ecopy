@@ -34,6 +34,7 @@ set -eu
 ECOPY_BIN=${ECOPY_BIN:-"$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/ecopy"}
 OUT=${ECOPY_PERF_OUT:-ecopy-client.data}
 FREQ=${ECOPY_PERF_FREQ:-997}
+EVENT=${ECOPY_PERF_EVENT:-cycles}
 
 if [ ! -x "$ECOPY_BIN" ]; then
     echo "ecopy binary not found at $ECOPY_BIN (set ECOPY_BIN)" >&2
@@ -49,5 +50,5 @@ if [ $# -lt 2 ]; then
 fi
 
 echo "profiling client: $ECOPY_BIN $*"
-echo "perf data -> $OUT"
-exec perf record -F "$FREQ" -g --inherit -o "$OUT" -- "$ECOPY_BIN" "$@"
+echo "perf data -> $OUT (event $EVENT)"
+exec perf record -e "$EVENT" -F "$FREQ" -g --inherit -o "$OUT" -- "$ECOPY_BIN" "$@"

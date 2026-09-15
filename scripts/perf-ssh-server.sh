@@ -34,21 +34,30 @@
 #       sudo perf record -g -p "$(pgrep -f 'sshd:.*@notty' | head -1)" ...
 #     System-wide (-a) also attributes kernel TCP/socket stacks, which is
 #     usually where WAN time goes after crypto.
-#   - If the client cannot find ecopy on the remote it bootstraps an uploaded
-#     binary and bypasses ECOPY_REMOTE_CMD - make sure the wrapper and
-#     ECOPY_BIN below are in place so the first handshake succeeds.
+#   - ssh's non-interactive PATH is usually /usr/bin:/bin, so a repo-local
+#     ecopy is invisible. This wrapper defaults ECOPY_BIN to ../ecopy next
+#     to the script (override if needed).
+#   - If handshake fails the client bootstraps an uploaded binary and
+#     bypasses this wrapper - abort if you see "bootstrapping remote binary".
+#   - If hardware cycles are unavailable (some VMs): ECOPY_PERF_EVENT=cpu-clock
 
 set -eu
 
-ECOPY_BIN=${ECOPY_BIN:-ecopy}          # resolved via remote PATH by default
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ECOPY_BIN=${ECOPY_BIN:-"$HERE/../ecopy"}
 OUT_DIR=${ECOPY_PERF_OUT_DIR:-/tmp}
 FREQ=${ECOPY_PERF_FREQ:-997}
+EVENT=${ECOPY_PERF_EVENT:-cycles}
 OUT="$OUT_DIR/ecopy-server.$$.data"
 
 if ! command -v perf >/dev/null 2>&1; then
     echo "perf-ssh-server: perf not found" >&2
     exit 1
 fi
+if [ ! -x "$ECOPY_BIN" ]; then
+    echo "perf-ssh-server: ecopy not executable at $ECOPY_BIN (set ECOPY_BIN)" >&2
+    exit 1
+fi
 
-echo "perf-ssh-server: recording to $OUT" >&2
-exec perf record -F "$FREQ" -g -o "$OUT" -- "$ECOPY_BIN" "$@"
+echo "perf-ssh-server: recording $ECOPY_BIN -> $OUT (event $EVENT)" >&2
+exec perf record -e "$EVENT" -F "$FREQ" -g -o "$OUT" -- "$ECOPY_BIN" "$@"
