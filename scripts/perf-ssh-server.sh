@@ -30,7 +30,7 @@
 #       sysctl kernel.perf_event_paranoid=1
 #   - This profiles the ecopy server only. The per-connection sshd does the
 #     decryption and lives *above* this process, so profile it separately:
-#       sudo perf record -a -g -o sshd.data -- sleep 60     # system-wide, or
+#       sudo perf record -a -g -o /tmp/sshd-sys.data         # system-wide, or
 #       sudo perf record -g -p "$(pgrep -f 'sshd:.*@notty' | head -1)" ...
 #     System-wide (-a) also attributes kernel TCP/socket stacks, which is
 #     usually where WAN time goes after crypto.
