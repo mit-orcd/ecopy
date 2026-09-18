@@ -15,9 +15,11 @@
 #include "workers.h"
 #include "ssh_transport.h"
 #include "hardlinks.h"
+#include "shutdown.h"
 
 #include <errno.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -862,6 +864,9 @@ static void process_dir_entries(dir_handle_t *handle,
         struct stat st;
         char src_path[PATH_MAX], dst_path[PATH_MAX];
 
+        /* Ctrl+C: stop stat'ing/mkdir'ing further entries in this directory. */
+        if (atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed)) break;
+
         if (!strcmp(ent_name, ".") || !strcmp(ent_name, "..")) continue;
 
         if (!remote) {
@@ -1067,6 +1072,13 @@ static void *traversal_worker_main(void *arg)
 
         pthread_mutex_lock(&g_dir_lock);
         for (;;) {
+            /* Ctrl+C: stop scanning immediately; queued dir nodes are
+             * reclaimed when the process exits. */
+            if (atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed)) {
+                pthread_mutex_unlock(&g_dir_lock);
+                file_scratch_free();
+                return NULL;
+            }
             node = pop_dir_locked();
             if (node) {
                 g_dir_active++;
@@ -1190,6 +1202,14 @@ void traversal_wait(void)
     free(g_threads);
     g_threads = NULL;
     stats_set_traversal_done();
+}
+
+void traversal_request_stop(void)
+{
+    pthread_mutex_lock(&g_dir_lock);
+    g_dir_done = 1;
+    pthread_cond_broadcast(&g_dir_cond);
+    pthread_mutex_unlock(&g_dir_lock);
 }
 
 int traversal_finalize_metadata(void)

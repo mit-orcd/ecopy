@@ -36,6 +36,7 @@ int workers_file_is_sparse(const struct stat *st);
 void workers_print_runtime_summary(void);
 void workers_print_startup_config(void);
 void workers_stop(void);
+void workers_request_stop(void);
 int workers_status(void);
 int workers_enqueue_small_file(dir_handle_t *dir,
                                const char *name,

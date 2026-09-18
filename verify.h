@@ -55,6 +55,7 @@ int verify_pipeline_finish(int remote, int include_dirs);
 int verify_run_tree(const char *src, const char *dst, int remote,
                     int source_is_dir);
 void verify_queue_clear(void);
+void verify_request_stop(void);
 int verify_worker_count(void);
 uint64_t verify_queue_depth(void);
 uint64_t verify_active_count(void);

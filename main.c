@@ -19,9 +19,11 @@
 #include "hardlinks.h"
 #include "types.h"
 #include "config.h"
+#include "shutdown.h"
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <limits.h>
 #include <errno.h>
@@ -29,6 +31,7 @@
 #include <sys/resource.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <signal.h>
 
 static void usage(const char *prog) {
     fprintf(stderr,
@@ -565,6 +568,8 @@ int main(int argc, char **argv) {
     uint32_t gid_override = 0;
     ssh_target_t target;
 
+    shutdown_install_handlers();
+
     /* Hidden remote peer mode: `ecopy --server <root>`. */
     if (argc == 3 && strcmp(argv[1], "--server") == 0) {
         return server_main(argv[2], 0);
@@ -901,6 +906,10 @@ int main(int argc, char **argv) {
         progress_stop();
         stats_set_shutdown_done();
         printf("\n");
+        if (atomic_load(&g_ecopy_shutdown)) {
+            printf("Interrupted.\n");
+            return 130;
+        }
         stats_print_final(verbose);
         return verify_failed ? 1 : 0;
     }
@@ -947,6 +956,20 @@ int main(int argc, char **argv) {
         stats_set_traversal_done();
     }
     workers_stop();
+
+    if (atomic_load(&g_ecopy_shutdown)) {
+        /*
+         * Ctrl+C: the destination is incomplete by definition, so skip hard
+         * link replay, metadata finalization, and verification; just stop the
+         * remaining threads and exit with the conventional 128+SIGINT.
+         */
+        if (verify_pipeline_on) verify_pipeline_finish(remote, 0);
+        sshx_disconnect();
+        progress_stop();
+        stats_set_shutdown_done();
+        printf("\nInterrupted (partial destination left in place).\n");
+        return 130;
+    }
 
     /*
      * Materialize deferred hard links before finalizing directory metadata.

@@ -40,6 +40,7 @@ OBJS = \
 	hardlinks.o \
 	copy_policy.o \
 	verify.o \
+	shutdown.o \
 	$(BLAKE3_OBJS) \
 	suggestion.o \
 	protocol.o \

@@ -17,6 +17,7 @@
 #include "telemetry.h"
 #include "ssh_transport.h"
 #include "protocol.h"
+#include "shutdown.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,6 +31,7 @@
 #include <sys/syscall.h>
 #include <limits.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <time.h>
 
 #ifndef SEEK_DATA
@@ -109,6 +111,9 @@ typedef struct large_file_ctx {
     int readers_started;
     int writers_started;
     uint64_t service_start_ns;
+    /* Intrusive link in g_active_large (under g_queue_lock): lets
+     * workers_request_stop() fail parked reader/writer threads on Ctrl+C. */
+    struct large_file_ctx *next_active;
 } large_file_ctx_t;
 
 typedef struct {
@@ -225,6 +230,12 @@ static file_task_t    *g_task_freelist = NULL;
 static int             g_queue_done = 0;
 static uint64_t        g_small_workers_active = 0;
 static uint64_t        g_large_workers_active = 0;
+/*
+ * Active large-file pipelines, linked via large_file_ctx_t.next_active under
+ * g_queue_lock. workers_request_stop() walks it to fail every in-flight large
+ * file so parked reader/writer threads wake and unwind on Ctrl+C.
+ */
+static large_file_ctx_t *g_active_large = NULL;
 /*
  * When set (default), dispatch prefers files with the most allocated data.
  * When 0, sched_key falls back to enqueue order so the heaps behave FIFO.
@@ -1586,6 +1597,12 @@ static void *large_reader_main(void *arg)
         int i;
 
         pthread_mutex_lock(&ctx->lock);
+        /* Ctrl+C unwinds a multi-GB file through the normal failure teardown
+         * (buffers reclaimed, temp file unlinked) instead of copying on. */
+        if (atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed) &&
+            !ctx->failed) {
+            mark_large_file_failed_locked(ctx);
+        }
         while (!ctx->failed && !ctx->free_head && ctx->next_read_offset < ctx->bulk_end) {
             uint64_t wait_start_ns = g_collect_wait_timing ? monotonic_ns() : 0;
             ctx->free_waiters++;
@@ -1702,6 +1719,10 @@ static void *large_writer_main(void *arg)
         int i;
 
         pthread_mutex_lock(&ctx->lock);
+        if (atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed) &&
+            !ctx->failed) {
+            mark_large_file_failed_locked(ctx);
+        }
         while (!ctx->failed && !ctx->ready_head && !ctx->read_done) {
             uint64_t wait_start_ns = g_collect_wait_timing ? monotonic_ns() : 0;
             ctx->ready_waiters++;
@@ -1712,7 +1733,9 @@ static void *large_writer_main(void *arg)
             }
         }
 
-        if ((ctx->failed && !ctx->ready_head) || (!ctx->ready_head && ctx->read_done)) {
+        /* On shutdown do not keep writing already-read buffers. */
+        if (atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed) ||
+            (ctx->failed && !ctx->ready_head) || (!ctx->ready_head && ctx->read_done)) {
             ctx->active_writers--;
             pthread_mutex_unlock(&ctx->lock);
             break;
@@ -1881,6 +1904,18 @@ static void finish_large_file_ctx(large_file_ctx_t *ctx)
     if (g_large_workers_active > 0) {
         g_large_workers_active--;
     }
+    /* Unregister from the active large-file list (lock ordering is
+     * g_queue_lock -> ctx->lock everywhere, matching workers_request_stop()). */
+    {
+        large_file_ctx_t **link = &g_active_large;
+        while (*link) {
+            if (*link == ctx) {
+                *link = ctx->next_active;
+                break;
+            }
+            link = &(*link)->next_active;
+        }
+    }
     pthread_cond_broadcast(&g_queue_cond);
     pthread_cond_broadcast(&g_large_done_cond);
     pthread_mutex_unlock(&g_queue_lock);
@@ -2012,6 +2047,15 @@ static int start_large_file_copy(file_task_t *task)
         advise_dest_streaming(ctx->fd_out);
     }
 
+    /* Register before spawning threads so workers_request_stop() can fail
+     * this file's parked reader/writer threads on Ctrl+C. Removed in
+     * finish_large_file_ctx() (also on the fail_started path, which runs
+     * finish synchronously). */
+    pthread_mutex_lock(&g_queue_lock);
+    ctx->next_active = g_active_large;
+    g_active_large = ctx;
+    pthread_mutex_unlock(&g_queue_lock);
+
     for (i = 0; i < ctx->reader_count; i++) {
         if (pthread_create(&ctx->reader_threads[i], NULL, large_reader_main, ctx) != 0) {
             perror("pthread_create");
@@ -2089,7 +2133,8 @@ static work_claim_t dequeue_work(file_task_t **stash, int *stash_head,
     work_claim_t claim;
     memset(&claim, 0, sizeof(claim));
 
-    if (*stash_head < *stash_count) {
+    if (*stash_head < *stash_count &&
+        !atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed)) {
         claim.kind = WORK_SMALL_FILE;
         claim.file_task = stash[(*stash_head)++];
         return claim;
@@ -2097,8 +2142,39 @@ static work_claim_t dequeue_work(file_task_t **stash, int *stash_head,
 
     pthread_mutex_lock(&g_queue_lock);
 
+    if (atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed)) {
+        /*
+         * Ctrl+C: abandon instead of drain. Recycle the stash remainder and
+         * wake any producer parked on a full queue so it can observe the
+         * shutdown flag; tasks still in the ring/heap are freed by
+         * workers_stop().
+         */
+        while (*stash_head < *stash_count) {
+            file_task_t *t = stash[(*stash_head)++];
+            dir_handle_release(t->dir);
+            t->next = g_task_freelist;
+            g_task_freelist = t;
+            if (g_small_workers_active > 0) {
+                g_small_workers_active--;
+            }
+        }
+        *stash_count = 0;
+        pthread_cond_broadcast(&g_space_cond);
+        pthread_mutex_unlock(&g_queue_lock);
+        return claim;
+    }
+
     for (;;) {
         int total_slots_used = total_worker_slots_used_locked();
+
+        if (atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed)) {
+            /* Parked worker woken by workers_request_stop(): leave queued
+             * work for workers_stop() to free and wake producers so they
+             * can unwind too. */
+            pthread_cond_broadcast(&g_space_cond);
+            break;
+        }
+
 
         if (g_large_heap.len > 0 &&
             (int)g_large_workers_active < g_max_active_large_files &&
@@ -2272,7 +2348,8 @@ static int copy_file_remote(file_task_t *task, uint64_t *payload_bytes)
 
     if (sparse) {
         off_t pos = 0;
-        while (pos < size) {
+        while (pos < size &&
+               !atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed)) {
             off_t data = lseek(fd_in, pos, SEEK_DATA);
             if (data < 0) {
                 if (errno == ENXIO) break;
@@ -2302,12 +2379,16 @@ static int copy_file_remote(file_task_t *task, uint64_t *payload_bytes)
             }
             pos = hole;
         }
+        if (atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed)) {
+            goto out;
+        }
         if (sshx_file_ftruncate(f, size) != 0) {
             goto out;
         }
     } else {
         off_t pos = 0;
-        while (pos < size) {
+        while (pos < size &&
+               !atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed)) {
             /* Chunk-aligned count keeps O_DIRECT reads valid up to EOF. */
             ssize_t r = pread_nocancel(fd_in, buf, chunk, pos);
             if (r < 0) { perror("pread"); goto out; }
@@ -2316,6 +2397,9 @@ static int copy_file_remote(file_task_t *task, uint64_t *payload_bytes)
             pos += r;
             record_progress_bytes((uint64_t)r, 1);
             if (payload_bytes) *payload_bytes += (uint64_t)r;
+        }
+        if (atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed)) {
+            goto out;
         }
     }
 
@@ -2483,6 +2567,27 @@ int workers_start(void)
     }
 
     return 0;
+}
+
+void workers_request_stop(void)
+{
+    pthread_mutex_lock(&g_queue_lock);
+    g_queue_done = 1;
+    pthread_cond_broadcast(&g_queue_cond);
+    pthread_cond_broadcast(&g_large_done_cond);
+    /*
+     * Fail every in-flight large file: without this its parked reader/writer
+     * threads would stay asleep on the per-file condvars (nothing else wakes
+     * them) and workers_stop() would hang waiting for the slot release.
+     */
+    for (large_file_ctx_t *c = g_active_large; c; c = c->next_active) {
+        pthread_mutex_lock(&c->lock);
+        if (!c->failed) {
+            mark_large_file_failed_locked(c);
+        }
+        pthread_mutex_unlock(&c->lock);
+    }
+    pthread_mutex_unlock(&g_queue_lock);
 }
 
 void workers_stop(void)
@@ -2683,12 +2788,18 @@ int workers_enqueue_batch(dir_handle_t *dir,
 
         pthread_mutex_lock(&g_queue_lock);
         while ((int)(g_small_ring.len + g_large_heap.len) >=
-               g_max_queued_files) {
+               g_max_queued_files &&
+               !atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed)) {
             uint64_t wait_start_ns = g_collect_wait_timing ? monotonic_ns() : 0;
             pthread_cond_wait(&g_space_cond, &g_queue_lock);
             if (g_collect_wait_timing) {
                 stats_record_queue_wait_ns(monotonic_ns() - wait_start_ns);
             }
+        }
+        if (atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed)) {
+            pthread_mutex_unlock(&g_queue_lock);
+            errno = ECANCELED;
+            goto fail;
         }
         room = (size_t)(g_max_queued_files -
                         (int)(g_small_ring.len + g_large_heap.len));

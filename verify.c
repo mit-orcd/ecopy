@@ -14,6 +14,7 @@
 #include "progress.h"
 #include "ssh_transport.h"
 #include "stats.h"
+#include "shutdown.h"
 #include "third_party/blake3/blake3.h"
 
 #include <errno.h>
@@ -939,6 +940,21 @@ typedef struct {
 /* The long-lived pool used by the copy/verify pipeline. */
 static verify_pool_t g_pipe_pool;
 
+void verify_request_stop(void)
+{
+    pthread_mutex_lock(&g_queue_lock);
+    g_feeder_stop = 1;
+    pthread_cond_broadcast(&g_queue_cv);
+    pthread_cond_broadcast(&g_space_cv);
+    pthread_mutex_unlock(&g_queue_lock);
+
+    pthread_mutex_lock(&g_pipe_pool.lock);
+    g_pipe_pool.stop = 1;
+    pthread_cond_broadcast(&g_pipe_pool.work_cv);
+    pthread_cond_broadcast(&g_pipe_pool.space_cv);
+    pthread_mutex_unlock(&g_pipe_pool.lock);
+}
+
 static void free_item(verify_item_t *item)
 {
     if (!item) return;
@@ -966,6 +982,12 @@ static void *verify_pool_worker(void *arg)
         pthread_mutex_lock(&pool->lock);
         while (!pool->head && !pool->stop) {
             pthread_cond_wait(&pool->work_cv, &pool->lock);
+        }
+        /* Ctrl+C abandons queued items (freed by verify_pool_finish); the
+         * normal stop path still drains them so verification can complete. */
+        if (atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed)) {
+            pthread_mutex_unlock(&pool->lock);
+            break;
         }
         if (!pool->head) {
             pthread_mutex_unlock(&pool->lock);
@@ -1031,10 +1053,12 @@ static int verify_pool_start(verify_pool_t *pool, int remote)
 static int verify_pool_submit(verify_pool_t *pool, verify_item_t *item)
 {
     pthread_mutex_lock(&pool->lock);
-    while (pool->queued >= pool->limit && !pool->stop) {
+    while (pool->queued >= pool->limit && !pool->stop &&
+           !atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed)) {
         pthread_cond_wait(&pool->space_cv, &pool->lock);
     }
-    if (pool->stop) {
+    if (pool->stop ||
+        atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed)) {
         pthread_mutex_unlock(&pool->lock);
         return -1;
     }
@@ -1060,6 +1084,13 @@ static int verify_pool_finish(verify_pool_t *pool)
         pthread_join(pool->threads[i], NULL);
     }
     int failed = pool->failed;
+    /* Items abandoned by the workers on shutdown; normally already empty. */
+    while (pool->head) {
+        verify_item_t *next = pool->head->next;
+        free_item(pool->head);
+        pool->head = next;
+    }
+    pool->tail = NULL;
     stats_set_verify_runtime(-1, pool->nthreads,
                              pool->queue_peak, pool->active_peak);
     free(pool->threads);
@@ -1184,13 +1215,18 @@ static void *verify_feeder_main(void *arg)
         verify_item_t *batch = g_head;
         g_head = g_tail = NULL;
         int stop = g_feeder_stop;
+        int shutting_down =
+            atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed);
         pthread_mutex_unlock(&g_queue_lock);
 
         uint64_t stolen = 0;
         while (batch) {
             verify_item_t *next = batch->next;
             batch->next = NULL;
-            if (batch->durable) {
+            if (shutting_down) {
+                /* Ctrl+C: drop instead of submitting for verification. */
+                free_item(batch);
+            } else if (batch->durable) {
                 if (verify_pool_submit(&g_pipe_pool, batch) != 0) {
                     free_item(batch);
                     g_feeder_failed = 1;
@@ -1203,6 +1239,16 @@ static void *verify_feeder_main(void *arg)
             }
             stolen++;
             batch = next;
+        }
+        if (shutting_down) {
+            /* Discard the accumulated generation without flushing it. */
+            while (gen_head) {
+                verify_item_t *next = gen_head->next;
+                free_item(gen_head);
+                gen_head = next;
+            }
+            gen_tail = NULL;
+            gen_count = 0;
         }
         if (stolen) {
             pthread_mutex_lock(&g_queue_lock);
@@ -1371,6 +1417,11 @@ static int walk_submit(verify_pool_t *pool, const char *src, const char *dst,
     }
     int failed = 0;
     for (;;) {
+        /* Ctrl+C: stop walking; the pool abandons its queue on shutdown. */
+        if (atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed)) {
+            failed = 1;
+            break;
+        }
         errno = 0;
         struct dirent *de = readdir(dir);
         if (!de) {
