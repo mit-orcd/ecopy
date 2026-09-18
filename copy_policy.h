@@ -32,9 +32,5 @@ int copy_policy_small_inplace(void);
 void copy_policy_set_id_override(int uid_set, uint32_t uid,
                                  int gid_set, uint32_t gid);
 void copy_policy_apply_id_override(struct stat *st);
-int copy_policy_uid_override_set(void);
-uint32_t copy_policy_uid_override_value(void);
-int copy_policy_gid_override_set(void);
-uint32_t copy_policy_gid_override_value(void);
 
 #endif

@@ -167,11 +167,9 @@ void verify_configure(int metadata, int data, double percent,
 int verify_enabled(void) { return g_cfg.metadata || g_cfg.data; }
 int verify_metadata_enabled(void) { return g_cfg.metadata; }
 int verify_data_enabled(void) { return g_cfg.data; }
-int verify_include_skipped(void) { return g_cfg.include_skipped; }
 double verify_percent(void) { return g_cfg.percent; }
 uint64_t verify_seed(void) { return g_cfg.seed; }
 int verify_worker_count(void) { return g_cfg.workers; }
-uint64_t verify_queue_depth(void) { return atomic_load(&g_run_queue_depth); }
 uint64_t verify_active_count(void) { return atomic_load(&g_run_active); }
 
 /*
@@ -364,24 +362,6 @@ verify_meta_class_t verify_metadata_stat(const struct stat *expected,
     fprintf(stderr, "ecopy: verification metadata mismatch: %s (%s)\n",
             path, owner_field);
     return VERIFY_META_MISMATCH;
-}
-
-int verify_metadata_path(const char *path, const struct stat *expected,
-                         int is_dir)
-{
-    struct stat actual;
-    if (!g_cfg.metadata) return 0;
-    if (lstat(path, &actual) != 0) {
-        progress_interrupt();
-        perror(path);
-        stats_record_verify(0, 0, 0, 1, 0, 0, 0, 1, 1);
-        return -1;
-    }
-    verify_meta_class_t cls = verify_metadata_stat(expected, &actual, is_dir, path);
-    if (cls == VERIFY_META_OWNERSHIP) stats_record_verify_ownership(1);
-    int meta_bad = (cls == VERIFY_META_MISMATCH);
-    stats_record_verify(0, 0, 0, 1, 0, meta_bad, 0, 0, meta_bad);
-    return meta_bad ? -1 : 0;
 }
 
 static ssize_t pread_full(int fd, void *buf, size_t len, off_t off)

@@ -30,7 +30,6 @@ void verify_configure(int metadata, int data, double percent,
 int verify_enabled(void);
 int verify_metadata_enabled(void);
 int verify_data_enabled(void);
-int verify_include_skipped(void);
 double verify_percent(void);
 uint64_t verify_seed(void);
 
@@ -57,7 +56,6 @@ int verify_run_tree(const char *src, const char *dst, int remote,
 void verify_queue_clear(void);
 void verify_request_stop(void);
 int verify_worker_count(void);
-uint64_t verify_queue_depth(void);
 uint64_t verify_active_count(void);
 uint64_t verify_outstanding_count(void);
 
@@ -80,7 +78,5 @@ verify_meta_class_t verify_metadata_stat(const struct stat *expected,
                                          const struct stat *actual,
                                          int is_dir,
                                          const char *path);
-int verify_metadata_path(const char *path, const struct stat *expected,
-                         int is_dir);
 
 #endif

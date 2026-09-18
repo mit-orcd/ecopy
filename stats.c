@@ -347,8 +347,6 @@ void stats_record_write_open(int used_direct) {
 }
 
 void stats_record_queue_wait_ns(uint64_t ns) { pthread_mutex_lock(&g_lock); g_stats.queue_wait_ns += ns; pthread_mutex_unlock(&g_lock); }
-void stats_record_read_io(uint64_t ns) { hot_add(&a_read_syscalls, 1); hot_add(&a_read_ns, ns); }
-void stats_record_write_io(uint64_t ns) { hot_add(&a_write_syscalls, 1); hot_add(&a_write_ns, ns); }
 
 void stats_record_read_op(void) {
     if (++tls_read_ops >= IO_OP_FLUSH_THRESHOLD) {
@@ -425,7 +423,6 @@ void stats_inc_hardlink_created(void){ pthread_mutex_lock(&g_lock); g_stats.hard
 void stats_add_hardlink_saved(uint64_t bytes){ pthread_mutex_lock(&g_lock); g_stats.hardlink_bytes_saved += bytes; pthread_mutex_unlock(&g_lock);} 
 void stats_record_copy_file_range_call(uint64_t bytes) { pthread_mutex_lock(&g_lock); g_stats.copy_file_range_calls++; g_stats.copy_file_range_bytes += bytes; pthread_mutex_unlock(&g_lock); }
 void stats_record_copy_file_range_fallback(void) { pthread_mutex_lock(&g_lock); g_stats.copy_file_range_fallbacks++; pthread_mutex_unlock(&g_lock); }
-void stats_add_copy_file_range_usage(uint64_t calls, uint64_t bytes, uint64_t fallbacks) { pthread_mutex_lock(&g_lock); g_stats.copy_file_range_calls += calls; g_stats.copy_file_range_bytes += bytes; g_stats.copy_file_range_fallbacks += fallbacks; pthread_mutex_unlock(&g_lock); } 
 void stats_inc_metadata_warning(void) { pthread_mutex_lock(&g_lock); g_stats.metadata_warnings++; pthread_mutex_unlock(&g_lock); }
 void stats_inc_metadata_error(void) { pthread_mutex_lock(&g_lock); g_stats.metadata_errors++; pthread_mutex_unlock(&g_lock); }
 void stats_set_verify_config(int metadata, int data, double percent, uint64_t seed) {
@@ -476,11 +473,6 @@ void stats_record_verify(uint64_t bytes, uint64_t scope_bytes, uint64_t blocks,
     if (expected_zero_mismatch) g_stats.verify_zero_mismatches++;
     if (io_failure) g_stats.verify_io_failures++;
     if (failed) g_stats.verify_failures++;
-    pthread_mutex_unlock(&g_lock);
-}
-void stats_mark_verify_failure(void) {
-    pthread_mutex_lock(&g_lock);
-    g_stats.verify_failures++;
     pthread_mutex_unlock(&g_lock);
 }
 void stats_record_verify_holes(uint64_t blocks, uint64_t bytes) {
@@ -654,76 +646,6 @@ double stats_elapsed_sec(void) {
     start = g_stats.start_ts;
     pthread_mutex_unlock(&g_lock);
     return ts_to_sec(&now) - ts_to_sec(&start);
-}
-
-double stats_traversal_elapsed_sec(void) {
-    struct timespec start, done;
-    int traversal_done;
-
-    pthread_mutex_lock(&g_lock);
-    start = g_stats.start_ts;
-    done = g_stats.traversal_done_ts;
-    traversal_done = g_stats.traversal_done;
-    pthread_mutex_unlock(&g_lock);
-
-    if (!traversal_done) {
-        return 0.0;
-    }
-    return ts_to_sec(&done) - ts_to_sec(&start);
-}
-
-double stats_file_work_drained_elapsed_sec(void) {
-    struct timespec start, done;
-    int file_work_drained;
-
-    pthread_mutex_lock(&g_lock);
-    start = g_stats.start_ts;
-    done = g_stats.file_work_drained_ts;
-    file_work_drained = g_stats.file_work_drained;
-    pthread_mutex_unlock(&g_lock);
-
-    if (!file_work_drained) {
-        return 0.0;
-    }
-    return ts_to_sec(&done) - ts_to_sec(&start);
-}
-
-double stats_finalize_elapsed_sec(void) {
-    struct timespec start, done;
-    int file_work_drained;
-
-    pthread_mutex_lock(&g_lock);
-    start = g_stats.file_work_drained_ts;
-    done = g_stats.finalize_done_ts;
-    file_work_drained = g_stats.file_work_drained;
-    pthread_mutex_unlock(&g_lock);
-
-    if (!file_work_drained || done.tv_sec == 0) {
-        return 0.0;
-    }
-    return ts_to_sec(&done) - ts_to_sec(&start);
-}
-
-double stats_shutdown_elapsed_sec(void) {
-    struct timespec start, done;
-    int finalize_done;
-
-    pthread_mutex_lock(&g_lock);
-    start = g_stats.finalize_done_ts;
-    done = g_stats.shutdown_done_ts;
-    finalize_done = g_stats.finalize_done;
-    pthread_mutex_unlock(&g_lock);
-
-    if (!finalize_done || done.tv_sec == 0) {
-        return 0.0;
-    }
-    return ts_to_sec(&done) - ts_to_sec(&start);
-}
-
-double stats_avg_gibs(void) {
-    double elapsed = stats_elapsed_sec();
-    uint64_t bytes = hot_load(&a_bytes_copied);
-    return elapsed > 0.0 ? stats_bytes_to_gib(bytes) / elapsed : 0.0;
 }
 
 double stats_rolling_gibs(void) {

@@ -53,9 +53,6 @@ int sshx_connect(const ssh_target_t *t);
 /* True once a remote destination is active for this run. */
 int sshx_active(void);
 
-/* Number of parallel SSH connections established for this run (>=1). */
-int sshx_connection_count(void);
-
 /*
  * Bind the calling thread to one connection of the pool (by index, taken mod
  * the connection count). All subsequent transport calls on this thread use that
@@ -99,12 +96,6 @@ int sshx_remote_root_present(void);
 int sshx_mkdir(const char *path, mode_t mode);
 
 /*
- * Stat a single remote path. Returns 1 if present (fills mode/size/mtime in
- * st), 0 if absent, -1 on protocol/error.
- */
-int sshx_stat(const char *path, struct stat *st);
-
-/*
  * Bulk-stat: base directory path + n child names, one round-trip. results[i]
  * is set to 1 present / 0 absent, and st[i] filled when present. Returns 0 on
  * success, -1 on error.
@@ -136,15 +127,6 @@ int sshx_link(const char *primary_path, const char *link_path);
  */
 int sshx_putfile(const char *final_path, const struct stat *src_st,
                  mode_t parent_mode, const void *buf, size_t len, int inplace);
-
-/*
- * Synchronization point on the calling thread's connection: drain its prior
- * fire-and-forget frames, optionally flush to stable storage, and collect the
- * cumulative remote error count. Returns 0 if no remote errors so far, -1
- * otherwise (a diagnostic with the first failing path is printed). Use
- * sshx_barrier_all at phase boundaries that must cover every connection.
- */
-int sshx_barrier(int flush);
 
 /* Barrier every connection in the pool (used at phase boundaries). */
 int sshx_barrier_all(int flush);

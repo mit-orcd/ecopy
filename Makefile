@@ -3,10 +3,8 @@ CPPFLAGS ?=
 CFLAGS   ?= -O3 -Wall -Wextra -pthread
 LDFLAGS  ?= -pthread
 DEPFLAGS ?= -MMD -MP
-PKG_CONFIG ?= pkg-config
 
 TARGET = ecopy
-JEMALLOC_TARGET = ecopy-jemalloc
 ARCH := $(shell uname -m)
 
 BLAKE3_OBJS = \
@@ -47,30 +45,9 @@ OBJS = \
 	ssh_transport.o \
 	server.o
 
-ifneq ($(MAKECMDGOALS),clean)
-JEMALLOC_PKGCONFIG := $(shell command -v $(PKG_CONFIG) >/dev/null 2>&1 && $(PKG_CONFIG) --exists jemalloc && echo yes)
-ifeq ($(JEMALLOC_PKGCONFIG),yes)
-HAVE_JEMALLOC := yes
-JEMALLOC_CFLAGS := $(shell $(PKG_CONFIG) --cflags jemalloc)
-JEMALLOC_LIBS := $(shell $(PKG_CONFIG) --libs jemalloc)
-else
-JEMALLOC_CHECK := $(shell tmp=$$(mktemp "$${TMPDIR:-/tmp}/ecopy-jemalloc-check.XXXXXX" 2>/dev/null) || exit 0; printf '\043include <jemalloc/jemalloc.h>\nint main\050void\051 { return 0; }\n' | $(CC) $(CPPFLAGS) $(CFLAGS) -x c - -o "$$tmp" -ljemalloc >/dev/null 2>&1; status=$$?; rm -f "$$tmp"; [ $$status -eq 0 ] && echo yes)
-ifeq ($(JEMALLOC_CHECK),yes)
-HAVE_JEMALLOC := yes
-JEMALLOC_CFLAGS :=
-JEMALLOC_LIBS := -ljemalloc
-endif
-endif
-endif
+.PHONY: all clean test
 
-OPTIONAL_TARGETS =
-ifeq ($(HAVE_JEMALLOC),yes)
-OPTIONAL_TARGETS += $(JEMALLOC_TARGET)
-endif
-
-.PHONY: all clean test protocol_test telemetry_test blake3_bench
-
-all: $(TARGET) $(OPTIONAL_TARGETS)
+all: $(TARGET)
 
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS)
@@ -87,26 +64,14 @@ third_party/blake3/blake3_sse41.o: override CFLAGS += -mssse3 -msse4.1
 third_party/blake3/blake3_avx2.o: override CFLAGS += -mavx2
 third_party/blake3/blake3_avx512.o: override CFLAGS += -mavx512f -mavx512vl
 
-ifeq ($(HAVE_JEMALLOC),yes)
-$(JEMALLOC_TARGET): $(OBJS)
-	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ $(OBJS) $(LDFLAGS) $(JEMALLOC_LIBS)
-else
-$(JEMALLOC_TARGET):
-	@echo "jemalloc headers/libs were not found; $@ was not built"
-	@false
-endif
-
 protocol_test: tests/protocol_test.c protocol.o $(BLAKE3_OBJS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tests/protocol_test.c protocol.o $(BLAKE3_OBJS) $(LDFLAGS)
 
 telemetry_test: tests/telemetry_test.c telemetry.o stats.o $(BLAKE3_OBJS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tests/telemetry_test.c telemetry.o stats.o $(BLAKE3_OBJS) $(LDFLAGS)
 
-blake3_bench: tests/blake3_bench.c $(BLAKE3_OBJS)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tests/blake3_bench.c $(BLAKE3_OBJS) $(LDFLAGS)
-
 clean:
-	rm -f *.o *.d third_party/blake3/*.o third_party/blake3/*.d $(TARGET) $(JEMALLOC_TARGET) direct_copy protocol_test telemetry_test blake3_bench
+	rm -f *.o *.d third_party/blake3/*.o third_party/blake3/*.d $(TARGET) protocol_test telemetry_test
 	rm -rf *.dSYM   # debug bundles, emitted when linking with -g on macOS
 
 test: $(TARGET) protocol_test telemetry_test

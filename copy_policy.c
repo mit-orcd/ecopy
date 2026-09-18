@@ -67,23 +67,3 @@ void copy_policy_apply_id_override(struct stat *st)
     if (g_uid_override_set) st->st_uid = (uid_t)g_uid_override;
     if (g_gid_override_set) st->st_gid = (gid_t)g_gid_override;
 }
-
-int copy_policy_uid_override_set(void)
-{
-    return g_uid_override_set;
-}
-
-uint32_t copy_policy_uid_override_value(void)
-{
-    return g_uid_override;
-}
-
-int copy_policy_gid_override_set(void)
-{
-    return g_gid_override_set;
-}
-
-uint32_t copy_policy_gid_override_value(void)
-{
-    return g_gid_override;
-}

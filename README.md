@@ -1,398 +1,191 @@
 # ecopy
 
-`ecopy` is a parallel directory copy tool for moving large regular-file datasets quickly over high-throughput
-storage paths (tested on NFS v4.2 exports and local filesystems). It keeps source, network, and target busy at the
-same time using a shared pool of read/write/traversal workers. Linux is the primary target; macOS is supported
-with the fallbacks listed under [Platforms](#platforms).
+Parallel copy for large file trees over fast storage (local, NFS, or `ssh://`). It keeps source, network, and
+target busy at once, skips unchanged files, preserves sparse files and hard links, and can verify what it copied.
+Linux is the primary platform; macOS is supported with fallbacks (see [Platforms](#platforms)).
 
-## Quick Start
+## Quick start
 
 ```bash
 make
-./ecopy <source> <target>
+./ecopy /src/tree /dst/tree                     # copy a directory tree
+./ecopy /src/data.bin /dst/                     # copy one file into a directory
+./ecopy /src/tree ssh://user@host/data/tree     # push to another host
+./ecopy --verify /src/tree /dst/tree            # copy, then check metadata + a 1% data sample
+./ecopy --verify-only /src/tree /dst/tree       # check an existing copy; changes nothing
 ```
 
-- `source` may be an existing directory or a single regular file.
-- For a **directory** source, source and target must not overlap; the target root and the matching tree beneath it
-  are created as needed.
-- For a **single file** source, `target` is the destination directory (the file keeps its name), or — locally — a
-  full destination path to also rename it. `ssh://` targets are always treated as the destination directory.
-- Add `-v`/`--verbose` to print the resolved config and full diagnostic counters.
+- `source` is a directory or a single regular file; `target` is a local path or `ssh://[user@]host[:port]/path`.
+- A single-file target is the destination directory (file keeps its name) or, locally, a full path to rename it.
+- For a directory source, source and target must not overlap. Missing target directories are created.
+- Re-running is incremental: files with matching `size + mtime` are skipped.
+- `-v` shows queue depths, verify worker counts, and the current file on the progress line.
 
-Common variations:
+Buffered I/O is often faster for many small files:
 
 ```bash
-# Copy one file into a directory (keeps its name)
-./ecopy /src/data.bin /dst/
-
-# Copy + rename one file (local only)
-./ecopy /src/data.bin /dst/data-2026.bin
-
-# Push one file to a remote directory
-./ecopy /src/data.bin ssh://user@host/data/incoming/
-
-# Many small files / metadata-heavy trees: buffered I/O is often faster
-DIRECT_COPY_DISABLE_DIRECT_IO=1 DIRECT_COPY_MAX_WORKERS=16 ./ecopy /src /dst
-
-# Large aligned streaming copies (defaults are already tuned for this)
-./ecopy /src /dst
-
-# Mixed mode: buffered reads, direct writes
-DIRECT_COPY_DISABLE_READ_DIRECT_IO=1 ./ecopy /src /dst
+DIRECT_COPY_DISABLE_DIRECT_IO=1 ./ecopy /src /dst
 ```
 
-## Remote (SSH) Targets
+## What is preserved
 
-The target may be an `ssh://` URL to push a local tree to another host:
+Regular files, directories, symlinks (verbatim, never followed), and hard links (copied once, then linked; a
+cross-filesystem link falls back to a copy). Sparse files copy only their data extents. Permission bits, `atime`,
+`mtime`, and `uid`/`gid` are preserved; ownership is best effort when unprivileged (see below).
+
+Not preserved: xattrs, ACLs, SELinux labels, capabilities. Devices, FIFOs, and sockets are ignored on the source
+and rejected on the target. A top-level source that is itself a symlink is rejected.
+
+**Atomicity.** Into an *existing* target tree, each file is written to a same-directory temp file and renamed into
+place after data and metadata are complete. Into a *new* target root, small files are written directly to their
+final name for speed, so an interrupted first copy can leave partial files there. Do not let another writer
+populate a root while its first copy runs.
+
+## Options
+
+| Flag | Effect |
+| --- | --- |
+| `-v`, `--verbose` | Detailed progress line and full diagnostic counters in the report |
+| `--no-preserve-times` | Do not copy or verify `atime`/`mtime` |
+| `--uid N`, `--gid N` | Force target ownership of every object to `N` (the other id stays from source) |
+| `--verify` | After copy: metadata check plus a 1% sampled data check |
+| `--verify-metadata` | Check type, size, mode, uid/gid, and timestamps |
+| `--verify-data[=PCT]` | Check `PCT`% of aligned 4 KiB blocks (default 1); first and last block always |
+| `--verify-skipped` | Also verify files skipped as unchanged |
+| `--verify-seed N` | Reproducible block selection (default random; the seed used is printed) |
+| `--verify-only` | Compare source and target without copying, creating, or repairing anything |
+| `--verify-workers N` | Checker threads, 1–128 (default `min(cpus,16)`, `min(cpus,8)` over ssh) |
+
+## Verification
+
+- Verification is opt-in; plain copies pay nothing for it. For directory trees it runs *pipelined* with the copy,
+  so `Verify wall sec` overlaps the copy timings — `Total Elapsed` is the ground truth.
+- Data sampling is relative to *allocated* data: holes in sparse files are never read or hashed, so a 1% sample of a
+  mostly-empty image reads 1% of its real data. Sampled holes on the target must read as zeros.
+- Ownership that could not be preserved is not a failure. An unprivileged process cannot `chown` to a foreign uid;
+  such objects are counted on a separate `Ownership not preserved` line and the run still exits 0. A group you belong
+  to *is* applied even when the owner uid cannot be. Mode, size, and time mismatches are always failures.
+- `--uid`/`--gid` are applied where each object's metadata is captured, so the copy and the verification agree on
+  the forced ids. They do not reduce crawling and cannot bypass the privilege rules above.
+- `--verify-only` requires every source file and directory to exist on the target, ignores target-only extras, and
+  over ssh starts a read-only peer that refuses to create a missing root.
+- Over ssh, 32-byte BLAKE3 digests are sent to the peer, which hashes its own blocks; file data never comes back.
+- When timestamps are verified, reads use `O_NOATIME`. If the caller lacks permission for it, verification fails
+  rather than invalidate the atime it is checking; use `--no-preserve-times` or metadata-only checks instead.
+
+## SSH targets
 
 ```bash
 ./ecopy /local/src ssh://user@host:22/data/dst
 ```
 
-- **Push only.** The source is always local; an `ssh://` source is rejected.
-- `ecopy` opens one or more SSH connections and runs `ecopy --server <path>` on the remote host over each,
-  then streams data and metadata over pipelined binary channels. Reads stay local (O_DIRECT, sparse detection);
-  the remote peer performs the destination syscalls confined under `<path>`.
-- **Parallel connections, single authentication.** `DIRECT_COPY_SSH_CONNECTIONS` (default 4) transfers over N
-  sessions to lift the single-stream throughput ceiling. Authentication happens exactly once: the first
-  connection is an SSH `ControlMaster` (it performs the one interactive prompt, e.g. an MFA/Duo push) and the
-  remaining connections attach to its control socket with `ControlMaster=no`, so they never re-authenticate.
-  Every connection still runs its own remote `ecopy --server` process; the shared destination filesystem lets any
-  connection perform any operation, and a streamed file's frames all stay on one connection. Multiplexed sessions
-  share one authenticated TCP connection with independent SSH channel windows, so they beat a per-channel-window
-  limit but not a single-TCP congestion-window limit — compare `DIRECT_COPY_SSH_CONNECTIONS=1` vs `=4` on your
-  link to see which applies. Set `DIRECT_COPY_SSH_MULTIPLEX=0` to disable the `ControlMaster` injection so each
-  session gets its own independent TCP flow (separate KEX/cipher and congestion window, which can beat a
-  single-TCP ceiling) — but then **each connection authenticates independently, so an MFA/Duo prompt fires once
-  per connection** (with the defaults that is up to 5 pushes: 4 copy + 1 verify). Prefer leaving multiplexing on
-  (one push) and take the throughput win from the faster cipher below; only disable it if the single TCP path is
-  provably the ceiling and you can tolerate N interactive prompts. If a secondary connection fails to attach, the
-  run degrades gracefully to the connections that did come up. Requires an OpenSSH client with `ControlMaster`
-  support and a writable short socket path (under `$TMPDIR`/`/tmp`); `N=1` reproduces the classic single-channel
-  behavior and needs no multiplexing.
-- **Fast cipher, fallback-safe.** For the stock `ssh` client `ecopy` biases the transport toward the fastest
-  hardware-accelerated AEAD cipher by injecting `-o Ciphers=^aes128-gcm@openssh.com,aes256-gcm@openssh.com,chacha20-poly1305@openssh.com`.
-  The leading `^` *prepends* these to the client's default cipher set rather than replacing it, so every default
-  cipher stays available as automatic fallback and key exchange can never fail because of this preference — no
-  retry, no probe, no extra authentication prompt. On AES-NI hardware `aes128-gcm` costs far less CPU per byte
-  than the usual negotiated default (roughly a 2x single-stream win on links where crypto was the bottleneck);
-  it is a standard strong AEAD cipher, so there is no meaningful security downgrade. The `^` prepend syntax needs
-  an OpenSSH client >= 7.8; on older clients the option is skipped automatically (`ecopy` parses `ssh -V` once).
-  Because only the `ControlMaster` (and non-multiplexed connections) negotiate KEX, the cipher is chosen once and
-  applies to all traffic riding that transport. Set `DIRECT_COPY_SSH_CIPHER` to a comma list to override the
-  preference, or to `0`/`off` to disable the injection entirely. Custom `ECOPY_SSH` wrappers are never modified.
-- **Latency-aware by design:** small files, directory creation, and metadata updates are *fire-and-forget* (no
-  per-item round-trip). A small file at or below `DIRECT_COPY_SSH_PUTFILE_MAX` ships as a single frame (path +
-  metadata + data); larger files stream in pipelined chunks. Many files stream concurrently. Sparse files send
-  only their data extents so holes are recreated remotely.
-- **Directories are created lazily by their contents:** the first file written into a directory creates it (and any
-  missing parents), so no separate `MKDIR` round-trip is spent on directories that hold files. A shared
-  sharded single-flight cache guarantees that only one server worker creates a path; the others reuse the result instead of
-  duplicating NFS LOOKUP/MKDIR RPCs. Missing parents are walked only after an optimistic leaf `mkdir` returns
-  `ENOENT`. An explicit `MKDIR` is sent only for directories that end up with no files.
-- **Batched durability:** each file is written and (incrementally) atomically renamed into place, but there is no
-  per-file `fsync`. A periodic and a final *barrier* drain the server, flush to stable storage, and report any
-  errors as a batch (with the first offending path); a nonzero count fails the run. Tune the barrier cadence with
-  `DIRECT_COPY_SSH_BARRIER_OPS`.
-- **Parallel remote apply:** over NFS each remote metadata op (mkdir, create, chown, chmod, times, rename) is a
-  separate synchronous RPC, so a single-threaded peer sits idle waiting on latency. The remote runs an apply pool
-  (`DIRECT_COPY_SSH_SERVER_THREADS`, default 16) so file writes and final directory metadata run concurrently.
-  Barriers before finalization and between directory-depth groups preserve ordering for restrictive parent modes.
-- **Direct I/O on the peer:** the remote opens streamed dense files with `O_DIRECT` (bypassing its page cache),
-  writing the client's already block-aligned chunks straight through. The single unaligned tail of a file, and any
-  filesystem that rejects `O_DIRECT`, transparently fall back to buffered writes so a transfer never fails on
-  alignment. Small (single-frame) files and sparse files always use buffered writes. Set
-  `DIRECT_COPY_SSH_SERVER_DIRECT_IO=0` on the client to force buffered writes on the peer.
-- **Cached directory handles on the peer:** on automounted (autofs) destinations every open/rename/set-times by an
-  absolute path re-walks the whole path from `/`, and autofs re-checks each component for a mountpoint — profiling a
-  million-file tree showed ~60% of the busy peer process's CPU there. The peer keeps a bounded LRU of open `O_PATH`
-  directory handles and does its file operations with `openat`/`renameat`/`unlinkat`/`utimensat` relative to them, so
-  the per-object path walk collapses to a single trailing component once a directory is warm (a miss opens relative to
-  its cached parent, so warming a subtree costs one component per level total). The cache is sized from
-  `RLIMIT_NOFILE`; `DIRECT_COPY_SSH_SERVER_DIRFD_CACHE` overrides it (`0`/small favors fewer fds over hit-rate).
-- **Bulk directory reads:** each walker enumerates a directory with raw `getdents64` into a reusable per-thread
-  buffer (`DIRECT_COPY_GETDENTS_BUF`, default 256 KiB), returning thousands of entries per syscall instead of one
-  per `readdir` — fewer syscalls (and less seccomp/audit overhead) on huge directories. The parent directory fd is
-  reused for the relative `fstatat`/`openat` of every entry (no absolute-path re-walk). Set the buffer to `0` to fall
-  back to libc `readdir`.
-- **Batched client scheduling:** traversal appends each stat group to the file queues under one lock instead of
-  locking and signaling once per file. The same scheduler path is used for local/NFS and SSH destinations.
-- **Fewer RPCs per file:** the peer creates files with their final mode (no extra `fchmod`) and skips `chown` when
-  the owner already matches. File-bearing directories are also created with their source mode when it remains
-  owner-writable, allowing finalization to skip a redundant `fchmod`. A fresh small file costs about a create +
-  write + one time-stamp RPC. Add
-  `--no-preserve-times` to drop the time-stamp SETATTR too (atime/mtime are not carried over), leaving roughly a
-  create + write per file.
-- **Fresh vs. incremental:** on the first copy into a non-existent destination root, per-directory bulk stats are
-  skipped entirely and files are written straight to their final name (no temp + rename). Re-running into an
-  existing destination keeps one bulk stat per directory (so unchanged files by `size + mtime` are skipped) and
-  writes via temp + atomic rename.
-- **Self-bootstrapping:** if the remote `ecopy` is missing or an incompatible version, the local binary is
-  streamed over and executed (guarded by a matching `uname -sm`). Install `ecopy` in the remote `PATH` to skip this.
-- Requires working SSH access (key-based auth recommended). Set `ECOPY_SSH` to override the ssh command and
-  `ECOPY_REMOTE_CMD` to point at a specific remote `ecopy` binary.
-- **Tip:** when the remote peer writes to an NFS-mounted destination, mounting it with `nconnect=N` (multiple TCP
-  connections) is a complementary, zero-code way to raise the concurrent-RPC ceiling that the apply pool feeds.
+- **Push only.** The source is always local. The peer runs `ecopy --server <path>` and performs all destination
+  syscalls confined under `<path>`. If `ecopy` is missing or mismatched on the remote, the local binary is streamed
+  over and run (same `uname -sm` required); install it in the remote `PATH` to skip this.
+- **Parallel connections, one authentication.** `DIRECT_COPY_SSH_CONNECTIONS` (default 4) sessions share one
+  `ControlMaster`, so an interactive prompt (MFA/Duo) fires once. Pipelined verify adds one more session
+  automatically. `DIRECT_COPY_SSH_MULTIPLEX=0` gives each session its own TCP connection — and its own prompt.
+- **Fast cipher, fallback safe.** `aes128-gcm@openssh.com` is *prepended* to the client's cipher list (OpenSSH ≥ 7.8),
+  so the defaults remain as fallback and key exchange cannot fail because of it. `DIRECT_COPY_SSH_CIPHER=0` disables.
+- **Latency aware.** Small files ship as a single frame with their metadata; directories are created by the first
+  file written into them; metadata updates are fire-and-forget. A periodic and a final barrier drain the peer,
+  flush to stable storage, and report any errors as a batch. There is no per-file `fsync`.
+- The peer writes dense streamed files with `O_DIRECT` and runs `DIRECT_COPY_SSH_SERVER_THREADS` (default 16) apply
+  threads so NFS metadata RPCs overlap. On autofs destinations it caches open directory handles to avoid re-walking
+  paths. Mounting the destination with `nconnect=N` raises the RPC ceiling further.
+- `ECOPY_SSH` overrides the ssh command (e.g. `ssh -i key`); `ECOPY_REMOTE_CMD` points at a specific remote binary.
 
-## What It Does
+## How it copies
 
-- Walks the source tree and recreates it on the target: regular files, directories, symlinks, and hard links.
-- Recreates symlinks verbatim without ever following them (`cp -d` semantics): the link's target string is
-  preserved unchanged, and the link's `uid`/`gid`/times are applied to the link itself.
-- Preserves hard links: files sharing a source inode are copied once (the first occurrence), and additional links
-  become real hard links on the target instead of duplicating the data. A cross-filesystem link (`EXDEV`) falls back
-  to a full copy locally so no file is lost.
-- Skips unchanged files based on `size + mtime`.
-- Detects sparse files and copies only their data, preserving holes instead of moving zeros.
-- On a newly created destination tree, writes small files directly to their final names to avoid destination stats
-  and rename RPCs. Interrupted runs can therefore leave partial files in that new tree.
-- On an existing destination, copies through same-directory temp files and renames into place after data + metadata
-  are complete (crash-atomic).
-- Opens entries relative to open directory handles, so symlink swaps are rejected during traversal and copy.
-- Preserves `uid`/`gid` (when permitted), permission bits, `atime`, and `mtime`.
-
-The final report shows `Symlinks : <created> of <seen>` and `Hard links : <created> linked, <N> not duplicated`
-whenever the source tree contains them. Symlinks and hard-link secondaries are not enrolled in `--verify` (the
-primary file's data is verified, and a hard link shares its content by construction).
-
-Not preserved: xattrs, ACLs, SELinux labels, file capabilities. Other non-regular entries (devices, FIFOs, sockets)
-are ignored on the source and rejected on the target rather than reconciled. A top-level source that is itself a
-symlink is rejected.
-
-## Transfer Verification
-
-Verification is opt-in, so ordinary copies pay no extra opens, reads, hashing, allocations, or protocol traffic:
-
-```bash
-# Exact preserved-metadata checks plus the default 1% data sample
-./ecopy --verify /src /dst
-
-# Check every logical 4 KiB block
-./ecopy --verify-data=100 --verify-metadata /src /dst
-
-# Also verify files skipped by the size+mtime incremental test
-./ecopy --verify --verify-skipped /src /dst
-
-# Verify an existing tree without copying, creating, or repairing anything
-./ecopy --verify-only /src /dst
-
-# Read-only verification over SSH with explicit checker parallelism
-./ecopy --verify-only --verify-workers=8 /src ssh://host/existing/dst
-```
-
-- `--verify-metadata` checks object type, regular-file size, permission and special bits, numeric UID/GID, and
-  atime/mtime when time preservation is enabled. It does not check metadata ecopy does not copy (ctime/birth time,
-  ACLs, xattrs, labels, or capabilities).
-- Ownership that could not be preserved is not a failure. An unprivileged process cannot change a file's owner
-  uid, so when the only metadata difference is UID/GID and the copy ran unprivileged, ecopy skips the doomed
-  `chown` during copy, warns once, and reports the count on a separate `Ownership not preserved` line rather than
-  counting it under `Verify failures` (so such a run still exits 0). Genuine mode/size/time mismatches, and any
-  UID/GID mismatch when running privileged, remain hard failures.
-- `--uid N` / `--gid N` force the target ownership of **every** transferred object (files, directories, symlinks,
-  and hard links) to the given numeric id instead of copying the source's. Either flag may be used alone; the
-  unspecified side keeps the source value. The override is applied where each object's metadata is captured, so both
-  the apply and the verification comparison use the provided ids - `--verify`/`--verify-only` check the target
-  against the forced ids, not the source's. Two caveats: (1) it does **not** reduce crawling - `lstat`/`fstatat`
-  returns UID/GID in the same call that supplies size/mode/mtime, and ecopy already uses numeric ids (no name-lookup
-  RPCs); (2) the same privilege rules apply - an unprivileged target still cannot `chown` to a foreign uid, so
-  ownership is genuinely applied and verified only when the target can set it (a privileged target, or an override
-  equal to the target's own effective uid/gid). Otherwise the requested ids are still what verification checks
-  against, and any shortfall is reported under `Ownership not preserved` as usual.
-- `--verify-data[=PERCENT]` samples aligned 4 KiB blocks. The first and final block are always checked,
-  including a short final block; empty files receive size/metadata checks only. The percentage sets the total target
-  block count including those endpoints, so small files can have higher achieved coverage than requested.
-- For sparse files, coverage is relative to *allocated* data, not logical size: the sampler works from the source's
-  data extents (`SEEK_DATA`/`SEEK_HOLE`), so holes are never read, hashed, or (over SSH) sent as digests. A mostly-hole
-  file is verified in proportion to its real data - a 1% sample of a 20 PB image with 1 TB of data reads ~10 GB, not
-  ~200 TB. `Verify scope` reports the allocated bytes the sample was drawn from. Fully dense files are unaffected.
-- Sampling uses one random per-run seed. `--verify-seed=N` reproduces the same offsets, and the effective seed plus
-  requested/achieved logical-byte coverage are printed in the final report.
-- `--verify-skipped` includes files that were not copied because size+mtime matched. Without it, checks apply only
-  to files copied in this invocation.
-- `--verify-only` never starts copy workers and never creates, truncates, renames, or repairs target objects. It
-  walks the source once, requires each source regular file and directory to exist at the corresponding target path,
-  and ignores target-only extras. It defaults to metadata plus 1% sampled data unless explicit
-  `--verify-metadata` or `--verify-data[=PERCENT]` selectors are supplied. `--verify-skipped` is redundant in this
-  mode. Local single-file target mapping is the same as copy mode; an SSH target is always a directory.
-- Verification uses a bounded read-only worker pool. `--verify-workers=N` or
-  `DIRECT_COPY_VERIFY_WORKERS=N` selects 1–128 workers. Defaults are the online CPU count capped at 16 locally and
-  8 for SSH.
-- For directory-tree copies, verification is **pipelined with copy**: the checker pool and a feeder thread start at
-  copy time and verify each file as soon as it is durable, so the verify wall time is largely hidden behind copy
-  instead of being paid afterward. Durable items (local temp+rename, remote streamed COMMIT, and skipped files) are
-  verified immediately. Remote fire-and-forget small files (`PUTFILE`) are not materialized until the next barrier,
-  so they are released in barrier-gated generations: after `DIRECT_COPY_VERIFY_PIPELINE_OPS` such files accumulate
-  (default 4096) or the feeder idles ~250 ms, one barrier materializes them and hands them to the checker pool.
-  Directory-metadata checks are always done after directory timestamps are finalized (the final step), never
-  mid-copy. Over SSH, pipelined verify runs on its own **additive connection** (`DIRECT_COPY_SSH_VERIFY_CONNECTIONS`,
-  auto-opens one): it is established in addition to the `DIRECT_COPY_SSH_CONNECTIONS` copy connections, never carved
-  from them, so copy parallelism is unaffected. Verify's tiny fire-and-forget digest frames then never interleave with
-  bulk copy frames on a connection's write path, and because each SSH session is a separate remote `ecopy --server`
-  process, verify reads (`pread` + BLAKE3) no longer queue behind copy `pwrite`/`fsync` in a shared server thread
-  pool. Under `ControlMaster` multiplexing (default) the extra verify session attaches to the same authenticated
-  master (no additional MFA/Duo) and rides the master TCP connection, so it removes application- and
-  server-process-level contention but not TCP-level bandwidth sharing; disable multiplexing for a fully separate path.
-  Set `DIRECT_COPY_SSH_VERIFY_CONNECTIONS=0` to share the copy connections instead. Copy workers only enqueue verify
-  records (they never block on the checker pool), and single-file copies keep the small post-copy check. Because
-  verification overlaps copy, `Verify wall sec` and the copy timings are not additive; `Total Elapsed` is the ground
-  truth.
-- Local targets compare source and destination bytes directly. SSH targets send full 32-byte BLAKE3 digests in
-  bounded batches and hash target blocks in the remote server pool; sampled file data is not sent back over SSH and
-  there is one phase barrier rather than a per-file round trip. SSH verify-only starts a read-only peer and refuses
-  to create a missing target root.
-- Sparse files are checked as logical content: sampled holes read as zero. This verifies bytes and size, not the
-  target's physical extent layout. A source extent map lets sampled source holes skip the source read and hash while
-  still reading the target and requiring zero bytes. Unsupported extent discovery falls back to ordinary reads.
-- Partial samples retain the same seed-derived block set but read each bounded batch in offset order with random-I/O
-  readahead advice. A 100% check is a sequential scan with sequential readahead. BLAKE3 1.8.2's official C
-  implementation selects AVX-512, AVX2, SSE4.1, SSE2, or the portable backend at runtime; the selected backend is
-  printed in the final verification report.
-
-Enabled verification necessarily adds I/O. At 1%, large files add approximately 1% source reads and 1% target
-reads; mandatory endpoint reads dominate tiny-file workloads. `--no-preserve-times` excludes timestamps from the
-metadata comparison. When timestamps are checked, data reads use `O_NOATIME`; if the caller lacks permission for
-that flag, verification fails rather than invalidating the atime it is checking. Use metadata-only verification or
-`--no-preserve-times` when `O_NOATIME` is unavailable.
-
-### Final report timing and percentiles
-
-The final report separates phases so verification time never depresses the reported copy rate:
-
-- **Copy data elapsed/rate** runs from process statistics initialization until all file workers drain. **Copy
-  complete elapsed/rate** also includes directory finalization and the remote flush immediately before verification.
-  **Payload bytes** are bytes actually moved; **logical bytes** are selected source file sizes. Their difference is
-  reported as sparse savings.
-- For SSH targets, **Remote drain rate / busy** report how many payload bytes the remote peer wrote and how long it
-  spent in the `write`/`fsync` syscalls that consume the stream (summed server-side service time, reported at each
-  barrier). A drain busy time close to the copy elapsed time, or a drain rate far below your link speed, means the
-  bottleneck is the remote peer's storage or a loaded remote host rather than the client or the network.
-- **Transfer distribution** values are worker-service metrics measured from task claim through successful
-  finalization. Small dense, large dense (the configured large threshold), and sparse files have separate
-  populations. Latency includes zero-byte files; per-file effective throughput excludes them. A remote PUTFILE
-  sample ends after client send/backpressure completion, while streamed remote files include COMMIT acknowledgement.
-  The **summed-service rate** divides class payload by service time summed across workers; it is a worker-equivalent
-  efficiency measure, not wall-clock transfer throughput. The report also prints copied files/s.
-- One-second payload-rate windows begin with the first payload and end when file work drains. They include zero-rate
-  stall windows and are collected even when stdout is redirected; only the live 10-second rolling display requires a
-  terminal.
-- **Verification wall/busy time and rate.** `Verify wall sec` is the pipeline start-to-finish window; for directory
-  trees it overlaps copy (see pipelining above), so it is not additive with the copy timings and the report says so
-  (`Total Elapsed` is the ground truth). `Verify busy sec` is the summed checker-worker service time, and the
-  `Verify object rate` / `Verify sample rate` are computed from it (worker-equivalent, like the transfer
-  summed-service rate) so an overlapped verify phase is not made to look slow by the copy window it hides behind.
-  Scope, achieved coverage, the compact pending peak, bounded worker-queue peak, hole reads avoided, hash backend,
-  and categorized failures are reported independently.
-
-Percentiles use bounded integer logarithmic histograms: counts, sums, and min/max are exact, while percentile values
-are bucket approximations. Min and max are intentionally shown but are highly sensitive to single-file and
-single-window outliers.
-
-## Safety
-
-Use at your own risk and test on your storage stack first. This is not `rsync` and not a full replication tool;
-for independent full-tree assurance, checking a run with `rsync` or another trusted tool is still good practice. Prefer an empty or
-trusted target tree: existing regular files may be skipped or atomically replaced, and existing non-regular target
-entries are rejected. Do not let another writer populate a destination root while its first copy is running: a root
-created by this invocation uses the faster non-atomic final-name path.
-
-## How It Copies
-
-- **Small files** use a simple copy path. With buffered I/O they can also use streaming `posix_fadvise()` hints and
-  opportunistic `copy_file_range()`. Local/NFS and SSH traversal share 512-entry stat/queue batches; a fresh target
-  skips destination existence stats, while an incremental target keeps `size + mtime` skip checks.
-- **Large files** (size > `DIRECT_COPY_LARGE_THRESHOLD_MB`, default 10) run a bounded reader→queue→writer pipeline
-  with preallocated aligned chunk buffers. The destination is preallocated up front with `fallocate()` (falling back
-  to `ftruncate()`), which keeps block allocation off the write path and avoids late-run throughput collapse. Keep
-  this well below your typical medium-file size: files under the threshold use the many-way small-file pool, where a
-  large number of concurrent medium files thrash a bandwidth-limited target.
-- **Sparse files** are routed to a hole-skipping path regardless of logical size: data regions are found with
-  `lseek(SEEK_DATA/SEEK_HOLE)`, only data is copied, and the destination is `ftruncate()`d to the exact source size.
-- **Dispatch order** is biggest-allocated-data-first, not FIFO: the backlog the crawler builds ahead of the workers is
-  kept in a max-heap and the file with the most real data to move is dispatched first, on both local and `ssh://`
-  targets. This lets large files start streaming and fill the link as soon as they are discovered, instead of waiting
-  behind a mountain of tiny files found earlier. The ranking weight is `min(logical size, allocated blocks)`, so a huge
-  but mostly-empty sparse file is ranked by its real data, not its logical size. Set `DIRECT_COPY_SIZE_PRIORITY=0` to
-  fall back to FIFO (discovery/directory order) if a workload benefits from directory locality.
+- **Small files** (≤ `DIRECT_COPY_LARGE_THRESHOLD_MB`, default 10) use a many-way worker pool.
+- **Large files** run a bounded reader → queue → writer pipeline with aligned chunk buffers, preallocating the
+  destination with `fallocate()` so block allocation stays off the write path.
+- **Sparse files** are found with `SEEK_DATA`/`SEEK_HOLE` and copied hole-skipping regardless of size.
+- **Dispatch** is biggest-allocated-data first, so large files start filling the link as soon as they are found.
+  `DIRECT_COPY_SIZE_PRIORITY=0` restores discovery order.
+- Directories are read with raw `getdents64` and every entry is opened relative to its parent handle, so symlink
+  swaps during traversal are rejected.
 
 ## Tuning
 
-Best settings are workload- and environment-dependent. Key knobs (defaults in parentheses):
+Defaults suit large streaming copies. Out-of-range values are clamped with a warning.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `DIRECT_COPY_MAX_WORKERS` | 256 | Total shared worker-slot budget (clamped 2–512) |
-| `DIRECT_COPY_SMALL_MAX_WORKERS` | 32 | Cap on concurrent small-file workers; also caps threads created for SSH targets |
-| `DIRECT_COPY_LARGE_READERS` / `DIRECT_COPY_LARGE_WRITERS` | 4 / 2 | Threads per active large file |
+| `DIRECT_COPY_MAX_WORKERS` | 256 | Total worker-slot budget (2–512) |
+| `DIRECT_COPY_SMALL_MAX_WORKERS` | 32 | Concurrent small-file workers (also the thread cap for ssh targets) |
+| `DIRECT_COPY_LARGE_WORKERS` | 6 | Concurrent large files |
+| `DIRECT_COPY_LARGE_READERS` / `_WRITERS` | 4 / 2 | Threads per active large file |
 | `DIRECT_COPY_LARGE_FILE_INFLIGHT` | 16 | Chunk buffers in flight per large file |
-| `DIRECT_COPY_CHUNK_MB` | 1 | Aligned bulk-transfer chunk size (1–4096) |
-| `DIRECT_COPY_LARGE_THRESHOLD_MB` | 10 | Size at which a file enters the large-file pipeline |
-| `DIRECT_COPY_TRAVERSAL_WORKERS` | 8 | Parallel directory-walker threads |
-| `DIRECT_COPY_GETDENTS_BUF` | 262144 | Per-walker raw `getdents64` read-buffer bytes; fewer syscalls on huge directories. `0` falls back to libc `readdir` (nonzero clamped to ≥4096) |
+| `DIRECT_COPY_CHUNK_MB` | 1 | Chunk size (1–4096) |
+| `DIRECT_COPY_LARGE_THRESHOLD_MB` | 10 | Small/large boundary; keep it above your typical medium file |
+| `DIRECT_COPY_DIRECT_IO_MIN_SIZE_MB` | 10 | Use direct I/O only at or above this size (`0` = always) |
+| `DIRECT_COPY_DISABLE_DIRECT_IO` | 0 | Buffered I/O everywhere; `_READ_` / `_WRITE_` variants split it |
+| `DIRECT_COPY_DISABLE_COPY_FILE_RANGE` | 0 | Never use `copy_file_range()` |
+| `DIRECT_COPY_TRAVERSAL_WORKERS` | 8 | Parallel directory walkers |
+| `DIRECT_COPY_GETDENTS_BUF` | 262144 | Per-walker `getdents64` buffer; `0` uses libc `readdir` |
 | `DIRECT_COPY_MAX_QUEUED_FILES` | 262144 | Backpressure cap on queued file tasks |
-| `DIRECT_COPY_SIZE_PRIORITY` | 1 | Dispatch biggest-allocated-data files first (local and SSH); `0` restores FIFO order |
-| `DIRECT_COPY_SMALL_INPLACE` | 0 | Force final-name writes even on existing targets (fresh trees do this automatically; not crash-atomic) |
-| `DIRECT_COPY_DISABLE_DIRECT_IO` | 0 | Disable `O_DIRECT` on both sides (buffered I/O) |
-| `DIRECT_COPY_DISABLE_READ_DIRECT_IO` / `DIRECT_COPY_DISABLE_WRITE_DIRECT_IO` | 0 / 0 | Per-side direct-I/O switches |
-| `DIRECT_COPY_DISABLE_COPY_FILE_RANGE` | 0 | Skip `copy_file_range()` on buffered paths |
-| `ECOPY_SSH` | `ssh` | Command used to reach an `ssh://` target (e.g. `ssh -i key`) |
-| `ECOPY_REMOTE_CMD` | `ecopy` | Remote `ecopy` binary/command for `ssh://` targets |
-| `DIRECT_COPY_SSH_CONNECTIONS` | 4 | Parallel SSH sessions per `ssh://` run; all share one authenticated connection (1–16) |
-| `DIRECT_COPY_SSH_MULTIPLEX` | 1 | Use SSH `ControlMaster` to authenticate once for all connections; `0` disables it (one MFA/Duo prompt per connection) |
-| `DIRECT_COPY_SSH_CIPHER` | fast AEAD list | Ciphers prepended (via `Ciphers=^…`) to the stock ssh client defaults, biasing toward `aes128-gcm@openssh.com`; defaults stay as fallback so KEX can't fail. `0`/`off` disables; a custom list overrides; skipped on OpenSSH < 7.8 |
-| `DIRECT_COPY_SSH_VERIFY_CONNECTIONS` | -1 (auto) | Extra connections opened for pipelined verify, in addition to the copy connections; `-1` auto-opens 1, `0` shares the copy pool, `N` opens N (0–16) |
-| `DIRECT_COPY_SSH_PUTFILE_MAX` | 1024 | Max size (KiB) a file may be to ship as a single `ssh://` PUTFILE frame |
-| `DIRECT_COPY_SSH_BARRIER_OPS` | 8192 | Fire-and-forget remote ops between drain/flush barriers (min 256) |
-| `DIRECT_COPY_SSH_SERVER_THREADS` | 16 | Apply threads on the `ssh://` peer; higher hides more per-op RPC latency (max 256) |
-| `DIRECT_COPY_SSH_SERVER_DIRECT_IO` | 1 | Remote peer opens streamed dense files with `O_DIRECT`; `0` forces buffered writes |
-| `DIRECT_COPY_SSH_SERVER_DIRFD_CACHE` | auto (`RLIMIT_NOFILE`-derived) | Open directory handles the peer caches to do file ops via `openat`/`renameat` instead of re-walking absolute paths (big win on autofs); `0`/small trades hit-rate for fewer fds |
-| `DIRECT_COPY_VERIFY_WORKERS` | local: min(CPUs, 16); SSH: min(CPUs, 8) | Bounded verify/verify-only checker threads (1–128) |
-| `DIRECT_COPY_VERIFY_PIPELINE_OPS` | 4096 | Remote fire-and-forget files released per barrier-gated verify generation (1–1000000) |
-| `DIRECT_COPY_NO_PRESERVE_TIMES` | 0 | Skip atime/mtime on local/NFS and `ssh://` targets (same as `--no-preserve-times`) |
+| `DIRECT_COPY_SIZE_PRIORITY` | 1 | Biggest-first dispatch; `0` = discovery order |
+| `DIRECT_COPY_SMALL_INPLACE` | 0 | Final-name writes even into existing trees (not crash-atomic) |
+| `DIRECT_COPY_NO_PRESERVE_TIMES` | 0 | Same as `--no-preserve-times` |
+| `DIRECT_COPY_VERIFY_WORKERS` | see `--verify-workers` | Checker threads |
+| `DIRECT_COPY_VERIFY_QUEUE_MAX` | 262144 | Verify intake queue bound |
+| `DIRECT_COPY_VERIFY_PIPELINE_OPS` | 4096 | Remote small files released per verify generation |
+| `ECOPY_SSH` | `ssh` | Command used to reach an `ssh://` target |
+| `ECOPY_REMOTE_CMD` | `ecopy` | Remote `ecopy` command |
+| `DIRECT_COPY_SSH_CONNECTIONS` | 4 | Copy sessions per run (1–16) |
+| `DIRECT_COPY_SSH_VERIFY_CONNECTIONS` | auto (1) | Extra sessions for pipelined verify; `0` shares the copy pool |
+| `DIRECT_COPY_SSH_MULTIPLEX` | 1 | One `ControlMaster` auth for all sessions; `0` = one prompt per session |
+| `DIRECT_COPY_SSH_CIPHER` | fast AEAD list | Ciphers prepended to the ssh defaults; `0` disables |
+| `DIRECT_COPY_SSH_PUTFILE_MAX` | 1024 | Max KiB for a file to ship as one frame |
+| `DIRECT_COPY_SSH_BARRIER_OPS` | 8192 | Fire-and-forget ops between drain/flush barriers (min 256) |
+| `DIRECT_COPY_SSH_SERVER_THREADS` | 16 | Apply threads on the peer (max 256) |
+| `DIRECT_COPY_SSH_SERVER_DIRECT_IO` | 1 | Peer writes streamed files with `O_DIRECT`; `0` = buffered |
+| `DIRECT_COPY_SSH_SERVER_DIRFD_CACHE` | auto | Directory handles the peer caches; `0` favors fewer fds |
 
-Out-of-range numeric values are clamped with a warning. The final report prints one suggested next-run experiment;
-`-v` adds the full diagnostic counters (per-phase seconds, read/write opens, queue/buffer waits, etc.) to help you
-see whether time is going to traversal, copy, metadata, or teardown.
+## Reading the report
 
-## Build & Test
+- **Copy data rate** covers the time until all file workers drain; **Copy complete** adds directory finalization and
+  the remote flush. **Payload** is bytes moved; **logical** is source file size; the difference is sparse savings.
+- **Remote drain rate/busy** (ssh) is how fast the peer's `write`/`fsync` consumed the stream. Busy time close to
+  the copy time, or a rate far below the link, means the peer's storage is the bottleneck.
+- **Transfer distribution** rates are summed worker service time, not wall-clock throughput. Percentiles come from
+  logarithmic histograms (approximate); min/max are exact but outlier-sensitive.
+- **Verify** rates are computed from summed checker time (`Verify busy sec`) for the same reason.
 
-```bash
-make          # builds ecopy (and ecopy-jemalloc if jemalloc is available)
-make test     # runs protocol_test, the smoke tests, and tests/ecopy_harness.sh
-```
+## Safety
 
-`tests/ecopy_harness.sh` builds varied source trees (small/large/sparse/pure-hole files, nested dirs, symlinks,
-read-only files) and verifies ecopy reproduces them across several runtime profiles, including an `ssh://localhost`
-loopback profile. The loopback profile uses `tests/fake_ssh.sh` (a stand-in that runs `ecopy --server` over a local
-pipe) so the full protocol path is exercised without SSH keys; set `ECOPY_HARNESS_REAL_SSH=1` to use real ssh.
-Run it directly with `tests/ecopy_harness.sh` (or `ECOPY_HARNESS_VERBOSE=1 tests/ecopy_harness.sh`).
-`make protocol_test` builds the wire-protocol unit tests.
+Test on your storage stack first. This is not `rsync` and not a replication tool; for independent full-tree
+assurance, audit a run with a trusted tool as well. Prefer an empty or trusted target: existing regular files may be
+skipped or atomically replaced, and existing non-regular target entries are rejected.
 
-Warning-clean verification build:
+## Build and test
 
 ```bash
-make clean && make CFLAGS='-O2 -g -Wall -Wextra -Wpedantic -pthread'
+make            # ecopy
+make test       # protocol and telemetry unit tests, the harness, and the smoke tests
 ```
+
+`tests/ecopy_harness.sh` builds varied trees (small, large, sparse, hole-only, symlinks, hard links, read-only) and
+checks that ecopy reproduces them across runtime profiles, including an `ssh://localhost` loopback that runs
+`ecopy --server` over a local pipe (`tests/fake_ssh.sh`) so no keys are needed. `ECOPY_HARNESS_REAL_SSH=1` uses real
+ssh; `ECOPY_HARNESS_VERBOSE=1` prints every passing check.
+
+Warning-clean build: `make clean && make CFLAGS='-O2 -g -Wall -Wextra -Wpedantic -pthread'`.
 
 ## Platforms
 
-Linux is the primary target and the only one the fast paths are tuned for. macOS builds and passes the same test
-suite, with these differences, all of which are fallbacks rather than failures:
+Linux is the primary target. macOS builds and passes the same tests using fallbacks in `compat.h`:
 
-| Linux fast path | macOS |
+| Linux | macOS |
 | --- | --- |
-| `O_DIRECT` | `fcntl(F_NOCACHE)` after open, so uncached I/O still bypasses the page cache |
-| `copy_file_range()` in-kernel copy | no ranged equivalent exists, so copies use the `pread`/`pwrite` path |
-| `getdents64()` bulk directory reads | `readdir()`, the same fallback Linux uses when the raw reader is disabled |
-| `posix_fadvise()` sequential/random hints | `fcntl(F_RDAHEAD)`; there is no ranged page-cache eviction, so `DONTNEED` is a no-op |
-| `fallocate()` preallocation | `fcntl(F_PREALLOCATE)` plus `ftruncate()` |
-| non-cancellable raw `pread`/`pwrite` syscalls | plain libc calls (`syscall(2)` is unsupported on Darwin) |
-| `O_NOATIME` reads | none exists, so **access times are copied but not verified** (see below) |
-
-Access times are the one semantic difference. Reading a file on macOS updates its atime and nothing can prevent
-that, so verification — which has to read both copies to hash them — would invalidate the very timestamp it then
-compares. Every other field (type, size, mode, mtime, uid, gid) is verified as usual, and atime is still
-replicated onto the target; it is only excluded from the comparison, and ecopy says so once per run.
+| `O_DIRECT` | `fcntl(F_NOCACHE)` after open |
+| `copy_file_range()` | `pread`/`pwrite` |
+| `getdents64()` | `readdir()` |
+| `posix_fadvise()` | `fcntl(F_RDAHEAD)`; `DONTNEED` is a no-op |
+| `fallocate()` | `fcntl(F_PREALLOCATE)` + `ftruncate()` |
+| `O_NOATIME` | none — **atime is copied but not verified** (reading a file moves it), announced once per run |
 
 ## License
 
-MIT License. See [LICENSE](LICENSE). Copyright held by **Michel Erb** (2026).
+MIT. See [LICENSE](LICENSE). Copyright Michel Erb (2026).

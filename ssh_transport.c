@@ -150,11 +150,6 @@ void sshx_request_verify_connections(int nverify)
     g_verify_want = nverify;
 }
 
-int sshx_connection_count(void)
-{
-    return g_nconns;
-}
-
 struct sshx_file {
     conn_t *conn;
     uint64_t file_id;
@@ -1164,11 +1159,6 @@ static void maybe_periodic_barrier(conn_t *c)
     pthread_mutex_unlock(&c->barrier_lock);
 }
 
-int sshx_barrier(int flush)
-{
-    return barrier_conn(cur_conn(), flush);
-}
-
 int sshx_barrier_all(int flush)
 {
     int rc = 0;
@@ -1218,29 +1208,6 @@ static void decode_stat_entry(pdec_t *d, int *present, struct stat *st)
         st->st_mtim.tv_sec = (time_t)mt_sec;
         st->st_mtim.tv_nsec = (long)mt_nsec;
     }
-}
-
-int sshx_stat(const char *path, struct stat *st)
-{
-    conn_t *c = cur_conn();
-    uint8_t buf[PATH_MAX + 8];
-    penc_t e; penc_init(&e, buf, sizeof(buf));
-    penc_str(&e, path);
-    if (e.overflow) { errno = ENAMETOOLONG; return -1; }
-
-    uint64_t id = next_request_id(c);
-    pending_t *p = pending_add(c, id);
-    if (!p) return -1;
-    if (conn_send(c, MSG_STAT, id, buf, (uint32_t)e.len) != 0) { pending_remove(c, p); return -1; }
-    if (pending_wait(c, p) != 0) { pending_remove(c, p); return -1; }
-
-    int present = 0;
-    pdec_t d; pdec_init(&d, p->resp, p->resp_len);
-    decode_stat_entry(&d, &present, st);
-    int err = d.error;
-    pending_remove(c, p);
-    if (err) return -1;
-    return present ? 1 : 0;
 }
 
 int sshx_stat_bulk(const char *base, const char *const *names, int n,

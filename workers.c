@@ -2946,18 +2946,6 @@ int workers_enqueue_small_file(dir_handle_t *dir,
     return workers_enqueue_batch(dir, &item, 1);
 }
 
-int workers_enqueue_large_file(dir_handle_t *dir,
-                               const char *name,
-                               const char *src,
-                               const char *dst,
-                               const struct stat *src_st)
-{
-    workers_batch_item_t item = { name, src_st };
-    (void)src;
-    (void)dst;
-    return workers_enqueue_batch(dir, &item, 1);
-}
-
 uint64_t workers_small_queue_depth(void)
 {
     uint64_t v;
@@ -3000,30 +2988,6 @@ int workers_max_workers(void)
     return g_worker_count;
 }
 
-int workers_large_workers(void)
-{
-    init_runtime_config();
-    return g_large_worker_count;
-}
-
-int workers_large_file_inflight(void)
-{
-    init_runtime_config();
-    return g_large_file_inflight;
-}
-
-int workers_max_active_large_files(void)
-{
-    init_runtime_config();
-    return g_max_active_large_files;
-}
-
-int workers_chunk_mb(void)
-{
-    init_runtime_config();
-    return (int)(g_chunk_size / (1024 * 1024));
-}
-
 int workers_large_threshold_mb(void)
 {
     init_runtime_config();
@@ -3050,11 +3014,6 @@ int workers_traversal_workers(void)
         return 8;
     }
     return env_int_or_default("DIRECT_COPY_TRAVERSAL_WORKERS", 8, 1, 128);
-}
-
-int workers_file_is_large(off_t size)
-{
-    return size > runtime_large_threshold();
 }
 
 void workers_print_runtime_summary(void)

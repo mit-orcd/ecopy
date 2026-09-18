@@ -26,8 +26,6 @@ void stats_set_shutdown_done(void);
 void stats_record_read_open(int used_direct);
 void stats_record_write_open(int used_direct);
 void stats_record_queue_wait_ns(uint64_t ns);
-void stats_record_read_io(uint64_t ns);
-void stats_record_write_io(uint64_t ns);
 /*
  * Split variants for the hot large-file path, where I/O timing is sampled:
  * the _op functions count every syscall, while the _time functions fold in an
@@ -56,7 +54,6 @@ void stats_inc_hardlink_created(void);
 void stats_add_hardlink_saved(uint64_t bytes);
 void stats_record_copy_file_range_call(uint64_t bytes);
 void stats_record_copy_file_range_fallback(void);
-void stats_add_copy_file_range_usage(uint64_t calls, uint64_t bytes, uint64_t fallbacks);
 void stats_inc_metadata_warning(void);
 void stats_inc_metadata_error(void);
 void stats_set_verify_config(int metadata, int data, double percent, uint64_t seed);
@@ -70,7 +67,6 @@ void stats_record_verify(uint64_t bytes, uint64_t scope_bytes, uint64_t blocks,
                          int metadata_checked,
                          int data_mismatch, int metadata_mismatch,
                          int expected_zero_mismatch, int io_failure, int failed);
-void stats_mark_verify_failure(void);
 void stats_record_verify_holes(uint64_t blocks, uint64_t bytes);
 /*
  * Ownership differences (uid/gid) that could not have been preserved without
@@ -97,11 +93,6 @@ void stats_clear_current_file(const char *path);
 
 void stats_record_speed_sample(void);
 double stats_elapsed_sec(void);
-double stats_traversal_elapsed_sec(void);
-double stats_file_work_drained_elapsed_sec(void);
-double stats_finalize_elapsed_sec(void);
-double stats_shutdown_elapsed_sec(void);
-double stats_avg_gibs(void);
 double stats_rolling_gibs(void);
 void stats_get_progress_snapshot(progress_snapshot_t *snap);
 void stats_get_final(stats_t *out);
