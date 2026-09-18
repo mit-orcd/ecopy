@@ -42,6 +42,7 @@ static void usage(const char *prog) {
             "       a full destination path locally); ssh:// targets are directories.\n"
             "\n"
             "Options:\n"
+            "       -h, --help      show this help and exit.\n"
             "       -v, --verbose   verbose output (progress line shows queue depths,\n"
             "                       verify worker counts and the current file).\n"
             "       --no-preserve-times skips atime/mtime preservation.\n"
@@ -596,6 +597,9 @@ int main(int argc, char **argv) {
         for (int i = 1; i < argc; i++) {
             if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
                 verbose = 1;
+            } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+                usage(argv[0]);
+                return 0;
             } else if (strcmp(argv[i], "--no-preserve-times") == 0) {
                 no_preserve_times = 1;
             } else if (strcmp(argv[i], "--verify") == 0) {
