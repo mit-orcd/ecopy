@@ -386,6 +386,8 @@ static int flush_file_batch(trav_dir_t *d)
     int enqueue_count = 0;
     int n = d->n;
     int rc;
+    uint64_t planned_bytes = 0;
+    uint64_t skipped_bytes = 0;
 
     d->n = 0;
     if (n == 0) {
@@ -441,7 +443,7 @@ static int flush_file_batch(trav_dir_t *d)
                 if (skip_payload < 0) {
                     skip_payload = 0;
                 }
-                stats_add_skipped_bytes((uint64_t)skip_payload);
+                skipped_bytes += (uint64_t)skip_payload;
                 stats_inc_files_skipped();
                 /* Skipped files already exist at their final path (durable). */
                 if (verify_queue_file(src_path, dst_path, &batch[i].st, 1, 1) != 0) {
@@ -453,12 +455,19 @@ static int flush_file_batch(trav_dir_t *d)
             }
         }
 
-        stats_add_planned_copy_bytes((uint64_t)batch[i].st.st_size);
+        planned_bytes += (uint64_t)batch[i].st.st_size;
         enqueue_items[enqueue_count].name = batch[i].name;
         enqueue_items[enqueue_count].src_st = &batch[i].st;
         enqueue_count++;
     }
 
+    /* One locked add per batch instead of one per file (8 walkers share the lock). */
+    if (planned_bytes > 0) {
+        stats_add_planned_copy_bytes(planned_bytes);
+    }
+    if (skipped_bytes > 0) {
+        stats_add_skipped_bytes(skipped_bytes);
+    }
     if (workers_enqueue_batch(handle, enqueue_items, (size_t)enqueue_count) != 0) {
         rc = -1;
     }

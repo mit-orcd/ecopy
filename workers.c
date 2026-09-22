@@ -35,6 +35,12 @@
 #include <stdatomic.h>
 #include <time.h>
 
+#ifdef __linux__
+#include <sys/ioctl.h>
+#include <linux/fs.h>
+#include <linux/fiemap.h>
+#endif
+
 #ifndef SEEK_DATA
 #define SEEK_DATA 3
 #endif
@@ -78,6 +84,20 @@ typedef struct large_file_ctx {
     struct stat src_st;
     off_t bulk_end;
     off_t next_read_offset;
+    /*
+     * Hole-aware reading. For a sparse source the readers walk a SEEK_DATA/
+     * SEEK_HOLE extent map built at start instead of [0, bulk_end): holes
+     * are never read (no kernel zero-fill of unwritten extents) and never
+     * written (the destination is ftruncate()d, so they stay holes).
+     * extents holds ext_count [start,end) pairs, ALIGNMENT-rounded so
+     * O_DIRECT preads stay legal; ext_idx is the reader cursor. A dense file
+     * has extents == NULL and reads linearly as before.
+     */
+    off_t *extents;
+    size_t ext_count;
+    size_t ext_idx;
+    uint64_t payload_bytes; /* data bytes actually moved (holes excluded) */
+    int sparse;
     dir_handle_t *dir;
     int fd_in;
     int fd_out;
@@ -183,6 +203,18 @@ static pthread_cond_t  g_large_done_cond = PTHREAD_COND_INITIALIZER;
  */
 static int              g_queue_waiters;
 /*
+ * Producer (traversal) threads parked in pthread_cond_wait(&g_space_cond)
+ * because the queue is full. Consumers wake one only when at least
+ * space_wake_min() slots are free, so a woken producer can push a whole
+ * stat batch instead of a handful of files and re-parking. Signaling per
+ * claimed task, as before, made every claim a futex wake plus a mutex
+ * fight with the producer: 42-51% of all cycles in the futex hash-bucket
+ * spinlock and ~500k context switches/s on the imagenet profile, where the
+ * walkers outrun the copy workers and the queue sits full all run.
+ */
+static int              g_space_waiters;
+#define SPACE_WAKE_MIN 1024
+/*
  * The large-file dispatch queue is a max-heap keyed by file_task_t.sched_key
  * (see enqueue), so big files drain biggest-data-first — size priority is
  * what load-balances the multi-worker pipeline. Guarded by g_queue_lock; len
@@ -205,22 +237,33 @@ typedef struct {
 static task_heap_t     g_large_heap;
 
 /*
- * Small files dispatch strictly FIFO from a bounded ring. Size priority
- * among sub-threshold files has no load-balance value (that is what the
- * large heap is for), and a ring push/pop is O(1) with a cache-hot slots
- * array, unlike the 4-ary sift whose per-level node hops kept heap_pop_max
- * at 7.65% of CPU on the 17.6k files/s fstor007 profile. Capacity doubles on
- * demand and stays a power of two so positions are a mask, never a division.
+ * Small files are queued per source directory and dispatched round-robin
+ * across directories. Size priority among sub-threshold files has no
+ * load-balance value (that is what the large heap is for), but *which
+ * directory* concurrent workers touch matters a great deal: creating a file
+ * takes the parent's i_rwsem exclusively, so 32 workers all creating inside
+ * the same 1300-file directory serialize on that one lock (49% of cycles in
+ * osq_lock on the imagenet profile). The traversal hands us one batch per
+ * directory; a claim takes a run of SMALL_CLAIM_BATCH tasks from the head
+ * batch and, if that batch is not yet exhausted, rotates it to the tail. With
+ * N directories queued (typically hundreds; traversal runs far ahead) each
+ * directory has ~workers/N concurrent creators instead of all of them.
  * Same g_queue_lock guarding; len feeds backpressure and progress exactly
- * like the heap's did.
+ * like the ring's did.
  */
+typedef struct dir_batch {
+    struct dir_batch *next;
+    uint32_t          head;  /* next task to claim */
+    uint32_t          count;
+    file_task_t      *tasks[];
+} dir_batch_t;
+
 typedef struct {
-    file_task_t       **slots;
-    size_t              head; /* pop position; push at (head + len) & (cap-1) */
-    size_t              len;
-    size_t              cap;
-} task_ring_t;
-static task_ring_t     g_small_ring;
+    dir_batch_t *head;
+    dir_batch_t *tail;
+    size_t       len; /* tasks remaining across all batches */
+} small_queue_t;
+static small_queue_t   g_small_q;
 /*
  * Recycled file_task_t nodes. Each task carries three PATH_MAX buffers (~12 KiB)
  * so allocating and zeroing one per file dominated small-file CPU under perf.
@@ -504,6 +547,300 @@ int workers_file_is_sparse(const struct stat *st)
     return allocated + (off_t)ALIGNMENT < st->st_size;
 }
 
+/*
+ * st_blocks cannot see fallocate()d-but-unwritten extents: they count as
+ * allocated, so a 100 GiB file holding 14 GiB of data looks fully dense. The
+ * dense O_DIRECT reader then preads the whole 100 GiB and the kernel memsets
+ * zeros for the unwritten 86 GiB (80% of cycles in iov_iter_zero on the
+ * /data1/erbmi1/001 profile), which we then write out for real.
+ *
+ * Two ways to see through that:
+ *
+ *  - FIEMAP reads the extent tree directly and flags unwritten extents
+ *    explicitly (FIEMAP_EXTENT_UNWRITTEN). Deterministic. FIEMAP_FLAG_SYNC
+ *    first writes back dirty pages so an unwritten extent that was just
+ *    written to via the page cache is not misread as empty.
+ *  - SEEK_DATA/SEEK_HOLE is portable (NFS 4.2, macOS) but XFS answers it for
+ *    unwritten extents by asking the page cache: if something buffered-read
+ *    the file recently (sha256sum, cp, a previous verify), the cached zero
+ *    pages count as data and the holes vanish until eviction. Correct but
+ *    slow, and nondeterministic between runs. Fallback only.
+ */
+
+/* Growable [start,end) list, ALIGNMENT-rounded and merged. */
+typedef struct {
+    off_t   *ext;
+    size_t   n;
+    size_t   cap;
+    uint64_t bytes;
+} extent_list_t;
+
+/*
+ * Append data run [data,hole) clipped to limit. Boundaries are rounded
+ * outward to ALIGNMENT (reading a few KiB of hole as zeros is harmless; an
+ * unaligned O_DIRECT pread is not). Returns -1 on OOM.
+ */
+static int extent_list_add(extent_list_t *l, off_t data, off_t hole, off_t limit)
+{
+    data = (data / ALIGNMENT) * ALIGNMENT;
+    hole = ((hole + ALIGNMENT - 1) / ALIGNMENT) * ALIGNMENT;
+    if (hole > limit) {
+        hole = limit;
+    }
+    if (data < 0) {
+        data = 0;
+    }
+    if (hole <= data) {
+        return 0;
+    }
+    if (l->n > 0 && data <= l->ext[2 * (l->n - 1) + 1]) {
+        /* Touches or overlaps the previous run: merge. */
+        off_t prev_end = l->ext[2 * (l->n - 1) + 1];
+        if (hole > prev_end) {
+            l->bytes += (uint64_t)(hole - prev_end);
+            l->ext[2 * (l->n - 1) + 1] = hole;
+        }
+        return 0;
+    }
+    if (l->n == l->cap) {
+        size_t ncap = l->cap ? l->cap * 2 : 64;
+        off_t *tmp = realloc(l->ext, ncap * 2 * sizeof(*tmp));
+        if (!tmp) {
+            return -1;
+        }
+        l->ext = tmp;
+        l->cap = ncap;
+    }
+    l->ext[2 * l->n] = data;
+    l->ext[2 * l->n + 1] = hole;
+    l->n++;
+    l->bytes += (uint64_t)(hole - data);
+    return 0;
+}
+
+/*
+ * FIEMAP walk over [0, limit). Unwritten extents are treated as holes;
+ * anything else (including DELALLOC/UNKNOWN, which SYNC should have
+ * resolved anyway) is data. When stop_at_first_hole is set the walk returns
+ * as soon as it knows a hole exists (probe use).
+ * Returns 1 = mapped (*has_hole set), 0 = FIEMAP unsupported here,
+ * -1 = OOM.
+ */
+static int fiemap_walk(int fd, off_t limit, extent_list_t *l, int stop_at_first_hole,
+                       int *has_hole)
+{
+#ifdef FS_IOC_FIEMAP
+    enum { FM_BATCH = 512 };
+    struct fiemap *fm;
+    uint64_t pos = 0;
+    uint64_t expect = 0; /* logical offset the next extent should start at */
+    int rc = 1;
+
+    *has_hole = 0;
+    fm = malloc(sizeof(*fm) + FM_BATCH * sizeof(struct fiemap_extent));
+    if (!fm) {
+        return -1;
+    }
+    for (;;) {
+        unsigned int i;
+        const struct fiemap_extent *last = NULL;
+
+        memset(fm, 0, sizeof(*fm));
+        fm->fm_start = pos;
+        fm->fm_length = (uint64_t)limit - pos;
+        fm->fm_flags = FIEMAP_FLAG_SYNC;
+        fm->fm_extent_count = FM_BATCH;
+        if (ioctl(fd, FS_IOC_FIEMAP, fm) != 0) {
+            rc = 0; /* EOPNOTSUPP/ENOTTY/EBADR: not available on this fs */
+            break;
+        }
+        if (fm->fm_mapped_extents == 0) {
+            break;
+        }
+        for (i = 0; i < fm->fm_mapped_extents; i++) {
+            const struct fiemap_extent *e = &fm->fm_extents[i];
+            uint64_t s = e->fe_logical;
+            uint64_t en = s + e->fe_length;
+            int unwritten = (e->fe_flags & FIEMAP_EXTENT_UNWRITTEN) &&
+                            !(e->fe_flags & FIEMAP_EXTENT_DELALLOC);
+            last = e;
+            if (s > expect || unwritten) {
+                *has_hole = 1;
+                if (stop_at_first_hole) {
+                    goto done;
+                }
+            }
+            if (!unwritten && l && s < (uint64_t)limit) {
+                if (extent_list_add(l, (off_t)s, (off_t)(en < (uint64_t)limit ? en : (uint64_t)limit),
+                                    limit) != 0) {
+                    rc = -1;
+                    goto done;
+                }
+            }
+            if (en > expect) {
+                expect = en;
+            }
+        }
+        if ((last->fe_flags & FIEMAP_EXTENT_LAST) || expect >= (uint64_t)limit ||
+            expect <= pos /* no forward progress: never spin */) {
+            break;
+        }
+        pos = expect;
+    }
+    if (rc == 1 && expect < (uint64_t)limit) {
+        *has_hole = 1; /* trailing hole before limit */
+    }
+done:
+    free(fm);
+    return rc;
+#else
+    (void)fd; (void)limit; (void)l; (void)stop_at_first_hole;
+    *has_hole = 0;
+    return 0;
+#endif
+}
+
+/* SEEK_DATA/SEEK_HOLE walk over [0, limit). Same return convention. */
+static int seek_walk(int fd, off_t limit, extent_list_t *l, int *has_hole)
+{
+    off_t pos = 0;
+
+    *has_hole = 0;
+    while (pos < limit) {
+        off_t data = lseek(fd, pos, SEEK_DATA);
+        off_t hole;
+        if (data < 0) {
+            if (errno == ENXIO) {
+                *has_hole = 1; /* only holes remain */
+                break;
+            }
+            return 0; /* unsupported */
+        }
+        if (data >= limit) {
+            *has_hole = 1;
+            break;
+        }
+        if (data > pos) {
+            *has_hole = 1;
+        }
+        hole = lseek(fd, data, SEEK_HOLE);
+        if (hole < 0) {
+            return 0;
+        }
+        if (hole < limit) {
+            *has_hole = 1;
+        }
+        if (l && extent_list_add(l, data, hole, limit) != 0) {
+            return -1;
+        }
+        pos = hole;
+    }
+    return 1;
+}
+
+/*
+ * Build the data-extent map of fd over [0, limit): FIEMAP first, SEEK_HOLE
+ * fallback. Returns 0 with the map and count set, or 0 with a NULL map if
+ * neither interface works here (caller then reads the whole range); -1
+ * only on OOM.
+ */
+static int build_extent_map(int fd, off_t limit, off_t **out, size_t *count,
+                            uint64_t *data_bytes)
+{
+    extent_list_t l = { NULL, 0, 0, 0 };
+    int has_hole = 0;
+    int rc;
+
+    *out = NULL;
+    *count = 0;
+    *data_bytes = 0;
+    rc = fiemap_walk(fd, limit, &l, 0, &has_hole);
+    if (rc == 0) {
+        free(l.ext);
+        l.ext = NULL;
+        l.n = l.cap = 0;
+        l.bytes = 0;
+        rc = seek_walk(fd, limit, &l, &has_hole);
+    }
+    if (rc < 0) {
+        free(l.ext);
+        return -1;
+    }
+    if (rc == 0) {
+        free(l.ext);
+        return 0; /* dense read */
+    }
+    if (l.n == 0 && l.ext == NULL) {
+        /* All holes: hand back a valid empty map, not "unknown". */
+        l.ext = malloc(sizeof(off_t));
+        if (!l.ext) {
+            return -1;
+        }
+    }
+    *out = l.ext;
+    *count = l.n;
+    *data_bytes = l.bytes;
+    return 0;
+}
+
+/*
+ * Enqueue-time probe for files big enough to matter: one open + one extent
+ * walk (FIEMAP stops at the first unwritten extent or gap) + close per large
+ * file. Returns 1 if a hole exists before EOF, 0 if dense or unknowable.
+ */
+static int source_has_hole(int dir_fd, const char *name, off_t size)
+{
+    /* open + ioctl/lseek never touch atime, so no O_NOATIME games needed. */
+    int fd = openat(dir_fd, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    int has_hole = 0;
+    int rc;
+
+    if (fd < 0) {
+        return 0;
+    }
+    rc = fiemap_walk(fd, size, NULL, 1, &has_hole);
+    if (rc == 0) {
+        rc = seek_walk(fd, size, NULL, &has_hole);
+    }
+    ecopy_close_nocancel(fd);
+    return rc == 1 && has_hole;
+}
+
+/*
+ * Local files above the threshold take the parallel reader/writer pipeline.
+ * A sparse file qualifies too when its *data* (not its logical size) is
+ * above the threshold: a 100 GiB image holding 14 GiB is still a big copy
+ * and the pipeline skips its holes via the extent map. Sparse files with
+ * little data stay on the serial hole-skipping path, where per-file thread
+ * spin-up would dominate.
+ */
+static uint64_t task_weight(const struct stat *st);
+
+static int task_uses_large_pipeline(const file_task_t *t)
+{
+    off_t threshold = runtime_large_threshold();
+
+    if (sshx_active() || t->src_st.st_size <= threshold) {
+        return 0;
+    }
+    if (!t->sparse) {
+        return 1;
+    }
+    return (off_t)task_weight(&t->src_st) > threshold;
+}
+
+/* Decide once, at enqueue time, which data path a file takes. */
+static int classify_sparse(const dir_handle_t *dir, const char *name, const struct stat *st)
+{
+    if (workers_file_is_sparse(st)) {
+        return 1;
+    }
+    if (S_ISREG(st->st_mode) && st->st_size > runtime_large_threshold()) {
+        return source_has_hole(dir->src_fd, name, st->st_size);
+    }
+    return 0;
+}
+
 /* -------------------- queue helpers -------------------- */
 
 static void free_file_task(file_task_t *task)
@@ -615,44 +952,29 @@ static file_task_t *heap_pop_max(task_heap_t *h)
     return top;
 }
 
-/* Ensure the ring can hold at least `need` entries. Caller holds g_queue_lock. */
-static int ring_reserve(task_ring_t *r, size_t need)
+/* Append a (non-empty) directory batch. Caller holds g_queue_lock. */
+static void smallq_push_batch(small_queue_t *q, dir_batch_t *b)
 {
-    if (r->cap >= need) {
-        return 0;
+    b->next = NULL;
+    if (q->tail) {
+        q->tail->next = b;
+    } else {
+        q->head = b;
     }
-    size_t ncap = r->cap ? r->cap * 2 : 1024;
-    while (ncap < need) {
-        ncap *= 2;
-    }
-    file_task_t **ns = malloc(ncap * sizeof(*ns));
-    if (!ns) {
-        return -1;
-    }
-    for (size_t i = 0; i < r->len; i++) {
-        ns[i] = r->slots[(r->head + i) & (r->cap - 1)];
-    }
-    free(r->slots);
-    r->slots = ns;
-    r->cap = ncap;
-    r->head = 0;
-    return 0;
+    q->tail = b;
+    q->len += b->count - b->head;
 }
 
-/* Capacity must be reserved by the caller (keeps push infallible). */
-static void ring_push(task_ring_t *r, file_task_t *t)
+/* Detach the head batch. Caller holds g_queue_lock and ensures q->len > 0. */
+static dir_batch_t *smallq_pop_batch(small_queue_t *q)
 {
-    r->slots[(r->head + r->len) & (r->cap - 1)] = t;
-    r->len++;
-}
-
-/* Caller ensures r->len > 0. */
-static file_task_t *ring_pop(task_ring_t *r)
-{
-    file_task_t *t = r->slots[r->head];
-    r->head = (r->head + 1) & (r->cap - 1);
-    r->len--;
-    return t;
+    dir_batch_t *b = q->head;
+    q->head = b->next;
+    if (!q->head) {
+        q->tail = NULL;
+    }
+    q->len -= b->count - b->head;
+    return b;
 }
 
 static void enqueue_buffer(large_buffer_t **head, large_buffer_t **tail, large_buffer_t *buf)
@@ -1347,7 +1669,7 @@ static int copy_file_serial_small(file_task_t *task, uint64_t *payload_bytes)
     fadvise_batch_init(&fadv);
     init_runtime_config();
 
-    if (workers_file_is_sparse(&task->src_st)) {
+    if (task->sparse) {
         return copy_file_sparse(task, payload_bytes);
     }
 
@@ -1393,7 +1715,16 @@ static int copy_file_serial_small(file_task_t *task, uint64_t *payload_bytes)
         goto out;
     }
 
-    if (!in_direct) {
+    /*
+     * copy_file_range() either reflinks (same-fs XFS/btrfs) or splices in
+     * the kernel; the data never passes through this thread's buffer. A
+     * WILLNEED hint before it therefore just drags the whole source through
+     * the page cache for nothing (9.8% of cycles and the entire 144 GB
+     * dataset re-read on the imagenet profile). Hint only when we know we
+     * will read() the data ourselves; the fallback path below hints if
+     * copy_file_range turns out not to work.
+     */
+    if (!in_direct && !(copy_range_available && !out_direct)) {
         advise_source_streaming(fd_in);
     }
     if (!out_direct) {
@@ -1424,6 +1755,7 @@ static int copy_file_serial_small(file_task_t *task, uint64_t *payload_bytes)
             }
             stats_record_copy_file_range_fallback();
             copy_range_available = 0;
+            advise_source_streaming(fd_in); /* now we read it ourselves */
         }
 
         {
@@ -1546,6 +1878,38 @@ out:
 
 /* -------------------- large-file pipeline -------------------- */
 
+/*
+ * Position next_read_offset on data. Caller holds ctx->lock. After this,
+ * next_read_offset >= bulk_end means the readers are done; otherwise it
+ * points into extents[ext_idx] (or anywhere, for a dense file).
+ */
+static void reader_skip_holes_locked(large_file_ctx_t *ctx)
+{
+    if (!ctx->extents) {
+        return;
+    }
+    while (ctx->ext_idx < ctx->ext_count &&
+           ctx->next_read_offset >= ctx->extents[2 * ctx->ext_idx + 1]) {
+        ctx->ext_idx++;
+    }
+    if (ctx->ext_idx >= ctx->ext_count) {
+        ctx->next_read_offset = ctx->bulk_end;
+        return;
+    }
+    if (ctx->next_read_offset < ctx->extents[2 * ctx->ext_idx]) {
+        ctx->next_read_offset = ctx->extents[2 * ctx->ext_idx];
+    }
+}
+
+/* End of the run the next chunk may extend to. Caller holds ctx->lock. */
+static off_t reader_run_end_locked(const large_file_ctx_t *ctx)
+{
+    if (ctx->extents && ctx->ext_idx < ctx->ext_count) {
+        return ctx->extents[2 * ctx->ext_idx + 1];
+    }
+    return ctx->bulk_end;
+}
+
 static void *large_reader_main(void *arg)
 {
     large_file_ctx_t *ctx = (large_file_ctx_t *)arg;
@@ -1595,11 +1959,12 @@ static void *large_reader_main(void *arg)
                 ctx->free_count--;
             }
             offset = ctx->next_read_offset;
-            remain = ctx->bulk_end - offset;
+            remain = reader_run_end_locked(ctx) - offset;
             this_len_off = (remain >= g_chunk_size) ? g_chunk_size : remain;
             b->offset = offset;
             b->len = (size_t)this_len_off;
             ctx->next_read_offset += this_len_off;
+            reader_skip_holes_locked(ctx);
             batch[n++] = b;
         }
         pthread_mutex_unlock(&ctx->lock);
@@ -1821,9 +2186,9 @@ static void finish_large_file_ctx(large_file_ctx_t *ctx)
             rc = -1;
         } else {
             ctx->fd_out = -1;
-            telemetry_note_file(TRANSFER_LARGE,
+            telemetry_note_file(ctx->sparse ? TRANSFER_SPARSE : TRANSFER_LARGE,
                                 (uint64_t)ctx->src_st.st_size,
-                                (uint64_t)ctx->src_st.st_size,
+                                ctx->payload_bytes,
                                 monotonic_ns() - ctx->service_start_ns);
             telemetry_flush_thread();
             /* Local temp+rename: the file is durable and at its final path. */
@@ -1855,6 +2220,7 @@ static void finish_large_file_ctx(large_file_ctx_t *ctx)
     dir_handle_release(ctx->dir);
     free_large_buffers(ctx->free_head);
     free_large_buffers(ctx->ready_head);
+    free(ctx->extents);
     free(ctx->reader_threads);
     free(ctx->writer_threads);
     pthread_mutex_destroy(&ctx->lock);
@@ -1910,6 +2276,8 @@ static int start_large_file_copy(file_task_t *task)
     ctx->service_start_ns = monotonic_ns();
     ctx->bulk_end = (task->src_st.st_size / ALIGNMENT) * ALIGNMENT;
     ctx->next_read_offset = 0;
+    ctx->sparse = task->sparse;
+    ctx->payload_bytes = (uint64_t)task->src_st.st_size;
     dir_handle_retain(task->dir);
     ctx->dir = task->dir;
     ctx->fd_in = -1;
@@ -1938,6 +2306,21 @@ static int start_large_file_copy(file_task_t *task)
         goto fail;
     }
 
+    if (ctx->sparse) {
+        uint64_t data_bytes;
+        if (build_extent_map(ctx->fd_in, ctx->bulk_end, &ctx->extents,
+                             &ctx->ext_count, &data_bytes) != 0) {
+            perror("malloc");
+            goto fail;
+        }
+        if (ctx->extents) {
+            /* Data extents plus the buffered tail beyond bulk_end. */
+            ctx->payload_bytes = data_bytes +
+                (uint64_t)(ctx->src_st.st_size - ctx->bulk_end);
+            reader_skip_holes_locked(ctx);
+        }
+    }
+
     ctx->fd_out = create_temp_write_at_maybe_direct(ctx->dir->dst_fd,
                                                     ctx->dst,
                                                     ctx->src_st.st_mode & 07777,
@@ -1961,16 +2344,27 @@ static int start_large_file_copy(file_task_t *task)
      */
     if (ctx->src_st.st_size > 0) {
         /*
-         * Sparse files never normally reach the large-file pipeline (they are
-         * routed to the serial hole-skipping path), but guard against ever
-         * fallocate()-ing the full logical size of a sparse file: a 5 PB sparse
-         * image would otherwise try to physically reserve 5 PB. For the sparse
-         * case fall back to sizing with ftruncate() only.
+         * A sparse source must never be fallocate()d to its logical size (a
+         * 5 PB sparse image would try to reserve 5 PB, and the holes would
+         * stop being holes). Size it with ftruncate() so skipped ranges stay
+         * holes, then preallocate just the data extents so the O_DIRECT
+         * writes into them still skip the per-write allocator. Skip the
+         * per-extent calls for badly fragmented files where they would cost
+         * more than they save; the writes then allocate on the fly.
          */
-        if (workers_file_is_sparse(&ctx->src_st)) {
+        if (ctx->sparse) {
             if (ecopy_ftruncate_nocancel(ctx->fd_out, ctx->src_st.st_size) != 0) {
                 perror("ftruncate");
                 goto fail;
+            }
+            if (ctx->extents && ctx->ext_count <= 4096) {
+                for (size_t e = 0; e < ctx->ext_count; e++) {
+                    off_t st = ctx->extents[2 * e];
+                    off_t ln = ctx->extents[2 * e + 1] - st;
+                    if (fallocate(ctx->fd_out, 0, st, ln) != 0) {
+                        break; /* best effort */
+                    }
+                }
             }
         } else if (fallocate(ctx->fd_out, 0, 0, ctx->src_st.st_size) != 0) {
             if (errno != EOPNOTSUPP && errno != ENOSYS) {
@@ -2077,14 +2471,34 @@ static int total_worker_slots_used_locked(void)
     return (int)g_small_workers_active + (int)(g_large_workers_active * (uint64_t)g_large_worker_count);
 }
 
+/* Free slots a parked producer should see before it is worth waking. */
+static int space_wake_min(void)
+{
+    int m = g_max_queued_files / 4;
+    if (m > SPACE_WAKE_MIN) {
+        m = SPACE_WAKE_MIN;
+    }
+    return m > 0 ? m : 1;
+}
+
+/* Caller holds g_queue_lock; call after removing work from the queues. */
+static void wake_producer_if_room_locked(void)
+{
+    if (g_space_waiters > 0 &&
+        g_max_queued_files - (int)(g_small_q.len + g_large_heap.len) >= space_wake_min()) {
+        pthread_cond_signal(&g_space_cond);
+    }
+}
+
 /*
  * Small-file claims are refilled in batches: a worker pops up to
  * SMALL_CLAIM_BATCH tasks under one g_queue_lock acquisition into a local
  * stash and only re-enters the scheduler when the stash is empty, cutting
- * lock round-trips per dispatched file. Stash entries are consumed in ring
- * pop order, so FIFO dispatch is unchanged. Stashed
- * tasks stay counted in g_small_workers_active until completed, so slot
- * accounting and the shutdown condition are unaffected.
+ * lock round-trips per dispatched file. A stash is a run of consecutive
+ * files from one directory batch (the batch is then rotated behind the other
+ * queued directories, see small_queue_t). Stashed tasks stay counted in
+ * g_small_workers_active until completed, so slot accounting and the
+ * shutdown condition are unaffected.
  */
 #define SMALL_CLAIM_BATCH 8
 
@@ -2107,7 +2521,7 @@ static work_claim_t dequeue_work(file_task_t **stash, int *stash_head,
         /*
          * Ctrl+C: abandon instead of drain. Recycle the stash remainder and
          * wake any producer parked on a full queue so it can observe the
-         * shutdown flag; tasks still in the ring/heap are freed by
+         * shutdown flag; tasks still in the queue/heap are freed by
          * workers_stop().
          */
         while (*stash_head < *stash_count) {
@@ -2143,23 +2557,31 @@ static work_claim_t dequeue_work(file_task_t **stash, int *stash_head,
             claim.kind = WORK_LARGE_FILE_START;
             claim.file_task = heap_pop_max(&g_large_heap);
             g_large_workers_active++;
-            pthread_cond_signal(&g_space_cond);
+            wake_producer_if_room_locked();
             break;
         }
 
-        if (g_small_ring.len > 0 &&
+        if (g_small_q.len > 0 &&
             (int)g_small_workers_active < g_small_worker_limit &&
             total_slots_used + 1 <= g_worker_count) {
+            dir_batch_t *b = smallq_pop_batch(&g_small_q);
             *stash_head = 0;
             *stash_count = 0;
             while (*stash_count < SMALL_CLAIM_BATCH &&
-                   g_small_ring.len > 0 &&
+                   b->head < b->count &&
                    (int)g_small_workers_active < g_small_worker_limit &&
                    total_slots_used + 1 <= g_worker_count) {
-                stash[(*stash_count)++] = ring_pop(&g_small_ring);
+                stash[(*stash_count)++] = b->tasks[b->head++];
                 g_small_workers_active++;
-                pthread_cond_signal(&g_space_cond);
                 total_slots_used++;
+            }
+            wake_producer_if_room_locked();
+            /* Rotate a part-claimed directory behind the others so the next
+             * claimant works in a different directory. */
+            if (b->head < b->count) {
+                smallq_push_batch(&g_small_q, b);
+            } else {
+                free(b);
             }
             /*
              * The stash is drained over the next several file copies, and
@@ -2186,7 +2608,7 @@ static work_claim_t dequeue_work(file_task_t **stash, int *stash_head,
             break;
         }
 
-        if (g_small_ring.len == 0 && g_large_heap.len == 0 &&
+        if (g_small_q.len == 0 && g_large_heap.len == 0 &&
             g_queue_done && g_large_workers_active == 0 && g_small_workers_active == 0) {
             break;
         }
@@ -2268,7 +2690,7 @@ static int copy_file_remote(file_task_t *task, uint64_t *payload_bytes)
     int rc = -1;
     void *buf = NULL;
     off_t size = task->src_st.st_size;
-    int sparse = workers_file_is_sparse(&task->src_st);
+    int sparse = task->sparse;
     size_t chunk = (g_chunk_size > 0) ? (size_t)g_chunk_size : (size_t)(1024 * 1024);
     sshx_file_t *f = NULL;
 
@@ -2403,7 +2825,7 @@ static void *worker_main(void *arg)
         if (claim.kind == WORK_SMALL_FILE) {
             uint64_t service_start_ns = monotonic_ns();
             uint64_t payload_bytes = 0;
-            int sparse = workers_file_is_sparse(&claim.file_task->src_st);
+            int sparse = claim.file_task->sparse;
             int ok = sshx_active()
                          ? (copy_file_remote(claim.file_task, &payload_bytes) == 0)
                          : (copy_file_serial_small(claim.file_task, &payload_bytes) == 0);
@@ -2447,10 +2869,19 @@ static void *worker_main(void *arg)
              * observe the termination condition and exit; a lone signal would
              * leave the others blocked forever and hang workers_stop().
              */
-            if (g_queue_done && g_small_ring.len == 0 && g_large_heap.len == 0 &&
+            if (g_queue_done && g_small_q.len == 0 && g_large_heap.len == 0 &&
                 g_small_workers_active == 0 && g_large_workers_active == 0) {
                 pthread_cond_broadcast(&g_queue_cond);
-            } else {
+            } else if (g_queue_waiters > 0 &&
+                       (g_small_q.len > 0 || g_large_heap.len > 0)) {
+                /*
+                 * Wake a parked worker only when there is something for it
+                 * to claim. Signaling unconditionally per completed file
+                 * made every finish a futex wake of one of the (up to 256)
+                 * parked threads, which then fought the live workers for
+                 * this mutex and re-parked: 62% of cycles in futex and
+                 * 500k context switches/s on the imagenet profile.
+                 */
                 pthread_cond_signal(&g_queue_cond);
             }
             pthread_mutex_unlock(&g_queue_lock);
@@ -2505,8 +2936,8 @@ int workers_start(void)
 
     pthread_mutex_lock(&g_queue_lock);
     g_queue_done = 0;
-    g_small_ring.head = 0;
-    g_small_ring.len = 0;
+    g_small_q.head = g_small_q.tail = NULL;
+    g_small_q.len = 0;
     g_large_heap.len = 0;
     g_enqueue_seq = 0;
     g_small_workers_active = 0;
@@ -2574,19 +3005,20 @@ void workers_stop(void)
      * Free any tasks still queued (only happens on an error stop; a clean run
      * drains both queues to empty) and release the backing arrays.
      */
-    for (size_t i = 0; i < g_small_ring.len; i++) {
-        file_task_t *t =
-            g_small_ring.slots[(g_small_ring.head + i) & (g_small_ring.cap - 1)];
-        dir_handle_release(t->dir);
-        free(t);
+    while (g_small_q.head) {
+        dir_batch_t *b = smallq_pop_batch(&g_small_q);
+        for (uint32_t i = b->head; i < b->count; i++) {
+            dir_handle_release(b->tasks[i]->dir);
+            free(b->tasks[i]);
+        }
+        free(b);
     }
     for (size_t i = 0; i < g_large_heap.len; i++) {
         dir_handle_release(g_large_heap.items[i].task->dir);
         free(g_large_heap.items[i].task);
     }
-    free(g_small_ring.slots);
-    g_small_ring.slots = NULL;
-    g_small_ring.head = g_small_ring.len = g_small_ring.cap = 0;
+    g_small_q.head = g_small_q.tail = NULL;
+    g_small_q.len = 0;
     free(g_large_heap.items);
     g_large_heap.items = NULL;
     g_large_heap.len = g_large_heap.cap = 0;
@@ -2721,6 +3153,7 @@ int workers_enqueue_batch(dir_handle_t *dir,
         dir_handle_retain(dir);
         t->dir = dir;
         t->src_st = *items[i].src_st;
+        t->sparse = (unsigned char)classify_sparse(dir, items[i].name, items[i].src_st);
         t->next = NULL;
         if (batch_tail) {
             batch_tail->next = t;
@@ -2746,50 +3179,64 @@ int workers_enqueue_batch(dir_handle_t *dir,
     while (batch_head) {
         size_t room;
         size_t take;
+        dir_batch_t *db;
+
+        /* Sized for the whole remainder (>= this slice) so the fill under
+         * the lock never allocates. */
+        db = malloc(sizeof(*db) + built * sizeof(db->tasks[0]));
+        if (!db) {
+            errno = ENOMEM;
+            goto fail;
+        }
+        db->head = 0;
+        db->count = 0;
 
         pthread_mutex_lock(&g_queue_lock);
-        while ((int)(g_small_ring.len + g_large_heap.len) >=
-               g_max_queued_files &&
-               !atomic_load_explicit(&g_shutdown_requested, memory_order_relaxed)) {
-            uint64_t wait_start_ns = g_collect_wait_timing ? monotonic_ns() : 0;
-            pthread_cond_wait(&g_space_cond, &g_queue_lock);
-            if (g_collect_wait_timing) {
-                stats_record_queue_wait_ns(monotonic_ns() - wait_start_ns);
+        {
+            /* Park until the whole remainder fits, or at least a
+             * space_wake_min() slice does (the consumer wakes us at that
+             * point, never for a handful of slots). */
+            int need = (int)built < space_wake_min() ? (int)built : space_wake_min();
+            while (g_max_queued_files - (int)(g_small_q.len + g_large_heap.len) < need &&
+                   !atomic_load_explicit(&g_shutdown_requested, memory_order_relaxed)) {
+                uint64_t wait_start_ns = g_collect_wait_timing ? monotonic_ns() : 0;
+                g_space_waiters++;
+                pthread_cond_wait(&g_space_cond, &g_queue_lock);
+                g_space_waiters--;
+                if (g_collect_wait_timing) {
+                    stats_record_queue_wait_ns(monotonic_ns() - wait_start_ns);
+                }
             }
         }
         if (atomic_load_explicit(&g_shutdown_requested, memory_order_relaxed)) {
             pthread_mutex_unlock(&g_queue_lock);
+            free(db);
             errno = ECANCELED;
             goto fail;
         }
         room = (size_t)(g_max_queued_files -
-                        (int)(g_small_ring.len + g_large_heap.len));
+                        (int)(g_small_q.len + g_large_heap.len));
         take = built < room ? built : room;
 
         /*
-         * Reserve queue capacity for this slice before pushing so the pushes
-         * are infallible. Classify first to size each queue exactly; on OOM
+         * Reserve large-heap capacity for this slice before pushing so the
+         * pushes are infallible (the small batch was sized above). On OOM
          * bail out (the fail path frees the remaining batch and
          * already-queued items stay valid).
          */
         {
             size_t large_add = 0;
-            size_t small_add = 0;
             file_task_t *scan = batch_head;
             for (size_t i = 0; i < take; i++) {
-                int use_large = !sshx_active() &&
-                                scan->src_st.st_size > runtime_large_threshold() &&
-                                !workers_file_is_sparse(&scan->src_st);
+                int use_large = task_uses_large_pipeline(scan);
                 if (use_large) {
                     large_add++;
-                } else {
-                    small_add++;
                 }
                 scan = scan->next;
             }
-            if (heap_reserve(&g_large_heap, g_large_heap.len + large_add) != 0 ||
-                ring_reserve(&g_small_ring, g_small_ring.len + small_add) != 0) {
+            if (heap_reserve(&g_large_heap, g_large_heap.len + large_add) != 0) {
                 pthread_mutex_unlock(&g_queue_lock);
+                free(db);
                 errno = ENOMEM;
                 goto fail;
             }
@@ -2801,23 +3248,26 @@ int workers_enqueue_batch(dir_handle_t *dir,
             batch_head = t->next;
             t->next = NULL;
 
-            use_large = !sshx_active() &&
-                        t->src_st.st_size > runtime_large_threshold() &&
-                        !workers_file_is_sparse(&t->src_st);
+            use_large = task_uses_large_pipeline(t);
             /*
              * The large heap is keyed: allocated-bytes weight when size
              * priority is on (biggest data first), else a decreasing sequence
-             * so it yields FIFO order. Small files go to the FIFO ring —
-             * size priority among sub-threshold files has no load-balance
-             * value, so g_size_priority now only orders the large heap.
+             * so it yields FIFO order. Small files go into this directory's
+             * batch — size priority among sub-threshold files has no
+             * load-balance value, so g_size_priority now only orders the
+             * large heap.
              */
             if (use_large) {
                 t->sched_key = g_size_priority ? task_weight(&t->src_st)
                                                : (UINT64_MAX - g_enqueue_seq++);
                 heap_push(&g_large_heap, t);
             } else {
-                ring_push(&g_small_ring, t);
+                db->tasks[db->count++] = t;
             }
+        }
+        if (db->count > 0) {
+            smallq_push_batch(&g_small_q, db);
+            db = NULL;
         }
         {
             int free_slots = g_worker_count - total_worker_slots_used_locked();
@@ -2838,11 +3288,11 @@ int workers_enqueue_batch(dir_handle_t *dir,
                 free_slots -= large_wake * g_large_worker_count;
             }
 
-            if (g_small_ring.len > 0 && free_slots > 0) {
+            if (g_small_q.len > 0 && free_slots > 0) {
                 small_wake = g_small_worker_limit -
                              (int)g_small_workers_active;
-                if (small_wake > (int)g_small_ring.len) {
-                    small_wake = (int)g_small_ring.len;
+                if (small_wake > (int)g_small_q.len) {
+                    small_wake = (int)g_small_q.len;
                 }
                 if (small_wake > free_slots) {
                     small_wake = free_slots;
@@ -2868,6 +3318,7 @@ int workers_enqueue_batch(dir_handle_t *dir,
             }
         }
         pthread_mutex_unlock(&g_queue_lock);
+        free(db); /* NULL if it was queued; otherwise this slice was all large */
 
         built -= take;
     }
@@ -2911,7 +3362,7 @@ uint64_t workers_small_queue_depth(void)
 {
     uint64_t v;
     pthread_mutex_lock(&g_queue_lock);
-    v = g_small_ring.len;
+    v = g_small_q.len;
     pthread_mutex_unlock(&g_queue_lock);
     return v;
 }

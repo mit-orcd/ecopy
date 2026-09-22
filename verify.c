@@ -1000,6 +1000,8 @@ static void *verify_pool_worker(void *arg)
         free_item(item);
         atomic_fetch_sub(&g_run_active, 1);
     }
+    /* Fold this checker's per-thread verify counters into the totals. */
+    stats_flush_io_op_counts();
     return NULL;
 }
 

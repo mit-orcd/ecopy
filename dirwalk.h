@@ -11,7 +11,8 @@
  * directory (O_NOFOLLOW, verified against the discovery stat so a swapped
  * symlink is rejected), enumerates it with raw getdents64 where available
  * (libc readdir otherwise) and fstatat()s every entry relative to the open
- * descriptor, so no absolute path is re-walked per entry. Subdirectories the
+ * descriptor (or, with cfg.lazy_stat, only the directories and entries of
+ * unknown type), so no absolute path is re-walked per entry. Subdirectories the
  * consumer asks to descend into are pushed back onto the FIFO. Keeping
  * descriptors open only while a directory is being processed bounds them by
  * the thread count rather than by the queue depth.
@@ -54,6 +55,11 @@ typedef struct dirwalk_ops {
      * One call per entry other than "." and "..", with its AT_SYMLINK_NOFOLLOW
      * stat. For S_ISDIR entries return DIRWALK_DESCEND to have the walker
      * queue "<node->path>/<name>"; the return value is ignored otherwise.
+     *
+     * With cfg.lazy_stat set, st is NULL for entries the directory stream
+     * already reports as non-directories (d_type != DT_DIR/DT_UNKNOWN); such
+     * an entry is never a directory. Directories and entries of unknown type
+     * are always delivered with a stat.
      */
     int (*entry)(const dirwalk_node_t *node, int dir_fd, void *ctx,
                  const char *name, const struct stat *st);
@@ -71,6 +77,9 @@ typedef struct dirwalk_cfg {
     int threads;               /* walker threads, >= 1 */
     size_t getdents_buf;       /* per-thread raw getdents64 buffer bytes; 0 = readdir */
     const _Atomic int *stop;   /* optional external stop flag polled per entry */
+    int lazy_stat;             /* skip fstatat for entries d_type marks as non-directories
+                                  (entry() then gets st == NULL); saves one syscall per
+                                  file for consumers that only need to know "is it a dir" */
 } dirwalk_cfg_t;
 
 /*

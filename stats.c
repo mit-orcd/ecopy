@@ -72,6 +72,14 @@ static _Atomic uint64_t a_read_direct_opens;
 static _Atomic uint64_t a_read_buffered_opens;
 static _Atomic uint64_t a_write_direct_opens;
 static _Atomic uint64_t a_write_buffered_opens;
+static _Atomic uint64_t a_cfr_calls;
+static _Atomic uint64_t a_cfr_bytes;
+static _Atomic uint64_t a_cfr_syscalls;
+static _Atomic uint64_t a_cfr_ns;
+static _Atomic uint64_t a_cfr_fallbacks;
+static _Atomic uint64_t a_large_chunk_buffer_allocs;
+static _Atomic uint64_t a_metadata_warnings;
+static _Atomic uint64_t a_metadata_errors;
 static _Atomic int a_first_payload_seen;
 static struct timespec g_first_payload_ts;
 
@@ -103,6 +111,14 @@ static void stats_load_hot(stats_t *s) {
     s->read_buffered_opens = hot_load(&a_read_buffered_opens);
     s->write_direct_opens = hot_load(&a_write_direct_opens);
     s->write_buffered_opens = hot_load(&a_write_buffered_opens);
+    s->copy_file_range_calls = hot_load(&a_cfr_calls);
+    s->copy_file_range_bytes = hot_load(&a_cfr_bytes);
+    s->copy_file_range_syscalls = hot_load(&a_cfr_syscalls);
+    s->copy_file_range_ns = hot_load(&a_cfr_ns);
+    s->copy_file_range_fallbacks = hot_load(&a_cfr_fallbacks);
+    s->large_chunk_buffer_allocs = hot_load(&a_large_chunk_buffer_allocs);
+    s->metadata_warnings = hot_load(&a_metadata_warnings);
+    s->metadata_errors = hot_load(&a_metadata_errors);
 }
 
 static double ts_to_sec(const struct timespec *ts) {
@@ -178,6 +194,14 @@ void stats_init(void) {
     atomic_store_explicit(&a_read_buffered_opens, 0, memory_order_relaxed);
     atomic_store_explicit(&a_write_direct_opens, 0, memory_order_relaxed);
     atomic_store_explicit(&a_write_buffered_opens, 0, memory_order_relaxed);
+    atomic_store_explicit(&a_cfr_calls, 0, memory_order_relaxed);
+    atomic_store_explicit(&a_cfr_bytes, 0, memory_order_relaxed);
+    atomic_store_explicit(&a_cfr_syscalls, 0, memory_order_relaxed);
+    atomic_store_explicit(&a_cfr_ns, 0, memory_order_relaxed);
+    atomic_store_explicit(&a_cfr_fallbacks, 0, memory_order_relaxed);
+    atomic_store_explicit(&a_large_chunk_buffer_allocs, 0, memory_order_relaxed);
+    atomic_store_explicit(&a_metadata_warnings, 0, memory_order_relaxed);
+    atomic_store_explicit(&a_metadata_errors, 0, memory_order_relaxed);
     atomic_store_explicit(&a_read_syscalls, 0, memory_order_relaxed);
     atomic_store_explicit(&a_read_ns, 0, memory_order_relaxed);
     atomic_store_explicit(&a_write_syscalls, 0, memory_order_relaxed);
@@ -318,6 +342,59 @@ static __thread uint64_t tls_write_buffered_opens = 0;
 #define FILES_FLUSH_THRESHOLD 32
 static __thread uint64_t tls_files_copied = 0;
 
+/*
+ * copy_file_range accounting used to take g_lock twice per call. On a
+ * reflink-capable same-filesystem copy every small file is exactly one
+ * such call, so 1.28M files meant ~2.5M contended mutex round trips across
+ * 32 workers (18% of cycles in futex on the imagenet profile). Same TLS
+ * fold as the read/write counters above.
+ */
+static __thread uint64_t tls_cfr_calls = 0;
+static __thread uint64_t tls_cfr_bytes = 0;
+static __thread uint64_t tls_cfr_syscalls = 0;
+static __thread uint64_t tls_cfr_ns = 0;
+
+/*
+ * Verify checkers likewise recorded every object under g_lock (three lock
+ * round trips per object, ~1.8M objects on a full tree). Accumulate per
+ * thread and fold into g_stats every VERIFY_FLUSH_THRESHOLD objects and at
+ * thread exit (verify workers call stats_flush_io_op_counts() before
+ * returning). The live progress line lags by at most that many objects per
+ * checker; final totals are exact.
+ */
+#define VERIFY_FLUSH_THRESHOLD 32
+typedef struct {
+    uint64_t objects, bytes, scope_bytes, blocks;
+    uint64_t metadata_objects, data_mismatches, metadata_mismatches;
+    uint64_t zero_mismatches, io_failures, failures;
+    uint64_t hole_blocks, hole_bytes, ownership_unpreserved, busy_ns;
+} verify_tls_t;
+static __thread verify_tls_t tls_verify;
+static __thread int tls_verify_dirty = 0;
+
+static void verify_tls_flush(void) {
+    verify_tls_t v = tls_verify;
+    memset(&tls_verify, 0, sizeof(tls_verify));
+    tls_verify_dirty = 0;
+    pthread_mutex_lock(&g_lock);
+    g_stats.verify_objects += v.objects;
+    g_stats.verify_bytes += v.bytes;
+    g_stats.verify_scope_bytes += v.scope_bytes;
+    g_stats.verify_blocks += v.blocks;
+    g_stats.verify_metadata_objects += v.metadata_objects;
+    g_stats.verify_data_mismatches += v.data_mismatches;
+    g_stats.verify_metadata_mismatches += v.metadata_mismatches;
+    g_stats.verify_zero_mismatches += v.zero_mismatches;
+    g_stats.verify_io_failures += v.io_failures;
+    g_stats.verify_failures += v.failures;
+    g_stats.verify_hole_blocks += v.hole_blocks;
+    g_stats.verify_hole_bytes += v.hole_bytes;
+    g_stats.verify_source_reads_avoided += v.hole_blocks;
+    g_stats.verify_ownership_unpreserved += v.ownership_unpreserved;
+    g_stats.verify_busy_ns += v.busy_ns;
+    pthread_mutex_unlock(&g_lock);
+}
+
 void stats_record_read_open(int used_direct) {
     if (used_direct) {
         if (++tls_read_direct_opens >= IO_OP_FLUSH_THRESHOLD) {
@@ -361,6 +438,16 @@ void stats_record_write_op(void) {
     }
 }
 void stats_flush_io_op_counts(void) {
+    if (tls_cfr_calls > 0 || tls_cfr_syscalls > 0) {
+        hot_add(&a_cfr_calls, tls_cfr_calls);
+        hot_add(&a_cfr_bytes, tls_cfr_bytes);
+        hot_add(&a_cfr_syscalls, tls_cfr_syscalls);
+        hot_add(&a_cfr_ns, tls_cfr_ns);
+        tls_cfr_calls = tls_cfr_bytes = tls_cfr_syscalls = tls_cfr_ns = 0;
+    }
+    if (tls_verify_dirty) {
+        verify_tls_flush();
+    }
     if (tls_read_ops > 0) {
         hot_add(&a_read_syscalls, tls_read_ops);
         tls_read_ops = 0;
@@ -392,8 +479,16 @@ void stats_flush_io_op_counts(void) {
 }
 void stats_record_read_time(uint64_t ns) { hot_add(&a_read_ns, ns); }
 void stats_record_write_time(uint64_t ns) { hot_add(&a_write_ns, ns); }
-void stats_record_copy_file_range_io(uint64_t ns) { pthread_mutex_lock(&g_lock); g_stats.copy_file_range_syscalls++; g_stats.copy_file_range_ns += ns; pthread_mutex_unlock(&g_lock); }
-void stats_record_large_chunk_buffer_alloc(void) { pthread_mutex_lock(&g_lock); g_stats.large_chunk_buffer_allocs++; pthread_mutex_unlock(&g_lock); }
+void stats_record_copy_file_range_io(uint64_t ns) {
+    tls_cfr_syscalls++;
+    tls_cfr_ns += ns;
+    if (tls_cfr_syscalls >= IO_OP_FLUSH_THRESHOLD) {
+        hot_add(&a_cfr_syscalls, tls_cfr_syscalls);
+        hot_add(&a_cfr_ns, tls_cfr_ns);
+        tls_cfr_syscalls = tls_cfr_ns = 0;
+    }
+}
+void stats_record_large_chunk_buffer_alloc(void) { hot_add(&a_large_chunk_buffer_allocs, 1); }
 void stats_record_reader_buffer_wait_ns(uint64_t ns) { hot_add(&a_reader_buffer_wait_ns, ns); hot_add(&a_reader_buffer_waits, 1); }
 void stats_record_writer_data_wait_ns(uint64_t ns) { hot_add(&a_writer_data_wait_ns, ns); hot_add(&a_writer_data_waits, 1); }
 void stats_record_ready_queue_depth(uint64_t depth) {
@@ -421,10 +516,18 @@ void stats_inc_symlink_created(void){ pthread_mutex_lock(&g_lock); g_stats.symli
 void stats_inc_hardlink_seen(void){ pthread_mutex_lock(&g_lock); g_stats.hardlinks_seen++; pthread_mutex_unlock(&g_lock);} 
 void stats_inc_hardlink_created(void){ pthread_mutex_lock(&g_lock); g_stats.hardlinks_created++; pthread_mutex_unlock(&g_lock);} 
 void stats_add_hardlink_saved(uint64_t bytes){ pthread_mutex_lock(&g_lock); g_stats.hardlink_bytes_saved += bytes; pthread_mutex_unlock(&g_lock);} 
-void stats_record_copy_file_range_call(uint64_t bytes) { pthread_mutex_lock(&g_lock); g_stats.copy_file_range_calls++; g_stats.copy_file_range_bytes += bytes; pthread_mutex_unlock(&g_lock); }
-void stats_record_copy_file_range_fallback(void) { pthread_mutex_lock(&g_lock); g_stats.copy_file_range_fallbacks++; pthread_mutex_unlock(&g_lock); }
-void stats_inc_metadata_warning(void) { pthread_mutex_lock(&g_lock); g_stats.metadata_warnings++; pthread_mutex_unlock(&g_lock); }
-void stats_inc_metadata_error(void) { pthread_mutex_lock(&g_lock); g_stats.metadata_errors++; pthread_mutex_unlock(&g_lock); }
+void stats_record_copy_file_range_call(uint64_t bytes) {
+    tls_cfr_calls++;
+    tls_cfr_bytes += bytes;
+    if (tls_cfr_calls >= IO_OP_FLUSH_THRESHOLD) {
+        hot_add(&a_cfr_calls, tls_cfr_calls);
+        hot_add(&a_cfr_bytes, tls_cfr_bytes);
+        tls_cfr_calls = tls_cfr_bytes = 0;
+    }
+}
+void stats_record_copy_file_range_fallback(void) { hot_add(&a_cfr_fallbacks, 1); }
+void stats_inc_metadata_warning(void) { hot_add(&a_metadata_warnings, 1); }
+void stats_inc_metadata_error(void) { hot_add(&a_metadata_errors, 1); }
 void stats_set_verify_config(int metadata, int data, double percent, uint64_t seed) {
     pthread_mutex_lock(&g_lock);
     g_stats.verify_metadata_enabled = metadata;
@@ -447,9 +550,8 @@ void stats_set_verify_runtime(int verify_only, int workers,
     pthread_mutex_unlock(&g_lock);
 }
 void stats_add_verify_busy_ns(uint64_t ns) {
-    pthread_mutex_lock(&g_lock);
-    g_stats.verify_busy_ns += ns;
-    pthread_mutex_unlock(&g_lock);
+    tls_verify.busy_ns += ns;
+    tls_verify_dirty = 1;
 }
 void stats_set_verify_pending_peak(uint64_t pending_peak) {
     pthread_mutex_lock(&g_lock);
@@ -462,30 +564,30 @@ void stats_record_verify(uint64_t bytes, uint64_t scope_bytes, uint64_t blocks,
                          int metadata_checked,
                          int data_mismatch, int metadata_mismatch,
                          int expected_zero_mismatch, int io_failure, int failed) {
-    pthread_mutex_lock(&g_lock);
-    g_stats.verify_objects++;
-    g_stats.verify_bytes += bytes;
-    g_stats.verify_scope_bytes += scope_bytes;
-    g_stats.verify_blocks += blocks;
-    if (metadata_checked) g_stats.verify_metadata_objects++;
-    if (data_mismatch) g_stats.verify_data_mismatches++;
-    if (metadata_mismatch) g_stats.verify_metadata_mismatches++;
-    if (expected_zero_mismatch) g_stats.verify_zero_mismatches++;
-    if (io_failure) g_stats.verify_io_failures++;
-    if (failed) g_stats.verify_failures++;
-    pthread_mutex_unlock(&g_lock);
+    verify_tls_t *v = &tls_verify;
+    v->objects++;
+    v->bytes += bytes;
+    v->scope_bytes += scope_bytes;
+    v->blocks += blocks;
+    if (metadata_checked) v->metadata_objects++;
+    if (data_mismatch) v->data_mismatches++;
+    if (metadata_mismatch) v->metadata_mismatches++;
+    if (expected_zero_mismatch) v->zero_mismatches++;
+    if (io_failure) v->io_failures++;
+    if (failed) v->failures++;
+    tls_verify_dirty = 1;
+    if (v->objects >= VERIFY_FLUSH_THRESHOLD) {
+        verify_tls_flush();
+    }
 }
 void stats_record_verify_holes(uint64_t blocks, uint64_t bytes) {
-    pthread_mutex_lock(&g_lock);
-    g_stats.verify_hole_blocks += blocks;
-    g_stats.verify_hole_bytes += bytes;
-    g_stats.verify_source_reads_avoided += blocks;
-    pthread_mutex_unlock(&g_lock);
+    tls_verify.hole_blocks += blocks;
+    tls_verify.hole_bytes += bytes;
+    tls_verify_dirty = 1;
 }
 void stats_record_verify_ownership(uint64_t n) {
-    pthread_mutex_lock(&g_lock);
-    g_stats.verify_ownership_unpreserved += n;
-    pthread_mutex_unlock(&g_lock);
+    tls_verify.ownership_unpreserved += n;
+    tls_verify_dirty = 1;
 }
 void stats_set_remote_drain(uint64_t bytes, uint64_t ns) {
     pthread_mutex_lock(&g_lock);

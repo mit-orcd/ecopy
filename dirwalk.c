@@ -152,7 +152,9 @@ static int dirreader_open(dirreader_t *rd, int stream_fd)
 }
 
 /* 1 = entry (*name_out valid until the next call), 0 = end, -1 = error. */
-static int dirreader_next(dirreader_t *rd, const char **name_out)
+/* Returns 1 with *name_out and *type_out (DT_*, DT_UNKNOWN if the filesystem
+ * does not report types), 0 at end of stream, -1 on error. */
+static int dirreader_next(dirreader_t *rd, const char **name_out, unsigned char *type_out)
 {
     if (rd->fd < 0) {
         struct dirent *de = readdir(rd->dirp);
@@ -160,6 +162,7 @@ static int dirreader_next(dirreader_t *rd, const char **name_out)
             return 0;
         }
         *name_out = de->d_name;
+        *type_out = de->d_type;
         return 1;
     }
 #ifdef ECOPY_HAVE_GETDENTS64
@@ -183,6 +186,7 @@ static int dirreader_next(dirreader_t *rd, const char **name_out)
         }
         rd->buf_off += d->d_reclen;
         *name_out = d->d_name;
+        *type_out = d->d_type;
         return 1;
     }
 #else
@@ -243,6 +247,7 @@ static void process_node(dirwalk_node_t *node)
     void *ctx = NULL;
     dirreader_t rd;
     const char *name;
+    unsigned char dtype;
     int dir_fd, stream_fd, rc;
     size_t path_len;
 
@@ -273,13 +278,23 @@ static void process_node(dirwalk_node_t *node)
     }
 
     path_len = strlen(node->path);
-    while ((rc = dirreader_next(&rd, &name)) == 1) {
+    while ((rc = dirreader_next(&rd, &name, &dtype)) == 1) {
         struct stat st;
 
         if (stop_requested()) {
             break;
         }
         if (name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'))) {
+            continue;
+        }
+        /*
+         * Non-directory per the directory stream: the consumer asked not to
+         * pay for a stat it will not read. Should the entry turn into a
+         * directory before the consumer acts on it, its unlinkat() simply
+         * fails with EISDIR — nothing is ever followed or descended unseen.
+         */
+        if (g_cfg.lazy_stat && dtype != DT_UNKNOWN && dtype != DT_DIR) {
+            g_ops.entry(node, dir_fd, ctx, name, NULL);
             continue;
         }
         if (fstatat(dir_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
