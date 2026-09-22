@@ -40,6 +40,9 @@ OBJS = \
 	verify.o \
 	shutdown.o \
 	path_utils.o \
+	env_util.o \
+	format.o \
+	dirwalk.o \
 	$(BLAKE3_OBJS) \
 	suggestion.o \
 	protocol.o \
@@ -65,8 +68,10 @@ third_party/blake3/blake3_sse41.o: override CFLAGS += -mssse3 -msse4.1
 third_party/blake3/blake3_avx2.o: override CFLAGS += -mavx2
 third_party/blake3/blake3_avx512.o: override CFLAGS += -mavx512f -mavx512vl
 
-edelete: edelete.o path_utils.o
-	$(CC) $(CFLAGS) -o $@ edelete.o path_utils.o $(LDFLAGS)
+EDELETE_OBJS = edelete.o path_utils.o env_util.o format.o dirwalk.o shutdown.o
+
+edelete: $(EDELETE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(EDELETE_OBJS) $(LDFLAGS)
 
 protocol_test: tests/protocol_test.c protocol.o $(BLAKE3_OBJS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tests/protocol_test.c protocol.o $(BLAKE3_OBJS) $(LDFLAGS)
@@ -89,4 +94,4 @@ test: $(TARGET) edelete protocol_test telemetry_test
 		bash "$$t"; \
 	done
 
--include $(OBJS:.o=.d) edelete.d path_utils.d
+-include $(OBJS:.o=.d) $(EDELETE_OBJS:.o=.d)

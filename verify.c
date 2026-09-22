@@ -965,7 +965,7 @@ static void *verify_pool_worker(void *arg)
         }
         /* Ctrl+C abandons queued items (freed by verify_pool_finish); the
          * normal stop path still drains them so verification can complete. */
-        if (atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed)) {
+        if (atomic_load_explicit(&g_shutdown_requested, memory_order_relaxed)) {
             pthread_mutex_unlock(&pool->lock);
             break;
         }
@@ -1034,11 +1034,11 @@ static int verify_pool_submit(verify_pool_t *pool, verify_item_t *item)
 {
     pthread_mutex_lock(&pool->lock);
     while (pool->queued >= pool->limit && !pool->stop &&
-           !atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed)) {
+           !atomic_load_explicit(&g_shutdown_requested, memory_order_relaxed)) {
         pthread_cond_wait(&pool->space_cv, &pool->lock);
     }
     if (pool->stop ||
-        atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed)) {
+        atomic_load_explicit(&g_shutdown_requested, memory_order_relaxed)) {
         pthread_mutex_unlock(&pool->lock);
         return -1;
     }
@@ -1196,7 +1196,7 @@ static void *verify_feeder_main(void *arg)
         g_head = g_tail = NULL;
         int stop = g_feeder_stop;
         int shutting_down =
-            atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed);
+            atomic_load_explicit(&g_shutdown_requested, memory_order_relaxed);
         pthread_mutex_unlock(&g_queue_lock);
 
         uint64_t stolen = 0;
@@ -1398,7 +1398,7 @@ static int walk_submit(verify_pool_t *pool, const char *src, const char *dst,
     int failed = 0;
     for (;;) {
         /* Ctrl+C: stop walking; the pool abandons its queue on shutdown. */
-        if (atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed)) {
+        if (atomic_load_explicit(&g_shutdown_requested, memory_order_relaxed)) {
             failed = 1;
             break;
         }

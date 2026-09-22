@@ -4,37 +4,31 @@
  * SPDX-License-Identifier: MIT
  * Copyright (c) 2026 Michel Erb — see LICENSE.
  *
- * SIGINT/SIGTERM handling. The first signal sets a global flag (polled by the
- * work loops, which then abandon queued work instead of draining it) and posts
- * a semaphore; a dedicated watcher thread wakes every subsystem condvar from
- * normal thread context. A second signal exits immediately via _exit().
- *
  * Only async-signal-safe operations run in the handler itself: an atomic
  * store, sem_post(), and _exit(). Taking mutexes or broadcasting condvars
  * directly in the handler can self-deadlock when the signal interrupts a
- * thread that already holds that mutex.
+ * thread that already holds that mutex, so the stop callback runs on a
+ * watcher thread that the handler wakes with the semaphore.
  */
 
 #define _GNU_SOURCE
 #include "shutdown.h"
-#include "workers.h"
-#include "traversal.h"
-#include "verify.h"
 
 #include <pthread.h>
 #include <semaphore.h>
 #include <signal.h>
 #include <unistd.h>
 
-_Atomic int g_ecopy_shutdown = 0;
+_Atomic int g_shutdown_requested = 0;
 
 static sem_t g_shutdown_sem;
 static volatile sig_atomic_t g_signal_count = 0;
+static void (*g_on_stop)(void) = NULL;
 
 static void shutdown_handler(int sig)
 {
     if (g_signal_count++ == 0) {
-        g_ecopy_shutdown = 1;
+        g_shutdown_requested = 1;
         sem_post(&g_shutdown_sem);
     } else {
         /* Second Ctrl+C: force an immediate exit even if a thread is stuck
@@ -49,18 +43,18 @@ static void *shutdown_watcher_main(void *arg)
     while (sem_wait(&g_shutdown_sem) != 0) {
         /* retry on EINTR */
     }
-    /* Normal thread context: mutexes and condvar broadcasts are legal here. */
-    traversal_request_stop();
-    workers_request_stop();
-    verify_request_stop();
+    if (g_on_stop) {
+        g_on_stop();
+    }
     return NULL;
 }
 
-void shutdown_install_handlers(void)
+void shutdown_install_handlers(void (*on_stop)(void))
 {
     struct sigaction sa;
     pthread_t watcher;
 
+    g_on_stop = on_stop;
     sem_init(&g_shutdown_sem, 0, 0);
 
     sa.sa_handler = shutdown_handler;

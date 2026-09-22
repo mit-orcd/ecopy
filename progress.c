@@ -7,6 +7,7 @@
 
 #define _GNU_SOURCE
 #include "progress.h"
+#include "format.h"
 #include "stats.h"
 #include "workers.h"
 #include "verify.h"
@@ -57,25 +58,6 @@ static void trim_to_width(char *s, int width) {
     s[width - 3] = '.';
     s[width - 2] = '.';
     s[width - 1] = '\0';
-}
-
-static void format_duration(double sec, char *out, size_t out_sz)
-{
-    if (!out || out_sz == 0) {
-        return;
-    }
-
-    if (sec < 0.0) {
-        sec = 0.0;
-    }
-
-    uint64_t total = (uint64_t)(sec + 0.5);
-    uint64_t hours = total / 3600;
-    uint64_t minutes = (total % 3600) / 60;
-    uint64_t seconds = total % 60;
-
-    snprintf(out, out_sz, "%02" PRIu64 ":%02" PRIu64 ":%02" PRIu64,
-             hours, minutes, seconds);
 }
 
 static void format_bytes_adaptive(uint64_t bytes, char *out, size_t out_sz)

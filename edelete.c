@@ -4,175 +4,59 @@
  * SPDX-License-Identifier: MIT
  * Copyright (c) 2026 Michel Erb — see LICENSE.
  *
- * Parallel directory walker (same task-queue / donation model as ecrawl) that
- * unlinks non-directory paths (regular files, symlinks, pipes, sockets, etc.)
- * whose atime, mtime, or ctime is at least N full days behind wall-clock now.
- * With only a path (no time arguments), every non-directory under the start path
- * is eligible—still dry-run unless --delete.
- * Traversal uses lstat/fstatat without following symlinks. In delete mode, after
- * the crawl finishes it removes directories that became empty (rmdir only),
- * deepest first, without ascending above the start path or removing "/".
+ * Parallel tree deleter. Walks the start path with the same dirwalk engine as
+ * ecopy's traversal and unlinks every non-directory (regular files, symlinks,
+ * pipes, sockets, ...) that matches the filters: optionally an age in whole
+ * days on atime/mtime/ctime, optionally an owner uid and/or gid. Dry-run by
+ * default; --delete unlinks. Symlinks are never followed, and nothing above
+ * the start path is ever touched.
  *
- * Usage: run with --help (or no arguments) for the flag list.
- * Thread count: EDELETE_THREADS (default 16).
- *
- * Build: gcc -O2 -Wall -Wextra -pthread -o edelete edelete.c
+ * Structure mirrors ecopy: walker threads enumerate and stat; eligible paths
+ * go onto a bounded queue drained by a separate pool of unlink threads, so a
+ * slow unlink (quota accounting, ZFS block frees) never stalls the scan and
+ * the number of concurrent unlinks is an explicit knob. After the walk, in
+ * delete mode, directories that became empty are removed deepest-first, in
+ * parallel per depth level, up to and including the start path.
  */
 
-#define _XOPEN_SOURCE 700
-#define _DEFAULT_SOURCE
+#define _GNU_SOURCE
+#include "compat.h"
+#include "dirwalk.h"
+#include "env_util.h"
+#include "format.h"
+#include "path_utils.h"
+#include "shutdown.h"
 
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
-#include <stdint.h>
-#include <inttypes.h>
-#include <pthread.h>
-#include <errno.h>
-#include <sys/time.h>
-#include <sys/types.h>
 #include <sys/stat.h>
-#include <fcntl.h>
-#include <signal.h>
+#include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
-#include "path_canon.h"
-#include "path_utils.h"
-#include <stdatomic.h>
-#include <dirent.h>
-#include <ftw.h>
-#include <limits.h>
-#include <time.h>
+#define DEFAULT_THREADS        16
+#define DEFAULT_UNLINK_WORKERS 16
+#define UNLINK_QUEUE_MAX       262144   /* backpressure cap on queued unlinks */
+#define GETDENTS_BUF_BYTES     (256 * 1024)
+#define WINDOW_SECONDS         10
 
-#ifndef DT_UNKNOWN
-#define DT_UNKNOWN 0
-#endif
-#ifndef DT_DIR
-#define DT_DIR 4
-#endif
+typedef enum { TB_ATIME, TB_MTIME, TB_CTIME } time_basis_t;
 
-#ifndef PATH_MAX
-#define PATH_MAX 4096
-#endif
+/* ------------------------------------------------------------------------ */
+/* Options                                                                  */
 
-#define DEFAULT_THREADS 16
-#define DEFAULT_MAX_UNLINK_INFLIGHT 256
-/* Files at least this large are handed to the shared queue (when peer threads are idle) so their
- * potentially slow unlink(2) fans out across threads instead of running serially on one worker.
- * Small files stay on the zero-alloc inline path. 0 disables fan-out. */
-#define DEFAULT_FANOUT_MIN_BYTES (64ULL << 20)
-#define WINDOW_SECONDS 10
-#define PERF_FLUSH_INTERVAL 1024U
-#define LOCAL_STACK_DONATE_FLOOR 8
-#define DONATE_CHUNK_MIN 4
-#define DONATE_CHUNK_MAX 128
-#define DONATE_QUEUE_TARGET_PER_IDLE 4
-#define EMFILE_RETRY_LIMIT 8U
-#define EMFILE_RETRY_USEC 50000U
-#define QUEUE_COND_WAIT_MS 250
-#define READDIR_SHUTDOWN_CHECK_STRIDE 4096U
-
-typedef struct task_node task_node_t;
-
-typedef struct {
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    task_node_t *head;
-    task_node_t *tail;
-    int closed;
-    uint64_t queued_tasks;
-} task_queue_t;
-
-typedef struct {
-    char *path;
-    size_t path_len;
-    struct stat st;
-    int have_stat;
-} dir_work_t;
-
-typedef struct {
-    dir_work_t *items;
-    size_t count;
-    size_t cap;
-} dir_stack_t;
-
-struct task_node {
-    dir_work_t *items;
-    size_t count;
-    size_t cap;
-    struct task_node *next;
-};
-
-typedef struct {
-    pthread_mutex_t stats_mutex;
-    pthread_mutex_t rmdir_list_mutex;
-    char **rmdir_parents;
-    size_t rmdir_parents_n;
-    size_t rmdir_parents_cap;
-    uint64_t deleted_files;
-    uint64_t would_delete;
-    uint64_t removed_empty_dirs;
-    uint64_t total_errors;
-    uint64_t crawl_threads_started;
-    uint64_t donated_dirs;
-    uint64_t donation_attempts;
-    uint64_t donation_successes;
-} shared_state_t;
-
-typedef struct {
-    uint64_t entries;
-    uint64_t files;
-    uint64_t dirs;
-} perf_local_t;
-
-typedef struct {
-    uint64_t donated_dirs;
-    uint64_t donation_attempts;
-    uint64_t donation_successes;
-} worker_aux_stats_t;
-
-typedef struct {
-    shared_state_t *shared;
-    task_queue_t *queue;
-    uint64_t worker_index;
-    perf_local_t perf;
-    worker_aux_stats_t aux;
-} worker_arg_t;
-
-typedef enum {
-    TB_ATIME = 0,
-    TB_MTIME = 1,
-    TB_CTIME = 2
-} time_basis_t;
-
-static atomic_ullong g_queue_depth = 0;
-static atomic_int g_active_workers = 0;
-static atomic_int g_main_done = 0;
-static atomic_ullong g_tasks_popped = 0;
-static atomic_ullong g_wait_crawl_tasks = 0;
-
-static atomic_ullong g_total_entries = 0;
-static atomic_ullong g_total_dirs = 0;
-static atomic_ullong g_total_files = 0;
-static atomic_ullong g_window_entries = 0;
-static atomic_ullong g_bucket_entries[WINDOW_SECONDS];
-static atomic_int g_bucket_index = 0;
-static atomic_int g_stop_stats = 0;
-static atomic_uint g_seconds_seen = 0;
-static atomic_ullong g_live_would_unlink = 0;
-static atomic_ullong g_live_unlinked = 0;
-
-static volatile sig_atomic_t g_shutdown_requested = 0;
-
-static int g_force = 0;
 static int g_dry_run = 1;
+static int g_force = 0;
 static int g_threads = DEFAULT_THREADS;
-static int g_max_unlink_inflight = 0;
-static unsigned long long g_fanout_min_bytes = DEFAULT_FANOUT_MIN_BYTES;
-static pthread_mutex_t g_unlink_gate_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t g_unlink_gate_cond = PTHREAD_COND_INITIALIZER;
-static int g_unlink_inflight = 0;
+static int g_unlink_workers = DEFAULT_UNLINK_WORKERS;
 static time_basis_t g_basis = TB_MTIME;
 static int g_age_days = 0;
 static int g_delete_all = 0;
@@ -182,197 +66,522 @@ static uid_t g_filter_uid = 0;
 static gid_t g_filter_gid = 0;
 static time_t g_now = 0;
 
-#define ATOMIC_ADD_RELAXED(obj, value) atomic_fetch_add_explicit((obj), (value), memory_order_relaxed)
-#define ATOMIC_SUB_RELAXED(obj, value) atomic_fetch_sub_explicit((obj), (value), memory_order_relaxed)
-#define ATOMIC_LOAD_RELAXED(obj) atomic_load_explicit((obj), memory_order_relaxed)
+/* ------------------------------------------------------------------------ */
+/* Counters                                                                 */
 
-static double now_sec(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
+static atomic_ullong g_entries = 0;        /* everything walked: dirs + non-dirs */
+static atomic_ullong g_dirs = 0;
+static atomic_ullong g_files = 0;          /* non-directories */
+static atomic_ullong g_would_delete = 0;
+static atomic_ullong g_deleted = 0;
+static atomic_ullong g_removed_dirs = 0;
+static atomic_ullong g_errors = 0;
+
+/* Sliding 10 s window of entries walked, for the live rate. */
+static atomic_ullong g_window_entries = 0;
+static atomic_ullong g_bucket_entries[WINDOW_SECONDS];
+static atomic_int g_bucket_index = 0;
+static atomic_uint g_seconds_seen = 0;
+static atomic_int g_stop_status = 0;
+static pthread_mutex_t g_status_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_status_cond = PTHREAD_COND_INITIALIZER;
+
+/* Sleep up to one second, but return at once when the run ends. */
+static void status_pause(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += 1;
+    pthread_mutex_lock(&g_status_lock);
+    while (!atomic_load(&g_stop_status)) {
+        if (pthread_cond_timedwait(&g_status_cond, &g_status_lock, &ts) == ETIMEDOUT) break;
+    }
+    pthread_mutex_unlock(&g_status_lock);
 }
 
-static void human_decimal(double v, char *buf, size_t sz) {
-    const char *units[] = {"", "K", "M", "G", "T", "P", "E"};
-    int i = 0;
+static void status_stop(void)
+{
+    pthread_mutex_lock(&g_status_lock);
+    atomic_store(&g_stop_status, 1);
+    pthread_cond_broadcast(&g_status_cond);
+    pthread_mutex_unlock(&g_status_lock);
+}
 
-    while (v >= 1000.0 && i < 6) {
-        v /= 1000.0;
-        i++;
+static void count_entry(void)
+{
+    int idx = atomic_load_explicit(&g_bucket_index, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_entries, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_window_entries, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_bucket_entries[idx], 1, memory_order_relaxed);
+}
+
+static void count_error(void)
+{
+    atomic_fetch_add_explicit(&g_errors, 1, memory_order_relaxed);
+}
+
+static double now_sec(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Eligibility                                                              */
+
+static time_t pick_ts(const struct stat *st)
+{
+    switch (g_basis) {
+    case TB_ATIME: return st->st_atime;
+    case TB_CTIME: return st->st_ctime;
+    case TB_MTIME:
+    default:       return st->st_mtime;
+    }
+}
+
+static int eligible(const struct stat *st)
+{
+    if (g_have_uid_filter && st->st_uid != g_filter_uid) return 0;
+    if (g_have_gid_filter && st->st_gid != g_filter_gid) return 0;
+    if (g_delete_all) return 1;
+    if (g_age_days <= 0) return 0;
+    return pick_ts(st) <= g_now - (time_t)g_age_days * 86400;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Unlink queue and worker pool                                             */
+
+/*
+ * Work items are per-directory batches, as in ecopy's traversal: up to
+ * UNLINK_BATCH names from one directory, packed NUL-separated. A worker opens
+ * the directory once (O_NOFOLLOW) and unlinkat()s each name relative to it, so
+ * no path is re-walked per file and a symlinked-in component is never
+ * followed. Just as important, consecutive files of one directory land on one
+ * worker instead of being sprayed across all of them, which would make every
+ * unlink thread contend on that directory's inode lock.
+ */
+#define UNLINK_BATCH        512
+#define UNLINK_BATCH_BYTES  (64 * 1024)
+
+typedef struct unlink_item {
+    struct unlink_item *next;
+    int count;
+    size_t dir_len;
+    char data[];   /* dir path, NUL, then `count` NUL-terminated names */
+} unlink_item_t;
+
+static pthread_mutex_t g_uq_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_uq_not_empty = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t g_uq_not_full = PTHREAD_COND_INITIALIZER;
+static unlink_item_t *g_uq_head = NULL;
+static unlink_item_t *g_uq_tail = NULL;
+static size_t g_uq_files = 0;       /* names queued, for backpressure */
+static int g_uq_closed = 0;
+static pthread_t *g_unlink_threads = NULL;
+static int g_unlink_threads_started = 0;
+
+static int stopping(void)
+{
+    return atomic_load_explicit(&g_shutdown_requested, memory_order_relaxed);
+}
+
+/* Walker side. Blocks while the queue is full; drops the item on shutdown. */
+static void unlink_queue_push(unlink_item_t *it)
+{
+    pthread_mutex_lock(&g_uq_lock);
+    while (g_uq_files >= UNLINK_QUEUE_MAX && !g_uq_closed && !stopping()) {
+        pthread_cond_wait(&g_uq_not_full, &g_uq_lock);
+    }
+    if (g_uq_closed || stopping()) {
+        pthread_mutex_unlock(&g_uq_lock);
+        free(it);
+        return;
+    }
+    it->next = NULL;
+    if (g_uq_tail) g_uq_tail->next = it;
+    else g_uq_head = it;
+    g_uq_tail = it;
+    g_uq_files += (size_t)it->count;
+    pthread_cond_signal(&g_uq_not_empty);
+    pthread_mutex_unlock(&g_uq_lock);
+}
+
+static void unlink_batch_run(const unlink_item_t *it)
+{
+    const char *dir = it->data;
+    const char *name = dir + it->dir_len + 1;
+    int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    int i;
+
+    if (fd < 0) {
+        if (errno != ENOENT) {
+            fprintf(stderr, "edelete: open %s: %s\n", dir, strerror(errno));
+            count_error();
+        }
+        return;
+    }
+    for (i = 0; i < it->count; i++) {
+        if (unlinkat(fd, name, 0) == 0) {
+            atomic_fetch_add_explicit(&g_deleted, 1, memory_order_relaxed);
+        } else if (errno != ENOENT) {
+            fprintf(stderr, "edelete: unlink %s/%s: %s\n", dir, name, strerror(errno));
+            count_error();
+        }
+        name += strlen(name) + 1;
+    }
+    close(fd);
+}
+
+static void *unlink_worker_main(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        unlink_item_t *it;
+
+        pthread_mutex_lock(&g_uq_lock);
+        while (!g_uq_head && !g_uq_closed && !stopping()) {
+            pthread_cond_wait(&g_uq_not_empty, &g_uq_lock);
+        }
+        it = g_uq_head;
+        if (!it || stopping()) {
+            pthread_mutex_unlock(&g_uq_lock);
+            return NULL;
+        }
+        g_uq_head = it->next;
+        if (!g_uq_head) g_uq_tail = NULL;
+        g_uq_files -= (size_t)it->count;
+        pthread_cond_broadcast(&g_uq_not_full);
+        pthread_mutex_unlock(&g_uq_lock);
+
+        unlink_batch_run(it);
+        free(it);
+    }
+}
+
+/*
+ * Per-walker-thread batch under construction: names of the directory being
+ * enumerated, flushed as one queue item when full or when the directory ends.
+ * Thread-local so the buffer is allocated once per thread, not per directory.
+ */
+typedef struct {
+    char *names;
+    size_t used;
+    int count;
+} name_batch_t;
+
+static __thread name_batch_t t_batch;
+
+static void batch_flush(const char *dir, size_t dir_len)
+{
+    name_batch_t *b = &t_batch;
+    unlink_item_t *it;
+
+    if (b->count == 0) return;
+    it = malloc(sizeof(*it) + dir_len + 1 + b->used);
+    if (!it) {
+        perror("malloc");
+        count_error();
+    } else {
+        it->count = b->count;
+        it->dir_len = dir_len;
+        memcpy(it->data, dir, dir_len + 1);
+        memcpy(it->data + dir_len + 1, b->names, b->used);
+        unlink_queue_push(it);
+    }
+    b->used = 0;
+    b->count = 0;
+}
+
+static void batch_add(const char *dir, size_t dir_len, const char *name)
+{
+    name_batch_t *b = &t_batch;
+    size_t nlen = strlen(name) + 1;
+
+    if (!b->names) {
+        b->names = malloc(UNLINK_BATCH_BYTES);
+        if (!b->names) {
+            perror("malloc");
+            count_error();
+            return;
+        }
+    }
+    if (b->count == UNLINK_BATCH || b->used + nlen > UNLINK_BATCH_BYTES) {
+        batch_flush(dir, dir_len);
+    }
+    if (nlen > UNLINK_BATCH_BYTES) {
+        fprintf(stderr, "edelete: name too long under %s\n", dir);
+        count_error();
+        return;
+    }
+    memcpy(b->names + b->used, name, nlen);
+    b->used += nlen;
+    b->count++;
+}
+
+static void batch_thread_end(void)
+{
+    free(t_batch.names);
+    memset(&t_batch, 0, sizeof(t_batch));
+}
+
+static int unlink_pool_start(void)
+{
+    int i;
+
+    g_unlink_threads = calloc((size_t)g_unlink_workers, sizeof(*g_unlink_threads));
+    if (!g_unlink_threads) {
+        perror("calloc");
+        return -1;
+    }
+    for (i = 0; i < g_unlink_workers; i++) {
+        if (pthread_create(&g_unlink_threads[i], NULL, unlink_worker_main, NULL) != 0) {
+            perror("pthread_create");
+            break;
+        }
+        g_unlink_threads_started++;
+    }
+    return g_unlink_threads_started > 0 ? 0 : -1;
+}
+
+/* Close the queue (workers drain what is left, then exit) and join them. */
+static void unlink_pool_finish(void)
+{
+    int i;
+    unlink_item_t *it;
+
+    pthread_mutex_lock(&g_uq_lock);
+    g_uq_closed = 1;
+    pthread_cond_broadcast(&g_uq_not_empty);
+    pthread_cond_broadcast(&g_uq_not_full);
+    pthread_mutex_unlock(&g_uq_lock);
+
+    for (i = 0; i < g_unlink_threads_started; i++) {
+        pthread_join(g_unlink_threads[i], NULL);
+    }
+    free(g_unlink_threads);
+    g_unlink_threads = NULL;
+
+    /* Anything still queued was abandoned by a shutdown request. */
+    while ((it = g_uq_head) != NULL) {
+        g_uq_head = it->next;
+        free(it);
+    }
+    g_uq_tail = NULL;
+    g_uq_files = 0;
+}
+
+static void unlink_pool_wake(void)
+{
+    pthread_mutex_lock(&g_uq_lock);
+    pthread_cond_broadcast(&g_uq_not_empty);
+    pthread_cond_broadcast(&g_uq_not_full);
+    pthread_mutex_unlock(&g_uq_lock);
+}
+
+/* ------------------------------------------------------------------------ */
+/* Directory list for the rmdir pass                                        */
+
+typedef struct {
+    char *path;
+    int depth;
+} dir_rec_t;
+
+static pthread_mutex_t g_dirs_lock = PTHREAD_MUTEX_INITIALIZER;
+static dir_rec_t *g_dir_list = NULL;
+static size_t g_dir_count = 0;
+static size_t g_dir_cap = 0;
+
+static int record_dir(const char *path, int depth)
+{
+    char *dup = strdup(path);
+    if (!dup) {
+        perror("strdup");
+        return -1;
+    }
+    pthread_mutex_lock(&g_dirs_lock);
+    if (g_dir_count == g_dir_cap) {
+        size_t nc = g_dir_cap ? g_dir_cap * 2 : 1024;
+        dir_rec_t *np = realloc(g_dir_list, nc * sizeof(*np));
+        if (!np) {
+            pthread_mutex_unlock(&g_dirs_lock);
+            free(dup);
+            perror("realloc");
+            return -1;
+        }
+        g_dir_list = np;
+        g_dir_cap = nc;
+    }
+    g_dir_list[g_dir_count].path = dup;
+    g_dir_list[g_dir_count].depth = depth;
+    g_dir_count++;
+    pthread_mutex_unlock(&g_dirs_lock);
+    return 0;
+}
+
+static void free_dir_list(void)
+{
+    for (size_t i = 0; i < g_dir_count; i++) free(g_dir_list[i].path);
+    free(g_dir_list);
+    g_dir_list = NULL;
+    g_dir_count = g_dir_cap = 0;
+}
+
+static int dir_rec_cmp_desc_depth(const void *a, const void *b)
+{
+    const dir_rec_t *da = a, *db = b;
+    if (da->depth != db->depth) return db->depth - da->depth;
+    return strcmp(da->path, db->path);
+}
+
+static int rmdir_depth_of(size_t i)
+{
+    return g_dir_list[i].depth;
+}
+
+static int rmdir_one(size_t i)
+{
+    const char *p = g_dir_list[i].path;
+
+    if (strcmp(p, "/") == 0) return 0;
+    if (rmdir(p) == 0) {
+        atomic_fetch_add_explicit(&g_removed_dirs, 1, memory_order_relaxed);
+    } else if (errno != ENOTEMPTY && errno != EEXIST && errno != ENOENT &&
+               errno != EBUSY && errno != ENOTDIR) {
+        fprintf(stderr, "edelete: rmdir %s: %s\n", p, strerror(errno));
+        count_error();
+    }
+    return 0; /* an rmdir failure is counted, not fatal to the pass */
+}
+
+/*
+ * Every directory the walk visited is a candidate; children sort before their
+ * parents, and the depth grouping guarantees a parent is tried only after all
+ * of its children have been, so a whole emptied subtree collapses in one pass
+ * (including the start path itself when it ends up empty).
+ */
+static void remove_empty_directories(void)
+{
+    if (g_dir_count == 0) return;
+    qsort(g_dir_list, g_dir_count, sizeof(*g_dir_list), dir_rec_cmp_desc_depth);
+    dirwalk_depth_groups(g_dir_count, g_threads, rmdir_depth_of, rmdir_one, NULL, NULL);
+}
+
+/* ------------------------------------------------------------------------ */
+/* dirwalk callbacks                                                        */
+
+static int walk_dir_begin(const dirwalk_node_t *node, int dir_fd, void **ctx)
+{
+    (void)dir_fd;
+    *ctx = NULL;
+    count_entry();
+    atomic_fetch_add_explicit(&g_dirs, 1, memory_order_relaxed);
+    if (!g_dry_run && record_dir(node->path, node->depth) != 0) {
+        count_error();
+    }
+    return 0;
+}
+
+static int walk_entry(const dirwalk_node_t *node, int dir_fd, void *ctx,
+                      const char *name, const struct stat *st)
+{
+    (void)dir_fd;
+    (void)ctx;
+
+    if (S_ISDIR(st->st_mode)) {
+        return DIRWALK_DESCEND;
     }
 
-    if (v >= 100.0) snprintf(buf, sz, "%.0f%s", v, units[i]);
-    else if (v >= 10.0) snprintf(buf, sz, "%.1f%s", v, units[i]);
-    else snprintf(buf, sz, "%.2f%s", v, units[i]);
+    count_entry();
+    atomic_fetch_add_explicit(&g_files, 1, memory_order_relaxed);
+    if (!eligible(st)) {
+        return DIRWALK_SKIP;
+    }
+    if (g_dry_run) {
+        atomic_fetch_add_explicit(&g_would_delete, 1, memory_order_relaxed);
+        return DIRWALK_SKIP;
+    }
+    batch_add(node->path, strlen(node->path), name);
+    return DIRWALK_SKIP;
 }
 
-static void format_duration(double sec, char *out, size_t out_sz) {
-    uint64_t total, hours, minutes, seconds;
-
-    if (!out || out_sz == 0) return;
-    if (sec < 0.0) sec = 0.0;
-
-    total = (uint64_t)(sec + 0.5);
-    hours = total / 3600;
-    minutes = (total % 3600) / 60;
-    seconds = total % 60;
-
-    snprintf(out, out_sz, "%02" PRIu64 ":%02" PRIu64 ":%02" PRIu64, hours, minutes, seconds);
+static void walk_dir_end(const dirwalk_node_t *node, int dir_fd, void *ctx, int rc)
+{
+    (void)dir_fd; (void)ctx;
+    if (rc != 0) count_error();
+    if (!g_dry_run) batch_flush(node->path, strlen(node->path));
 }
 
-static void clear_status_line(void) {
+static void walk_error(const char *path)
+{
+    (void)path;
+    count_error();
+}
+
+static void edelete_stop(void)
+{
+    dirwalk_request_stop();
+    unlink_pool_wake();
+}
+
+/* ------------------------------------------------------------------------ */
+/* Status line                                                              */
+
+static void clear_status_line(void)
+{
     if (isatty(STDOUT_FILENO)) printf("\r\033[2K\r");
     else printf("\r%160s\r", "");
     fflush(stdout);
 }
 
-static void edelete_signal_handler(int signo) {
-    (void)signo;
-    g_shutdown_requested = 1;
-}
+static void *status_thread_main(void *arg)
+{
+    double run_start = *(double *)arg;
 
-static void install_job_signals(void) {
-    struct sigaction sa;
+    while (!atomic_load(&g_stop_status)) {
+        status_pause();
+        if (atomic_load(&g_stop_status)) break;
+        {
+            int next = (atomic_load(&g_bucket_index) + 1) % WINDOW_SECONDS;
+            unsigned long long expired = atomic_exchange(&g_bucket_entries[next], 0);
+            atomic_fetch_sub(&g_window_entries, expired);
+            atomic_store(&g_bucket_index, next);
+        }
+        {
+            unsigned int seen = atomic_load(&g_seconds_seen);
+            if (seen < WINDOW_SECONDS) atomic_store(&g_seconds_seen, seen + 1U);
+        }
+        {
+            unsigned int divisor = atomic_load(&g_seconds_seen);
+            unsigned long long acted = g_dry_run ? atomic_load(&g_would_delete) : atomic_load(&g_deleted);
+            char walked[32], rate[32], acted_buf[32], elapsed[32];
 
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = edelete_signal_handler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    (void)sigaction(SIGINT, &sa, NULL);
-    (void)sigaction(SIGTERM, &sa, NULL);
-}
-
-static void queue_cond_timedwait_ms(pthread_cond_t *cond, pthread_mutex_t *mutex, int ms) {
-    struct timespec ts;
-    long add_ns = (long)ms * 1000000L;
-
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_nsec += add_ns;
-    while (ts.tv_nsec >= 1000000000L) {
-        ts.tv_nsec -= 1000000000L;
-        ts.tv_sec++;
-    }
-
-    for (;;) {
-        int rc = pthread_cond_timedwait(cond, mutex, &ts);
-        if (rc == 0 || rc == ETIMEDOUT) return;
-        if (rc != EINTR) return;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_nsec += add_ns;
-        while (ts.tv_nsec >= 1000000000L) {
-            ts.tv_nsec -= 1000000000L;
-            ts.tv_sec++;
+            if (divisor == 0) divisor = 1;
+            format_count_si((double)atomic_load(&g_entries), walked, sizeof(walked));
+            format_count_si((double)atomic_load(&g_window_entries) / (double)divisor, rate, sizeof(rate));
+            format_count_si((double)acted, acted_buf, sizeof(acted_buf));
+            format_duration(now_sec() - run_start, elapsed, sizeof(elapsed));
+            printf("\r%s walk/s(10s) | walked:%s | %s:%s | el:%s            ",
+                   rate, walked, g_dry_run ? "would_unlink" : "unlinked", acted_buf, elapsed);
+            fflush(stdout);
         }
     }
+    return NULL;
 }
 
-static int parse_basis(const char *s, time_basis_t *out) {
-    if (!s || !out) return -1;
-    if (strcmp(s, "atime") == 0) {
-        *out = TB_ATIME;
-        return 0;
-    }
-    if (strcmp(s, "mtime") == 0) {
-        *out = TB_MTIME;
-        return 0;
-    }
-    if (strcmp(s, "ctime") == 0) {
-        *out = TB_CTIME;
-        return 0;
-    }
+/* ------------------------------------------------------------------------ */
+/* CLI                                                                      */
+
+static int parse_basis(const char *s, time_basis_t *out)
+{
+    if (strcmp(s, "atime") == 0) { *out = TB_ATIME; return 0; }
+    if (strcmp(s, "mtime") == 0) { *out = TB_MTIME; return 0; }
+    if (strcmp(s, "ctime") == 0) { *out = TB_CTIME; return 0; }
     return -1;
 }
 
-static int parse_thread_count(void) {
-    const char *e = getenv("EDELETE_THREADS");
-    long t;
-    char *end;
-
-    if (!e || !*e) return DEFAULT_THREADS;
-    errno = 0;
-    t = strtol(e, &end, 10);
-    if (errno || end == e || *end || t < 1 || t > (long)INT_MAX) return DEFAULT_THREADS;
-    return (int)t;
-}
-
-/* 0 = unlimited; unset uses DEFAULT_MAX_UNLINK_INFLIGHT */
-static int parse_max_unlink_inflight(void) {
-    const char *e = getenv("EDELETE_MAX_UNLINK_INFLIGHT");
-    long v;
-    char *end;
-
-    if (!e || !*e) return DEFAULT_MAX_UNLINK_INFLIGHT;
-    errno = 0;
-    v = strtol(e, &end, 10);
-    if (errno || end == e || *end || v < 0 || v > (long)INT_MAX) return DEFAULT_MAX_UNLINK_INFLIGHT;
-    if (v == 0) return 0;
-    return (int)v;
-}
-
-/* Min file size to fan a delete out to the queue; 0 disables, unset uses DEFAULT_FANOUT_MIN_BYTES. */
-static unsigned long long parse_fanout_min_bytes(void) {
-    const char *e = getenv("EDELETE_FANOUT_MIN_BYTES");
-    unsigned long long v;
-    char *end;
-
-    if (!e || !*e) return DEFAULT_FANOUT_MIN_BYTES;
-    errno = 0;
-    v = strtoull(e, &end, 10);
-    if (errno || end == e || *end) return DEFAULT_FANOUT_MIN_BYTES;
-    return v;
-}
-
-static int unlink_gate_enter(void) {
-    if (g_max_unlink_inflight <= 0) return 0;
-    pthread_mutex_lock(&g_unlink_gate_mutex);
-    while (g_unlink_inflight >= g_max_unlink_inflight) {
-        if (g_shutdown_requested) {
-            pthread_mutex_unlock(&g_unlink_gate_mutex);
-            return -1;
-        }
-        queue_cond_timedwait_ms(&g_unlink_gate_cond, &g_unlink_gate_mutex, QUEUE_COND_WAIT_MS);
-    }
-    g_unlink_inflight++;
-    pthread_mutex_unlock(&g_unlink_gate_mutex);
-    return 0;
-}
-
-static void unlink_gate_leave(void) {
-    if (g_max_unlink_inflight <= 0) return;
-    pthread_mutex_lock(&g_unlink_gate_mutex);
-    g_unlink_inflight--;
-    pthread_cond_signal(&g_unlink_gate_cond);
-    pthread_mutex_unlock(&g_unlink_gate_mutex);
-}
-
-static time_t pick_ts(const struct stat *st, time_basis_t b) {
-    switch (b) {
-        case TB_ATIME:
-            return st->st_atime;
-        case TB_CTIME:
-            return st->st_ctime;
-        case TB_MTIME:
-        default:
-            return st->st_mtime;
-    }
-}
-
-static int age_eligible_seconds(time_t ts) {
-    time_t cutoff;
-    if (g_delete_all) return 1;
-    if (g_age_days <= 0) return 0;
-    if ((time_t)-1 == g_now) return 0;
-    cutoff = g_now - (time_t)g_age_days * (time_t)86400;
-    return ts <= cutoff;
-}
-
-static int ownership_eligible(const struct stat *st) {
-    if (g_have_uid_filter && st->st_uid != g_filter_uid) return 0;
-    if (g_have_gid_filter && st->st_gid != g_filter_gid) return 0;
-    return 1;
-}
-
-static int parse_id_filter(const char *label, const char *s, unsigned long *out) {
+static int parse_id(const char *label, const char *s, unsigned long *out)
+{
     char *end = NULL;
     unsigned long v;
 
@@ -390,929 +599,8 @@ static int parse_id_filter(const char *label, const char *s, unsigned long *out)
     return 0;
 }
 
-static char *dup_parent_dir(const char *path) {
-    const char *slash;
-    size_t len;
-    char *out;
-
-    slash = strrchr(path, '/');
-    if (!slash || slash == path) return strdup("/");
-    len = (size_t)(slash - path);
-    if (len == 0) return strdup("/");
-    out = (char *)malloc(len + 1);
-    if (!out) return NULL;
-    memcpy(out, path, len);
-    out[len] = '\0';
-    return out;
-}
-
-/*
- * True if path must never be passed to unlink(2) or rmdir(2): the special entries
- * "." and ".." (alone or as the final path component). The directory walker also
- * skips these names from readdir(3); this is defense in depth for all delete paths.
- */
-static int edelete_is_forbidden_dot_entry_path(const char *path) {
-    const char *base;
-    size_t n, i;
-
-    if (!path || path[0] == '\0') return 1;
-    if (strcmp(path, ".") == 0 || strcmp(path, "..") == 0) return 1;
-
-    n = strlen(path);
-    while (n > 1U && path[n - 1U] == '/') n--;
-
-    base = path;
-    for (i = 0; i < n; i++) {
-        if (path[i] == '/') base = path + i + 1U;
-    }
-
-    if (*base == '\0') return 0;
-
-    return strcmp(base, ".") == 0 || strcmp(base, "..") == 0;
-}
-
-static int record_deleted_file_parent(shared_state_t *s, const char *parent_dir) {
-    char *dup;
-    char **np;
-    size_t nc;
-
-    if (edelete_is_forbidden_dot_entry_path(parent_dir)) return 0;
-    dup = strdup(parent_dir);
-    if (!dup) return -1;
-    pthread_mutex_lock(&s->rmdir_list_mutex);
-    if (s->rmdir_parents_n == s->rmdir_parents_cap) {
-        nc = s->rmdir_parents_cap ? s->rmdir_parents_cap * 2 : 64;
-        np = (char **)realloc(s->rmdir_parents, nc * sizeof(*np));
-        if (!np) {
-            pthread_mutex_unlock(&s->rmdir_list_mutex);
-            free(dup);
-            return -1;
-        }
-        s->rmdir_parents = np;
-        s->rmdir_parents_cap = nc;
-    }
-    s->rmdir_parents[s->rmdir_parents_n++] = dup;
-    pthread_mutex_unlock(&s->rmdir_list_mutex);
-    return 0;
-}
-
-static int path_slash_count(const char *p) {
-    int n = 0;
-    for (; *p; p++)
-        if (*p == '/') n++;
-    return n;
-}
-
-static int cmp_parent_path_desc(const void *a, const void *b) {
-    const char *pa = *(const char *const *)a;
-    const char *pb = *(const char *const *)b;
-    int da = path_slash_count(pa);
-    int db = path_slash_count(pb);
-
-    if (da != db) return db - da;
-    return strcmp(pa, pb);
-}
-
-typedef struct {
-    char *path;
-    int depth;
-} depth_path_t;
-
-static int cmp_depth_path_desc(const void *a, const void *b) {
-    const depth_path_t *pa = (const depth_path_t *)a;
-    const depth_path_t *pb = (const depth_path_t *)b;
-
-    if (pa->depth != pb->depth) return pb->depth - pa->depth;
-    return strcmp(pa->path, pb->path);
-}
-
-/*
- * Sort `list` of `n` path strings deepest-first (by '/'-count), then lexicographically — the order
- * try_rmdir_chain / the scan pass need so children are removed before their parents.
- *
- * Computes each path's slash-count once (Schwartzian transform) instead of recomputing it on every
- * qsort comparison; for many/deep parent dirs this removes the O(N log N · path-length) string scans
- * that path_slash_count showed up as in profiles. On allocation failure, falls back to the in-place
- * comparator (same order, just slower).
- */
-static void sort_paths_deepest_first(char **list, size_t n) {
-    depth_path_t *tmp;
-    size_t i;
-
-    if (n < 2) return;
-
-    tmp = (depth_path_t *)malloc(n * sizeof(*tmp));
-    if (!tmp) {
-        qsort(list, n, sizeof(*list), cmp_parent_path_desc);
-        return;
-    }
-
-    for (i = 0; i < n; i++) {
-        tmp[i].path = list[i];
-        tmp[i].depth = path_slash_count(list[i]);
-    }
-    qsort(tmp, n, sizeof(*tmp), cmp_depth_path_desc);
-    for (i = 0; i < n; i++) list[i] = tmp[i].path;
-
-    free(tmp);
-}
-
-static void stats_add_error(shared_state_t *s) {
-    pthread_mutex_lock(&s->stats_mutex);
-    s->total_errors++;
-    pthread_mutex_unlock(&s->stats_mutex);
-}
-
-static void try_rmdir_chain(shared_state_t *shared, const char *root_path, const char *start_dir) {
-    char *cur = strdup(start_dir);
-    char *next;
-
-    if (!cur) {
-        stats_add_error(shared);
-        return;
-    }
-
-    while (cur && strcmp(cur, "/") != 0) {
-        if (edelete_is_forbidden_dot_entry_path(cur)) {
-            free(cur);
-            return;
-        }
-        if (!path_is_under_root(cur, root_path)) {
-            free(cur);
-            return;
-        }
-        if (rmdir(cur) != 0) {
-            if (errno == ENOENT || errno == ENOTEMPTY || errno == EBUSY) {
-                free(cur);
-                return;
-            }
-            fprintf(stderr, "edelete: rmdir %s: %s\n", cur, strerror(errno));
-            stats_add_error(shared);
-            free(cur);
-            return;
-        }
-
-        pthread_mutex_lock(&shared->stats_mutex);
-        shared->removed_empty_dirs++;
-        pthread_mutex_unlock(&shared->stats_mutex);
-
-        next = dup_parent_dir(cur);
-        free(cur);
-        cur = next;
-        if (!cur) {
-            stats_add_error(shared);
-            return;
-        }
-    }
-
-    free(cur);
-}
-
-static void remove_empty_directories_after_delete(shared_state_t *shared, const char *root_path) {
-    size_t n, i, w;
-    char **list;
-
-    pthread_mutex_lock(&shared->rmdir_list_mutex);
-    n = shared->rmdir_parents_n;
-    list = shared->rmdir_parents;
-    shared->rmdir_parents = NULL;
-    shared->rmdir_parents_n = 0;
-    shared->rmdir_parents_cap = 0;
-    pthread_mutex_unlock(&shared->rmdir_list_mutex);
-
-    if (!list || n == 0) {
-        free(list);
-        return;
-    }
-
-    sort_paths_deepest_first(list, n);
-
-    w = 0;
-    for (i = 0; i < n; i++) {
-        if (w > 0 && strcmp(list[i], list[w - 1]) == 0) {
-            free(list[i]);
-            continue;
-        }
-        list[w++] = list[i];
-    }
-    n = w;
-
-    for (i = 0; i < n; i++) try_rmdir_chain(shared, root_path, list[i]);
-
-    for (i = 0; i < n; i++) free(list[i]);
-    free(list);
-}
-
-typedef struct {
-    char **paths;
-    size_t n;
-    size_t cap;
-} edelete_dir_list_t;
-
-static edelete_dir_list_t *g_edelete_dir_collect;
-
-static int edelete_nftw_collect_dir(const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbuf) {
-    edelete_dir_list_t *list = g_edelete_dir_collect;
-    char **np;
-    size_t nc;
-
-    (void)sb;
-    (void)ftwbuf;
-    if (!list) return 0;
-    if (typeflag != FTW_D && typeflag != FTW_DP) return 0;
-
-    if (list->n == list->cap) {
-        nc = list->cap ? list->cap * 2 : 4096;
-        np = (char **)realloc(list->paths, nc * sizeof(*np));
-        if (!np) return -1;
-        list->paths = np;
-        list->cap = nc;
-    }
-    list->paths[list->n] = strdup(fpath);
-    if (!list->paths[list->n]) return -1;
-    list->n++;
-    return 0;
-}
-
-/*
- * Deepest-first rmdir pass: removes empty directories left after unlinks (including branches that
- * never had eligible files, so no parent was recorded for try_rmdir_chain).
- */
-static void remove_empty_directories_scan_pass(const char *root_path, shared_state_t *shared) {
-    edelete_dir_list_t list = {0};
-    size_t i;
-    int nftw_rc;
-    struct stat st_root;
-
-    if (lstat(root_path, &st_root) != 0) {
-        if (errno == ENOENT) {
-            /* Start directory may already have been removed by try_rmdir_chain (e.g. leaf dir). */
-            return;
-        }
-        fprintf(stderr, "edelete: lstat %s: %s\n", root_path, strerror(errno));
-        stats_add_error(shared);
-        return;
-    }
-    if (!S_ISDIR(st_root.st_mode)) return;
-
-    g_edelete_dir_collect = &list;
-    errno = 0;
-    nftw_rc = nftw(root_path, edelete_nftw_collect_dir, 64, FTW_PHYS);
-    g_edelete_dir_collect = NULL;
-
-    if (nftw_rc != 0) {
-        if (errno == ENOENT) {
-            for (i = 0; i < list.n; i++) free(list.paths[i]);
-            free(list.paths);
-            return;
-        }
-        fprintf(stderr, "edelete: directory scan %s: %s\n", root_path, errno ? strerror(errno) : "failed");
-        stats_add_error(shared);
-        for (i = 0; i < list.n; i++) free(list.paths[i]);
-        free(list.paths);
-        return;
-    }
-
-    sort_paths_deepest_first(list.paths, list.n);
-
-    for (i = 0; i < list.n; i++) {
-        const char *p = list.paths[i];
-
-        if (strcmp(p, "/") == 0) continue;
-        if (edelete_is_forbidden_dot_entry_path(p)) continue;
-        if (!path_is_under_root(p, root_path)) continue;
-
-        if (rmdir(p) == 0) {
-            pthread_mutex_lock(&shared->stats_mutex);
-            shared->removed_empty_dirs++;
-            pthread_mutex_unlock(&shared->stats_mutex);
-        } else if (errno != ENOTEMPTY && errno != ENOENT && errno != EBUSY && errno != ENOTDIR) {
-            fprintf(stderr, "edelete: rmdir %s: %s\n", p, strerror(errno));
-            stats_add_error(shared);
-        }
-    }
-
-    for (i = 0; i < list.n; i++) free(list.paths[i]);
-    free(list.paths);
-}
-
-static void stats_add_started(shared_state_t *s) {
-    pthread_mutex_lock(&s->stats_mutex);
-    s->crawl_threads_started++;
-    pthread_mutex_unlock(&s->stats_mutex);
-}
-
-static void stats_merge_aux(shared_state_t *shared, const worker_aux_stats_t *local) {
-    shared->donated_dirs += local->donated_dirs;
-    shared->donation_attempts += local->donation_attempts;
-    shared->donation_successes += local->donation_successes;
-}
-
-static void stats_add_donated_dirs_local(worker_aux_stats_t *s, uint64_t count) {
-    s->donated_dirs += count;
-    s->donation_successes += count;
-}
-
-static void stats_add_donation_attempt_local(worker_aux_stats_t *s, uint64_t count) {
-    s->donation_attempts += count;
-}
-
-static void perf_flush_local(perf_local_t *perf) {
-    int idx;
-
-    if (!perf || perf->entries == 0) return;
-
-    idx = (int)ATOMIC_LOAD_RELAXED(&g_bucket_index);
-    ATOMIC_ADD_RELAXED(&g_total_entries, perf->entries);
-    ATOMIC_ADD_RELAXED(&g_window_entries, perf->entries);
-    ATOMIC_ADD_RELAXED(&g_bucket_entries[idx], perf->entries);
-
-    if (perf->dirs > 0) ATOMIC_ADD_RELAXED(&g_total_dirs, perf->dirs);
-    if (perf->files > 0) ATOMIC_ADD_RELAXED(&g_total_files, perf->files);
-
-    memset(perf, 0, sizeof(*perf));
-}
-
-static void emfile_retry_pause(unsigned attempt) {
-    unsigned long usec = (unsigned long)EMFILE_RETRY_USEC;
-    struct timespec ts;
-
-    if (attempt < 4U) usec *= (unsigned long)(attempt + 1U);
-    ts.tv_sec = (time_t)(usec / 1000000UL);
-    ts.tv_nsec = (long)((usec % 1000000UL) * 1000UL);
-    while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {
-    }
-}
-
-static void queue_init(task_queue_t *q) {
-    memset(q, 0, sizeof(*q));
-    pthread_mutex_init(&q->mutex, NULL);
-    pthread_cond_init(&q->cond, NULL);
-}
-
-static void queue_destroy(task_queue_t *q) {
-    task_node_t *cur, *next;
-
-    pthread_mutex_lock(&q->mutex);
-    cur = q->head;
-    while (cur) {
-        dir_stack_t task = {cur->items, cur->count, cur->cap};
-        size_t i;
-        for (i = 0; i < task.count; i++) free(task.items[i].path);
-        free(task.items);
-        next = cur->next;
-        free(cur);
-        cur = next;
-    }
-    pthread_mutex_unlock(&q->mutex);
-
-    pthread_mutex_destroy(&q->mutex);
-    pthread_cond_destroy(&q->cond);
-}
-
-static int queue_push_stack_take(task_queue_t *q, dir_stack_t *task) {
-    task_node_t *node;
-
-    if (!task || task->count == 0) return 0;
-
-    node = (task_node_t *)malloc(sizeof(*node));
-    if (!node) return -1;
-
-    node->items = task->items;
-    node->count = task->count;
-    node->cap = task->cap;
-    node->next = NULL;
-
-    pthread_mutex_lock(&q->mutex);
-    if (q->closed) {
-        pthread_mutex_unlock(&q->mutex);
-        free(node);
-        return -1;
-    }
-    if (q->tail) q->tail->next = node;
-    else q->head = node;
-    q->tail = node;
-    q->queued_tasks++;
-    ATOMIC_ADD_RELAXED(&g_queue_depth, 1);
-    pthread_cond_signal(&q->cond);
-    pthread_mutex_unlock(&q->mutex);
-
-    task->items = NULL;
-    task->count = 0;
-    task->cap = 0;
-    return 0;
-}
-
-static int queue_pop_wait(task_queue_t *q, dir_stack_t *task) {
-    task_node_t *node;
-
-    pthread_mutex_lock(&q->mutex);
-    for (;;) {
-        if (q->head) break;
-        if (q->closed) {
-            pthread_mutex_unlock(&q->mutex);
-            return -1;
-        }
-        if (atomic_load(&g_main_done) && atomic_load(&g_active_workers) == 0) {
-            q->closed = 1;
-            pthread_cond_broadcast(&q->cond);
-            pthread_mutex_unlock(&q->mutex);
-            return -1;
-        }
-        if (g_shutdown_requested) {
-            q->closed = 1;
-            pthread_cond_broadcast(&q->cond);
-            pthread_mutex_unlock(&q->mutex);
-            return -1;
-        }
-        queue_cond_timedwait_ms(&q->cond, &q->mutex, QUEUE_COND_WAIT_MS);
-        atomic_fetch_add_explicit(&g_wait_crawl_tasks, 1ULL, memory_order_relaxed);
-    }
-
-    node = q->head;
-    q->head = node->next;
-    if (!q->head) q->tail = NULL;
-    atomic_fetch_add(&g_active_workers, 1);
-    pthread_mutex_unlock(&q->mutex);
-
-    ATOMIC_SUB_RELAXED(&g_queue_depth, 1);
-    ATOMIC_ADD_RELAXED(&g_tasks_popped, 1);
-
-    task->items = node->items;
-    task->count = node->count;
-    task->cap = node->cap;
-    free(node);
-    return 0;
-}
-
-static int dir_stack_init(dir_stack_t *s) {
-    s->items = NULL;
-    s->count = 0;
-    s->cap = 0;
-    return 0;
-}
-
-static void dir_stack_destroy(dir_stack_t *s) {
-    size_t i;
-    for (i = 0; i < s->count; i++) free(s->items[i].path);
-    free(s->items);
-    s->items = NULL;
-    s->count = 0;
-    s->cap = 0;
-}
-
-static int dir_stack_push_take(dir_stack_t *s, char *path_owned, size_t path_len, const struct stat *st) {
-    if (s->count == s->cap) {
-        size_t new_cap = (s->cap == 0) ? 64 : (s->cap * 2);
-        dir_work_t *new_items = (dir_work_t *)realloc(s->items, new_cap * sizeof(*new_items));
-        if (!new_items) return -1;
-        s->items = new_items;
-        s->cap = new_cap;
-    }
-
-    s->items[s->count].path = path_owned;
-    s->items[s->count].path_len = path_len;
-    if (st) s->items[s->count].st = *st;
-    else memset(&s->items[s->count].st, 0, sizeof(s->items[s->count].st));
-    s->items[s->count].have_stat = st ? 1 : 0;
-    s->count++;
-    return 0;
-}
-
-static int dir_stack_pop(dir_stack_t *s, dir_work_t *work) {
-    if (s->count == 0) return -1;
-    *work = s->items[--s->count];
-    return 0;
-}
-
-/* True if at least one peer worker is currently idle (no task), so handing off work pays off. */
-static int peers_idle(const shared_state_t *shared) {
-    int started = (int)shared->crawl_threads_started;
-    int active = atomic_load(&g_active_workers);
-
-    return started > 1 && active < started;
-}
-
-static int should_donate_work(const shared_state_t *shared, const dir_stack_t *local_stack) {
-    uint64_t qdepth = ATOMIC_LOAD_RELAXED(&g_queue_depth);
-    int active = atomic_load(&g_active_workers);
-    int started = (int)shared->crawl_threads_started;
-    int idle = started - active;
-
-    if (started <= 1) return 0;
-    if (active >= started) return 0;
-    if (local_stack->count < LOCAL_STACK_DONATE_FLOOR) return 0;
-    if (qdepth >= (uint64_t)(idle * DONATE_QUEUE_TARGET_PER_IDLE)) return 0;
-    return 1;
-}
-
-static int donate_stack_chunk(dir_stack_t *local_stack, task_queue_t *queue, worker_aux_stats_t *aux) {
-    dir_stack_t donated;
-    size_t count, start;
-
-    if (!local_stack || local_stack->count < LOCAL_STACK_DONATE_FLOOR) return 0;
-
-    count = local_stack->count / 2;
-    if (count < DONATE_CHUNK_MIN) count = DONATE_CHUNK_MIN;
-    if (count > DONATE_CHUNK_MAX) count = DONATE_CHUNK_MAX;
-    if (count >= local_stack->count) count = local_stack->count - 1;
-    if (count == 0) return 0;
-
-    dir_stack_init(&donated);
-    donated.items = (dir_work_t *)malloc(count * sizeof(*donated.items));
-    if (!donated.items) return -1;
-
-    donated.count = count;
-    donated.cap = count;
-    start = local_stack->count - count;
-    memcpy(donated.items, local_stack->items + start, count * sizeof(*donated.items));
-    local_stack->count = start;
-
-    stats_add_donation_attempt_local(aux, count);
-    if (queue_push_stack_take(queue, &donated) != 0) {
-        local_stack->count += count;
-        free(donated.items);
-        return -1;
-    }
-
-    stats_add_donated_dirs_local(aux, count);
-    return 0;
-}
-
-static void account_leaf(perf_local_t *perf, const struct stat *st) {
-    perf->entries++;
-    if (S_ISDIR(st->st_mode))
-        perf->dirs++;
-    else
-        perf->files++;
-
-    if (perf->entries >= PERF_FLUSH_INTERVAL) perf_flush_local(perf);
-}
-
-/* Unlink any non-directory; symlinks and special files are included. Directories use opendir, not unlink here.
- * Returns 1 if unlinked, 0 if skipped or dry-run eligible, -1 on unlink error. */
-static int try_delete_nondir(shared_state_t *shared, const char *path, const struct stat *st) {
-    time_t ts;
-
-    if (edelete_is_forbidden_dot_entry_path(path)) return 0;
-    if (S_ISDIR(st->st_mode)) return 0;
-    if (g_shutdown_requested) return 0;
-
-    if (!ownership_eligible(st)) return 0;
-
-    ts = pick_ts(st, g_basis);
-    if (!age_eligible_seconds(ts)) return 0;
-
-    if (g_dry_run) {
-        pthread_mutex_lock(&shared->stats_mutex);
-        shared->would_delete++;
-        pthread_mutex_unlock(&shared->stats_mutex);
-        atomic_fetch_add_explicit(&g_live_would_unlink, 1ULL, memory_order_relaxed);
-        return 0;
-    }
-
-    if (unlink_gate_enter() != 0) return 0;
-    if (unlink(path) != 0) {
-        fprintf(stderr, "edelete: unlink %s: %s\n", path, strerror(errno));
-        stats_add_error(shared);
-        unlink_gate_leave();
-        return -1;
-    }
-    unlink_gate_leave();
-
-    pthread_mutex_lock(&shared->stats_mutex);
-    shared->deleted_files++;
-    pthread_mutex_unlock(&shared->stats_mutex);
-    atomic_fetch_add_explicit(&g_live_unlinked, 1ULL, memory_order_relaxed);
-    return 1;
-}
-
-static int process_directory_iterative(dir_stack_t *stack, shared_state_t *shared, perf_local_t *perf,
-                                       worker_aux_stats_t *aux, task_queue_t *queue) {
-    while (stack->count > 0) {
-        dir_work_t work;
-        char *dir_path;
-        size_t dir_path_len;
-        struct stat st;
-        DIR *dir = NULL;
-        struct dirent *ent;
-
-        if (g_shutdown_requested) {
-            dir_stack_destroy(stack);
-            return 0;
-        }
-
-        if (dir_stack_pop(stack, &work) != 0) break;
-        dir_path = work.path;
-
-        if (work.have_stat)
-            st = work.st;
-        else {
-            memset(&st, 0, sizeof(st));
-            if (lstat(dir_path, &st) != 0) {
-                fprintf(stderr, "edelete: lstat %s: %s\n", dir_path, strerror(errno));
-                stats_add_error(shared);
-                free(dir_path);
-                continue;
-            }
-        }
-
-        account_leaf(perf, &st);
-        dir_path_len = work.path_len;
-
-        if (!S_ISDIR(st.st_mode)) {
-            if (try_delete_nondir(shared, dir_path, &st) == 1) {
-                char *par = dup_parent_dir(dir_path);
-                if (!par)
-                    stats_add_error(shared);
-                else {
-                    if (record_deleted_file_parent(shared, par) != 0) stats_add_error(shared);
-                    free(par);
-                }
-            }
-            free(dir_path);
-            continue;
-        }
-
-        {
-            unsigned retry;
-            for (retry = 0; retry <= EMFILE_RETRY_LIMIT; retry++) {
-                dir = opendir(dir_path);
-                if (dir || errno != EMFILE || retry == EMFILE_RETRY_LIMIT) break;
-                emfile_retry_pause(retry);
-            }
-        }
-        if (!dir) {
-            fprintf(stderr, "edelete: opendir %s: %s\n", dir_path, strerror(errno));
-            stats_add_error(shared);
-            free(dir_path);
-            continue;
-        }
-
-        int shutdown_mid_readdir = 0;
-
-        {
-            int dir_fd = dirfd(dir);
-            unsigned readdir_i = 0;
-
-            if (dir_fd < 0) {
-                fprintf(stderr, "edelete: dirfd %s: %s\n", dir_path, strerror(errno));
-                stats_add_error(shared);
-                closedir(dir);
-                free(dir_path);
-                continue;
-            }
-
-            while ((ent = readdir(dir)) != NULL) {
-                if ((++readdir_i & (READDIR_SHUTDOWN_CHECK_STRIDE - 1U)) == 0U && g_shutdown_requested) {
-                    shutdown_mid_readdir = 1;
-                    break;
-                }
-
-                size_t child_name_len;
-                struct stat child_st;
-#if defined(_DIRENT_HAVE_D_TYPE) && defined(DT_DIR) && defined(DT_UNKNOWN)
-                unsigned char child_d_type = ent->d_type;
-#else
-                unsigned char child_d_type = DT_UNKNOWN;
-#endif
-
-                if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
-
-                child_name_len = strlen(ent->d_name);
-                if (child_d_type == DT_DIR) {
-                    char *child_path_owned;
-                    size_t child_path_len;
-
-                    if (path_join_alloc(dir_path, dir_path_len, ent->d_name, child_name_len, &child_path_owned,
-                                        &child_path_len) != 0) {
-                        fprintf(stderr, "edelete: path alloc %s/%s\n", dir_path, ent->d_name);
-                        stats_add_error(shared);
-                        continue;
-                    }
-                    if (dir_stack_push_take(stack, child_path_owned, child_path_len, NULL) != 0) {
-                        fprintf(stderr, "edelete: stack push %s\n", child_path_owned);
-                        free(child_path_owned);
-                        stats_add_error(shared);
-                        continue;
-                    }
-                    while (!g_shutdown_requested && should_donate_work(shared, stack)) {
-                        if (donate_stack_chunk(stack, queue, aux) != 0) {
-                            stats_add_error(shared);
-                            break;
-                        }
-                    }
-                } else {
-                    if (fstatat(dir_fd, ent->d_name, &child_st, AT_SYMLINK_NOFOLLOW) != 0) {
-                        fprintf(stderr, "edelete: fstatat %s/%s: %s\n", dir_path, ent->d_name, strerror(errno));
-                        stats_add_error(shared);
-                        continue;
-                    }
-                    if (S_ISDIR(child_st.st_mode)) {
-                        char *child_path_owned;
-                        size_t child_path_len;
-
-                        if (path_join_alloc(dir_path, dir_path_len, ent->d_name, child_name_len, &child_path_owned,
-                                            &child_path_len) != 0) {
-                            fprintf(stderr, "edelete: path alloc %s/%s\n", dir_path, ent->d_name);
-                            stats_add_error(shared);
-                            continue;
-                        }
-                        if (dir_stack_push_take(stack, child_path_owned, child_path_len, &child_st) != 0) {
-                            fprintf(stderr, "edelete: stack push %s\n", child_path_owned);
-                            free(child_path_owned);
-                            stats_add_error(shared);
-                            continue;
-                        }
-                        while (!g_shutdown_requested && should_donate_work(shared, stack)) {
-                            if (donate_stack_chunk(stack, queue, aux) != 0) {
-                                stats_add_error(shared);
-                                break;
-                            }
-                        }
-                    } else {
-                        char child[PATH_MAX];
-
-                        /*
-                         * Large files can have slow unlink(2) (e.g. ZFS freeing many blocks). When peer
-                         * threads are idle, push such files onto the work stack so the donation path fans
-                         * their deletes out across threads instead of unlinking them serially here — this is
-                         * what lets a single directory full of huge files drain in parallel. Pushed files are
-                         * account_leaf-counted when popped (like directories), so we do NOT count them here.
-                         * Small files, dry-run, and the all-busy case stay on the zero-alloc inline path.
-                         */
-                        if (!g_dry_run && g_fanout_min_bytes > 0 &&
-                            (unsigned long long)child_st.st_size >= g_fanout_min_bytes && peers_idle(shared)) {
-                            char *child_path_owned;
-                            size_t child_path_len;
-
-                            if (path_join_alloc(dir_path, dir_path_len, ent->d_name, child_name_len,
-                                                &child_path_owned, &child_path_len) == 0) {
-                                if (dir_stack_push_take(stack, child_path_owned, child_path_len, &child_st) == 0) {
-                                    while (!g_shutdown_requested && should_donate_work(shared, stack)) {
-                                        if (donate_stack_chunk(stack, queue, aux) != 0) {
-                                            stats_add_error(shared);
-                                            break;
-                                        }
-                                    }
-                                    continue;
-                                }
-                                free(child_path_owned);
-                            }
-                            /* alloc/push failed: fall through to inline unlink below */
-                        }
-
-                        account_leaf(perf, &child_st);
-
-                        if (path_join_fast(dir_path, dir_path_len, ent->d_name, child_name_len, child, sizeof(child)) !=
-                            0) {
-                            fprintf(stderr, "edelete: path too long %s/%s\n", dir_path, ent->d_name);
-                            stats_add_error(shared);
-                            continue;
-                        }
-                        if (try_delete_nondir(shared, child, &child_st) == 1) {
-                            if (record_deleted_file_parent(shared, dir_path) != 0) stats_add_error(shared);
-                        }
-                    }
-                }
-            }
-        }
-
-        closedir(dir);
-        if (shutdown_mid_readdir) {
-            free(dir_path);
-            dir_stack_destroy(stack);
-            return 0;
-        }
-        free(dir_path);
-    }
-
-    return 0;
-}
-
-static void *worker_thread_main(void *arg_void) {
-    worker_arg_t *arg = (worker_arg_t *)arg_void;
-
-    (void)arg->worker_index;
-
-    for (;;) {
-        dir_stack_t task;
-
-        if (queue_pop_wait(arg->queue, &task) != 0) break;
-
-        process_directory_iterative(&task, arg->shared, &arg->perf, &arg->aux, arg->queue);
-        atomic_fetch_sub(&g_active_workers, 1);
-
-        if (atomic_load(&g_main_done) && atomic_load(&g_active_workers) == 0) {
-            pthread_mutex_lock(&arg->queue->mutex);
-            pthread_cond_broadcast(&arg->queue->cond);
-            pthread_mutex_unlock(&arg->queue->mutex);
-        }
-
-        dir_stack_destroy(&task);
-    }
-
-    perf_flush_local(&arg->perf);
-    return NULL;
-}
-
-static int enqueue_root_task(const char *path, shared_state_t *shared, task_queue_t *queue) {
-    dir_stack_t task;
-    struct stat st;
-    char *dup;
-    size_t path_len;
-
-    dir_stack_init(&task);
-    memset(&st, 0, sizeof(st));
-    if (lstat(path, &st) != 0) {
-        fprintf(stderr, "edelete: lstat %s: %s\n", path, strerror(errno));
-        stats_add_error(shared);
-        return -1;
-    }
-
-    dup = strdup(path);
-    if (!dup) {
-        fprintf(stderr, "edelete: strdup failed\n");
-        stats_add_error(shared);
-        return -1;
-    }
-
-    path_len = strlen(path);
-    if (dir_stack_push_take(&task, dup, path_len, &st) != 0) {
-        fprintf(stderr, "edelete: stack push root\n");
-        free(dup);
-        stats_add_error(shared);
-        return -1;
-    }
-
-    if (queue_push_stack_take(queue, &task) != 0) {
-        fprintf(stderr, "edelete: enqueue root failed\n");
-        dir_stack_destroy(&task);
-        stats_add_error(shared);
-        return -1;
-    }
-
-    return 0;
-}
-
-static void *stats_thread_main(void *arg) {
-    double *run_start_ptr = (double *)arg;
-
-    while (!atomic_load(&g_stop_stats)) {
-        sleep(1);
-
-        {
-            int next = (atomic_load(&g_bucket_index) + 1) % WINDOW_SECONDS;
-            unsigned long long expired = atomic_exchange(&g_bucket_entries[next], 0);
-            atomic_fetch_sub(&g_window_entries, expired);
-            atomic_store(&g_bucket_index, next);
-        }
-
-        {
-            unsigned int seen = atomic_load(&g_seconds_seen);
-            if (seen < WINDOW_SECONDS) atomic_store(&g_seconds_seen, seen + 1U);
-        }
-
-        {
-            unsigned long long total_entries = atomic_load(&g_total_entries);
-            unsigned long long window_entries = atomic_load(&g_window_entries);
-            unsigned long long unlink_live =
-                g_dry_run ? atomic_load(&g_live_would_unlink) : atomic_load(&g_live_unlinked);
-            unsigned int divisor = atomic_load(&g_seconds_seen);
-
-            /* g_total_entries is updated in batched flushes (every PERF_FLUSH_INTERVAL per worker),
-             * while unlink_live is updated per unlink. Each entry is account_leaf-counted before it is
-             * unlinked, so true walked >= true unlinked; clamp the displayed walked up to unlink_live so
-             * the lagging flushed total never reads below unlinked. No hot-path cost. */
-            if (unlink_live > total_entries) total_entries = unlink_live;
-            double walk_rate;
-            double elapsed_sec = now_sec() - *run_start_ptr;
-            char walked_buf[32], rate_buf[32], unlink_buf[32], elapsed_buf[32];
-
-            if (divisor == 0) divisor = 1;
-            walk_rate = (double)window_entries / (double)divisor;
-            human_decimal((double)total_entries, walked_buf, sizeof(walked_buf));
-            human_decimal(walk_rate, rate_buf, sizeof(rate_buf));
-            human_decimal((double)unlink_live, unlink_buf, sizeof(unlink_buf));
-            format_duration(elapsed_sec, elapsed_buf, sizeof(elapsed_buf));
-
-            if (g_dry_run)
-                printf("\r%s walk/s(10s) | walked:%s | would_unlink:%s | el:%s            ", rate_buf, walked_buf,
-                       unlink_buf, elapsed_buf);
-            else
-                printf("\r%s walk/s(10s) | walked:%s | unlinked:%s | el:%s            ", rate_buf, walked_buf,
-                       unlink_buf, elapsed_buf);
-            fflush(stdout);
-        }
-    }
-
-    return NULL;
-}
-
-static int line_confirms_yes(char *buf) {
-    char *p = buf;
-
-    if (!p) return 0;
+static int line_confirms_yes(char *p)
+{
     while (*p && isspace((unsigned char)*p)) p++;
     if (strncmp(p, "YES", 3) != 0) return 0;
     p += 3;
@@ -1320,10 +608,9 @@ static int line_confirms_yes(char *buf) {
     return *p == '\0';
 }
 
-/*
- * Returns 0 if the user typed YES, -1 on cancel / EOF / wrong answer.
- */
-static int confirm_delete_prompt(const char *root_path, int delete_all, const char *basis_str, int age_days) {
+/* 0 if the user typed YES; -1 on cancel, EOF, or any other answer. */
+static int confirm_delete_prompt(const char *root_path, const char *basis_str)
+{
     char line[64];
 
     fprintf(stderr,
@@ -1335,13 +622,12 @@ static int confirm_delete_prompt(const char *root_path, int delete_all, const ch
             "  Resolved start path: %s\n"
             "  Filter:              %s\n",
             root_path,
-            delete_all ? "all non-directories (no age filter)" : "age-based (see below)");
-    if (!delete_all && basis_str) {
+            g_delete_all ? "all non-directories (no age filter)" : "age-based (see below)");
+    if (!g_delete_all && basis_str) {
         fprintf(stderr,
                 "  Time basis:          %s\n"
                 "  Minimum age:         %d day(s)\n",
-                basis_str,
-                age_days);
+                basis_str, g_age_days);
     }
     if (g_have_uid_filter || g_have_gid_filter) {
         fprintf(stderr, "  Ownership filter:    ");
@@ -1351,21 +637,15 @@ static int confirm_delete_prompt(const char *root_path, int delete_all, const ch
         fprintf(stderr, "\n");
     }
     fprintf(stderr,
-            "  Threads:             %d  (EDELETE_THREADS)\n"
-            "  Max unlink inflight: %d  (EDELETE_MAX_UNLINK_INFLIGHT; 0 = unlimited)\n"
-            "  Fan-out min bytes:   %llu  (EDELETE_FANOUT_MIN_BYTES; 0 = off)\n"
+            "  Walker threads:      %d  (EDELETE_THREADS)\n"
+            "  Unlink threads:      %d  (EDELETE_MAX_UNLINK_INFLIGHT)\n"
             "\n"
             "Type YES to proceed, anything else cancels: ",
-            g_threads,
-            g_max_unlink_inflight,
-            g_fanout_min_bytes);
+            g_threads, g_unlink_workers);
     fflush(stderr);
 
     if (!fgets(line, sizeof(line), stdin)) {
-        if (g_shutdown_requested)
-            fprintf(stderr, "\nedelete: interrupted.\n");
-        else
-            fprintf(stderr, "\nedelete: cancelled (no input).\n");
+        fprintf(stderr, "\nedelete: cancelled (no input).\n");
         return -1;
     }
     if (!line_confirms_yes(line)) {
@@ -1375,7 +655,8 @@ static int confirm_delete_prompt(const char *root_path, int delete_all, const ch
     return 0;
 }
 
-static void usage(const char *prog) {
+static void usage(const char *prog)
+{
     fprintf(stderr,
             "Usage: %s [options] <path>\n"
             "       %s [options] <atime|mtime|ctime> <days> <path>\n"
@@ -1390,125 +671,95 @@ static void usage(const char *prog) {
             "  --force                 with --delete: skip the YES prompt\n"
             "  --uid UID               only this owner\n"
             "  --gid GID               only this group (both apply when set)\n"
+            "  -h, --help              show this help\n"
             "\n"
             "Environment:\n"
-            "  EDELETE_THREADS                crawl workers (default %d)\n"
-            "  EDELETE_MAX_UNLINK_INFLIGHT    concurrent unlinks (default %d; 0=unlimited)\n"
-            "  EDELETE_FANOUT_MIN_BYTES      queue files this large for parallel unlink (default %llu MiB; 0=off)\n",
-            prog, prog, DEFAULT_THREADS, DEFAULT_MAX_UNLINK_INFLIGHT,
-            (unsigned long long)(DEFAULT_FANOUT_MIN_BYTES >> 20));
+            "  EDELETE_THREADS                directory walker threads (default %d)\n"
+            "  EDELETE_MAX_UNLINK_INFLIGHT    concurrent unlink threads (default %d)\n",
+            prog, prog, DEFAULT_THREADS, DEFAULT_UNLINK_WORKERS);
 }
 
-int main(int argc, char **argv) {
-    shared_state_t shared;
-    task_queue_t queue;
-    pthread_t *workers = NULL;
-    worker_arg_t *worker_args = NULL;
-    pthread_t stats_thread;
-    double t0, t1;
-    double run_start = 0.0;
-    int worker_count_started = 0;
-    int i;
-    int ai = 1;
+int main(int argc, char **argv)
+{
+    static char root_abs[PATH_MAX];
     const char *basis_str = NULL;
-    const char *days_str = NULL;
     const char *root_path = NULL;
+    struct stat root_st;
+    dirwalk_cfg_t cfg;
+    dirwalk_ops_t ops;
+    pthread_t status_thread;
+    int have_status_thread = 0;
+    int interrupted = 0;
+    double t0, t1;
+    int ai = 1;
 
     while (ai < argc && argv[ai][0] == '-') {
         if (strcmp(argv[ai], "--delete") == 0) {
             g_dry_run = 0;
             ai++;
-            continue;
-        }
-        if (strcmp(argv[ai], "--force") == 0) {
+        } else if (strcmp(argv[ai], "--force") == 0) {
             g_force = 1;
             ai++;
-            continue;
-        }
-        if (strcmp(argv[ai], "--uid") == 0) {
+        } else if (strcmp(argv[ai], "--uid") == 0 || strcmp(argv[ai], "--gid") == 0) {
             unsigned long v;
+            int is_uid = argv[ai][2] == 'u';
             if (ai + 1 >= argc) {
-                fprintf(stderr, "edelete: --uid requires an argument\n");
+                fprintf(stderr, "edelete: %s requires an argument\n", argv[ai]);
                 usage(argv[0]);
                 return 2;
             }
-            if (parse_id_filter("--uid", argv[ai + 1], &v) != 0) return 2;
-            g_filter_uid = (uid_t)v;
-            g_have_uid_filter = 1;
+            if (parse_id(argv[ai], argv[ai + 1], &v) != 0) return 2;
+            if (is_uid) { g_filter_uid = (uid_t)v; g_have_uid_filter = 1; }
+            else        { g_filter_gid = (gid_t)v; g_have_gid_filter = 1; }
             ai += 2;
-            continue;
-        }
-        if (strcmp(argv[ai], "--gid") == 0) {
-            unsigned long v;
-            if (ai + 1 >= argc) {
-                fprintf(stderr, "edelete: --gid requires an argument\n");
-                usage(argv[0]);
-                return 2;
-            }
-            if (parse_id_filter("--gid", argv[ai + 1], &v) != 0) return 2;
-            g_filter_gid = (gid_t)v;
-            g_have_gid_filter = 1;
-            ai += 2;
-            continue;
-        }
-        if (strcmp(argv[ai], "--help") == 0) {
+        } else if (strcmp(argv[ai], "--help") == 0 || strcmp(argv[ai], "-h") == 0) {
             usage(argv[0]);
             return 0;
+        } else {
+            fprintf(stderr, "edelete: unknown option %s\n", argv[ai]);
+            usage(argv[0]);
+            return 2;
         }
-        fprintf(stderr, "edelete: unknown option %s\n", argv[ai]);
-        usage(argv[0]);
-        return 2;
     }
-
-    if (argc - ai < 1) {
-        usage(argv[0]);
-        return 2;
-    }
-
-    install_job_signals();
 
     if (argc - ai == 1) {
         g_delete_all = 1;
-        root_path = argv[ai++];
+        root_path = argv[ai];
     } else if (argc - ai == 3) {
-        basis_str = argv[ai++];
-        days_str = argv[ai++];
-        root_path = argv[ai++];
+        long d;
+        char *end = NULL;
 
+        basis_str = argv[ai];
         if (parse_basis(basis_str, &g_basis) != 0) {
             fprintf(stderr, "edelete: time basis must be atime, mtime, or ctime\n");
             return 2;
         }
-
-        {
-            long d;
-            char *end = NULL;
-            errno = 0;
-            d = strtol(days_str, &end, 10);
-            if (errno || !end || *end || d < 1 || d > 365000L) {
-                fprintf(stderr, "edelete: days must be an integer in [1, 365000]\n");
-                return 2;
-            }
-            g_age_days = (int)d;
+        errno = 0;
+        d = strtol(argv[ai + 1], &end, 10);
+        if (errno || !end || *end || d < 1 || d > 365000L) {
+            fprintf(stderr, "edelete: days must be an integer in [1, 365000]\n");
+            return 2;
         }
+        g_age_days = (int)d;
+        root_path = argv[ai + 2];
     } else {
-        fprintf(stderr,
-                "edelete: use either one argument (<path>) or three (<atime|mtime|ctime> <days> <path>)\n");
+        if (argc - ai > 0) {
+            fprintf(stderr, "edelete: use either one argument (<path>) or three "
+                            "(<atime|mtime|ctime> <days> <path>)\n");
+        }
         usage(argv[0]);
         return 2;
     }
 
-    if (ai != argc) {
-        fprintf(stderr, "edelete: extra arguments after start path\n");
-        usage(argv[0]);
+    if (path_resolve_existing(root_path, root_abs, "edelete: ") != 0) return 2;
+    root_path = root_abs;
+    if (lstat(root_path, &root_st) != 0) {
+        fprintf(stderr, "edelete: %s: %s\n", root_path, strerror(errno));
         return 2;
     }
-
-    {
-        static char root_abs[PATH_MAX];
-
-        if (path_resolve_existing(root_path, root_abs, "edelete: ") != 0) return 2;
-        root_path = root_abs;
+    if (!S_ISDIR(root_st.st_mode)) {
+        fprintf(stderr, "edelete: %s: not a directory\n", root_path);
+        return 2;
     }
 
     if (!g_delete_all) {
@@ -1517,195 +768,95 @@ int main(int argc, char **argv) {
             fprintf(stderr, "edelete: time() failed\n");
             return 1;
         }
-    } else {
-        g_now = 0;
     }
 
-    g_threads = parse_thread_count();
-    g_max_unlink_inflight = parse_max_unlink_inflight();
-    g_fanout_min_bytes = parse_fanout_min_bytes();
+    g_threads = env_int_or_default("EDELETE_THREADS", DEFAULT_THREADS, 1, 1024);
+    g_unlink_workers = env_int_or_default("EDELETE_MAX_UNLINK_INFLIGHT", DEFAULT_UNLINK_WORKERS, 1, 1024);
 
-    if (!g_dry_run && !g_force && confirm_delete_prompt(root_path, g_delete_all, basis_str, g_age_days) != 0)
-        return 3;
+    if (!g_dry_run && !g_force && confirm_delete_prompt(root_path, basis_str) != 0) return 3;
 
-    /*
-     * Handlers are installed early; a stray SIGINT/SIGTERM during path resolve or the YES prompt can set
-     * g_shutdown_requested. Once we pass confirm/setup, start the crawl with a clean interrupt scope so
-     * try_delete_nondir is not permanently skipped.
-     */
-    g_shutdown_requested = 0;
-
-    memset(&shared, 0, sizeof(shared));
-    pthread_mutex_init(&shared.stats_mutex, NULL);
-    pthread_mutex_init(&shared.rmdir_list_mutex, NULL);
-    queue_init(&queue);
-
-    for (i = 0; i < WINDOW_SECONDS; i++) atomic_store(&g_bucket_entries[i], 0);
-    atomic_store(&g_total_entries, 0);
-    atomic_store(&g_live_would_unlink, 0);
-    atomic_store(&g_live_unlinked, 0);
-    atomic_store(&g_total_dirs, 0);
-    atomic_store(&g_total_files, 0);
-    atomic_store(&g_window_entries, 0);
-    atomic_store(&g_bucket_index, 0);
-    atomic_store(&g_stop_stats, 0);
-    atomic_store(&g_seconds_seen, 0);
-    atomic_store(&g_queue_depth, 0);
-    atomic_store(&g_active_workers, 0);
-    atomic_store(&g_main_done, 0);
-    atomic_store(&g_tasks_popped, 0);
-    atomic_store(&g_wait_crawl_tasks, 0);
+    /* Installed after the prompt so a Ctrl+C at the prompt simply exits. */
+    shutdown_install_handlers(edelete_stop);
 
     t0 = now_sec();
-    run_start = t0;
+    if (pthread_create(&status_thread, NULL, status_thread_main, &t0) == 0) {
+        have_status_thread = 1;
+    }
 
-    workers = (pthread_t *)calloc((size_t)g_threads, sizeof(*workers));
-    worker_args = (worker_arg_t *)calloc((size_t)g_threads, sizeof(*worker_args));
-    if (!workers || !worker_args) {
-        fprintf(stderr, "edelete: allocation failed\n");
-        free(workers);
-        free(worker_args);
-        queue_destroy(&queue);
-        pthread_mutex_destroy(&shared.rmdir_list_mutex);
-        pthread_mutex_destroy(&shared.stats_mutex);
+    if (!g_dry_run && unlink_pool_start() != 0) {
+        fprintf(stderr, "edelete: no unlink threads started\n");
         return 1;
     }
 
-    for (i = 0; i < g_threads; i++) {
-        worker_args[i].shared = &shared;
-        worker_args[i].queue = &queue;
-        worker_args[i].worker_index = (uint64_t)(i + 1);
-        memset(&worker_args[i].perf, 0, sizeof(worker_args[i].perf));
-        memset(&worker_args[i].aux, 0, sizeof(worker_args[i].aux));
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.threads = g_threads;
+    cfg.stop = &g_shutdown_requested;
+#ifdef ECOPY_HAVE_GETDENTS64
+    cfg.getdents_buf = GETDENTS_BUF_BYTES;
+#endif
+    memset(&ops, 0, sizeof(ops));
+    ops.dir_begin = walk_dir_begin;
+    ops.entry = walk_entry;
+    ops.dir_end = walk_dir_end;
+    ops.thread_end = batch_thread_end;
+    ops.error = walk_error;
 
-        if (pthread_create(&workers[i], NULL, worker_thread_main, &worker_args[i]) != 0) {
-            fprintf(stderr, "edelete: pthread_create failed\n");
-            stats_add_error(&shared);
-            break;
-        }
-        worker_count_started++;
-        stats_add_started(&shared);
+    if (dirwalk_start(root_path, &root_st, &cfg, &ops) != 0) {
+        fprintf(stderr, "edelete: could not start the walk\n");
+        count_error();
+    } else {
+        dirwalk_wait();
     }
-
-    if (worker_count_started == 0) {
-        fprintf(stderr, "edelete: no worker threads started\n");
-        free(workers);
-        free(worker_args);
-        queue_destroy(&queue);
-        pthread_mutex_destroy(&shared.rmdir_list_mutex);
-        pthread_mutex_destroy(&shared.stats_mutex);
-        return 1;
+    if (!g_dry_run) {
+        unlink_pool_finish();
     }
+    interrupted = stopping();
 
-    if (pthread_create(&stats_thread, NULL, stats_thread_main, &run_start) != 0) {
-        fprintf(stderr, "edelete: stats thread failed\n");
-        pthread_mutex_lock(&queue.mutex);
-        queue.closed = 1;
-        pthread_cond_broadcast(&queue.cond);
-        pthread_mutex_unlock(&queue.mutex);
-        for (i = 0; i < worker_count_started; i++) pthread_join(workers[i], NULL);
-        free(workers);
-        free(worker_args);
-        queue_destroy(&queue);
-        pthread_mutex_destroy(&shared.rmdir_list_mutex);
-        pthread_mutex_destroy(&shared.stats_mutex);
-        return 1;
+    if (!g_dry_run && !interrupted) {
+        remove_empty_directories();
     }
+    free_dir_list();
 
-    if (enqueue_root_task(root_path, &shared, &queue) != 0) {
-        atomic_store(&g_stop_stats, 1);
-        pthread_mutex_lock(&queue.mutex);
-        queue.closed = 1;
-        pthread_cond_broadcast(&queue.cond);
-        pthread_mutex_unlock(&queue.mutex);
-        pthread_join(stats_thread, NULL);
-        clear_status_line();
-        for (i = 0; i < worker_count_started; i++) pthread_join(workers[i], NULL);
-        free(workers);
-        free(worker_args);
-        queue_destroy(&queue);
-        pthread_mutex_destroy(&shared.rmdir_list_mutex);
-        pthread_mutex_destroy(&shared.stats_mutex);
-        return 1;
-    }
-
-    atomic_store(&g_main_done, 1);
-    pthread_mutex_lock(&queue.mutex);
-    pthread_cond_broadcast(&queue.cond);
-    pthread_mutex_unlock(&queue.mutex);
+    status_stop();
+    if (have_status_thread) pthread_join(status_thread, NULL);
+    clear_status_line();
+    if (interrupted) fprintf(stderr, "edelete: interrupted by signal; partial results below.\n");
+    t1 = now_sec();
 
     {
-        int interrupted = 0;
+        double elapsed = t1 - t0;
+        unsigned long long entries = atomic_load(&g_entries);
+        unsigned long long errors = atomic_load(&g_errors);
+        char avg[32];
 
-        for (i = 0; i < worker_count_started; i++) pthread_join(workers[i], NULL);
-        interrupted = g_shutdown_requested;
-
-        pthread_mutex_lock(&queue.mutex);
-        queue.closed = 1;
-        pthread_cond_broadcast(&queue.cond);
-        pthread_mutex_unlock(&queue.mutex);
-
-        for (i = 0; i < worker_count_started; i++) stats_merge_aux(&shared, &worker_args[i].aux);
-
-        if (!g_dry_run && !interrupted) {
-            remove_empty_directories_after_delete(&shared, root_path);
-            remove_empty_directories_scan_pass(root_path, &shared);
+        format_count_si(elapsed > 0.0 ? (double)entries / elapsed : 0.0, avg, sizeof(avg));
+        printf("delete_all=%d\n", g_delete_all);
+        if (!g_delete_all) {
+            printf("basis=%s\n", basis_str);
+            printf("age_days=%d\n", g_age_days);
         }
+        printf("force=%d\n", g_force);
+        printf("filter_uid_set=%d\n", g_have_uid_filter);
+        if (g_have_uid_filter) printf("filter_uid=%u\n", (unsigned)g_filter_uid);
+        printf("filter_gid_set=%d\n", g_have_gid_filter);
+        if (g_have_gid_filter) printf("filter_gid=%u\n", (unsigned)g_filter_gid);
+        printf("mode=%s\n", g_dry_run ? "dry-run" : "delete");
+        printf("start_path=%s\n", root_path);
+        printf("threads=%d\n", g_threads);
+        printf("max_unlink_inflight=%d\n", g_dry_run ? 0 : g_unlink_threads_started);
+        printf("walk_entries=%llu\n", entries);
+        printf("entries_scanned=%llu\n", entries);
+        printf("dirs_seen=%llu\n", (unsigned long long)atomic_load(&g_dirs));
+        printf("files_seen=%llu\n", (unsigned long long)atomic_load(&g_files));
+        printf("deleted_files=%llu\n", (unsigned long long)atomic_load(&g_deleted));
+        printf("removed_empty_dirs=%llu\n", (unsigned long long)atomic_load(&g_removed_dirs));
+        printf("would_delete=%llu\n", (unsigned long long)atomic_load(&g_would_delete));
+        printf("errors=%llu\n", errors);
+        printf("elapsed_sec=%.3f\n", elapsed);
+        printf("avg_walk_per_sec=%s\n", avg);
+        printf("avg_entries_per_sec=%s\n", avg);
 
-        atomic_store(&g_stop_stats, 1);
-        pthread_join(stats_thread, NULL);
-        clear_status_line();
-        if (interrupted) fprintf(stderr, "edelete: interrupted by signal; partial results below.\n");
-
-        t1 = now_sec();
-
-        free(workers);
-        free(worker_args);
-        queue_destroy(&queue);
-
-        {
-            double elapsed = t1 - t0;
-            double avg_walk =
-                elapsed > 0.0 ? (double)atomic_load(&g_total_entries) / elapsed : 0.0;
-            char avg_walk_buf[32];
-
-            human_decimal(avg_walk, avg_walk_buf, sizeof(avg_walk_buf));
-            printf("delete_all=%d\n", g_delete_all);
-            if (!g_delete_all) {
-                printf("basis=%s\n", basis_str);
-                printf("age_days=%d\n", g_age_days);
-            }
-            printf("force=%d\n", g_force);
-            printf("filter_uid_set=%d\n", g_have_uid_filter);
-            if (g_have_uid_filter) printf("filter_uid=%u\n", (unsigned)g_filter_uid);
-            printf("filter_gid_set=%d\n", g_have_gid_filter);
-            if (g_have_gid_filter) printf("filter_gid=%u\n", (unsigned)g_filter_gid);
-            printf("mode=%s\n", g_dry_run ? "dry-run" : "delete");
-            printf("start_path=%s\n", root_path);
-            printf("threads=%d\n", worker_count_started);
-            printf("max_unlink_inflight=%d\n", g_max_unlink_inflight);
-            printf("fanout_min_bytes=%llu\n", g_fanout_min_bytes);
-            printf("walk_entries=%" PRIu64 "\n", (uint64_t)atomic_load(&g_total_entries));
-            printf("entries_scanned=%" PRIu64 "\n", (uint64_t)atomic_load(&g_total_entries));
-            printf("dirs_seen=%" PRIu64 "\n", (uint64_t)atomic_load(&g_total_dirs));
-            printf("files_seen=%" PRIu64 "\n", (uint64_t)atomic_load(&g_total_files));
-            printf("deleted_files=%" PRIu64 "\n", shared.deleted_files);
-            printf("removed_empty_dirs=%" PRIu64 "\n", shared.removed_empty_dirs);
-            printf("would_delete=%" PRIu64 "\n", shared.would_delete);
-            printf("errors=%" PRIu64 "\n", shared.total_errors);
-            printf("elapsed_sec=%.3f\n", elapsed);
-            printf("avg_walk_per_sec=%s\n", avg_walk_buf);
-            printf("avg_entries_per_sec=%s\n", avg_walk_buf);
-            printf("tasks_popped=%" PRIu64 "\n", (uint64_t)atomic_load(&g_tasks_popped));
-            printf("wait_crawl_tasks=%" PRIu64 "\n", (uint64_t)atomic_load(&g_wait_crawl_tasks));
-            printf("donated_dirs=%" PRIu64 "\n", shared.donated_dirs);
-            printf("donation_attempts=%" PRIu64 "\n", shared.donation_attempts);
-            printf("donation_successes=%" PRIu64 "\n", shared.donation_successes);
-        }
-
-        pthread_mutex_destroy(&shared.rmdir_list_mutex);
-        pthread_mutex_destroy(&shared.stats_mutex);
         if (interrupted) return 130;
-        return shared.total_errors ? 1 : 0;
+        return errors ? 1 : 0;
     }
 }

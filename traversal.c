@@ -3,11 +3,20 @@
  *
  * SPDX-License-Identifier: MIT
  * Copyright (c) 2026 Michel Erb — see LICENSE.
+ *
+ * Source-tree traversal for a copy: the shared dirwalk walker enumerates the
+ * tree; the callbacks here create target directories, stat destinations in
+ * batches, hand regular files to the copy workers, recreate symlinks, and
+ * record every directory so its metadata can be finalized deepest-first once
+ * all of its contents are in place.
  */
 
 #define _GNU_SOURCE
 #include "compat.h"
 #include "traversal.h"
+#include "env_util.h"
+#include "dirwalk.h"
+#include "path_utils.h"
 #include "stats.h"
 #include "fs_util.h"
 #include "copy_policy.h"
@@ -24,29 +33,15 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
-#include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
-#ifdef ECOPY_HAVE_GETDENTS64
-#include <sys/syscall.h>
-#endif
 
 /*
- * Directory queue nodes and finalize records carry heap-allocated, exact-length
- * path strings rather than PATH_MAX arrays: trees with tens of millions of
- * directories otherwise pin ~8 KiB per directory for the whole run (the
- * finalize list is only released after the final metadata pass), which is what
- * OOM-killed ecopy on such trees.
+ * Finalize records carry heap-allocated, exact-length path strings rather than
+ * PATH_MAX arrays: the list lives until the final metadata pass, and with tens
+ * of millions of directories ~8 KiB each is what once OOM-killed ecopy.
  */
-typedef struct dir_node {
-    char *src;
-    char *dst;
-    struct stat src_st;
-    int depth;
-    struct dir_node *next;
-} dir_node_t;
-
 typedef struct dir_record {
     char *src;
     char *dst;
@@ -54,73 +49,17 @@ typedef struct dir_record {
     int depth;
 } dir_record_t;
 
-static pthread_t *g_threads = NULL;
 static int g_traversal_workers = 0;
 static int g_status = 0;
 static pthread_mutex_t g_status_lock = PTHREAD_MUTEX_INITIALIZER;
 static char g_src_root[PATH_MAX];
 static char g_dst_root[PATH_MAX];
-
-static pthread_mutex_t g_dir_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t g_dir_cond = PTHREAD_COND_INITIALIZER;
-static dir_node_t *g_dir_head = NULL;
-static dir_node_t *g_dir_tail = NULL;
-static int g_dir_active = 0;
-static int g_dir_done = 0;
+static size_t g_src_root_len;
 
 static pthread_mutex_t g_finalize_lock = PTHREAD_MUTEX_INITIALIZER;
 static dir_record_t *g_finalize_dirs = NULL;
 static size_t g_finalize_dir_count = 0;
 static size_t g_finalize_dir_cap = 0;
-
-static int env_int_or_default(const char *name, int defval, int minval, int maxval)
-{
-    const char *s = getenv(name);
-    if (!s || !*s) {
-        return defval;
-    }
-
-    errno = 0;
-    char *end = NULL;
-    long v = strtol(s, &end, 10);
-
-    if (errno != 0 || end == s || *end != '\0') {
-        fprintf(stderr,
-                "Warning: %s=%s is invalid; using default %d.\n",
-                name,
-                s,
-                defval);
-        return defval;
-    }
-    if (v < minval) {
-        fprintf(stderr,
-                "Warning: %s=%ld is below minimum %d; using %d.\n",
-                name,
-                v,
-                minval,
-                minval);
-        return minval;
-    }
-    if (v > maxval) {
-        fprintf(stderr,
-                "Warning: %s=%ld exceeds maximum %d; using %d.\n",
-                name,
-                v,
-                maxval,
-                maxval);
-        return maxval;
-    }
-    return (int)v;
-}
-
-static int path_is_same_or_child(const char *base, const char *path)
-{
-    size_t n = strlen(base);
-    if (strncmp(base, path, n) != 0) {
-        return 0;
-    }
-    return path[n] == '\0' || path[n] == '/';
-}
 
 static int copy_path_checked(char *dst, size_t dst_sz, const char *src, const char *label)
 {
@@ -131,26 +70,6 @@ static int copy_path_checked(char *dst, size_t dst_sz, const char *src, const ch
     return 0;
 }
 
-/*
- * Join "<parent>/<name>" into out. Done by hand because this runs for every
- * directory entry during traversal; snprintf("%s/%s") showed up as a real cost
- * under perf. Returns 0 on success, -1 if the result would not fit.
- */
-static int join_path(char *out, size_t out_sz, const char *parent, const char *name)
-{
-    size_t pl = strlen(parent);
-    size_t nl = strlen(name);
-
-    if (pl + 1 + nl + 1 > out_sz) {
-        return -1;
-    }
-    memcpy(out, parent, pl);
-    out[pl] = '/';
-    memcpy(out + pl + 1, name, nl);
-    out[pl + 1 + nl] = '\0';
-    return 0;
-}
-
 static void mark_traversal_error(void)
 {
     pthread_mutex_lock(&g_status_lock);
@@ -158,43 +77,15 @@ static void mark_traversal_error(void)
     pthread_mutex_unlock(&g_status_lock);
 }
 
-static int same_source_entry(const struct stat *a, const struct stat *b)
+/* Map a source directory path to its destination: replace the root prefix. */
+static int dst_path_for(const char *src, char *out, size_t out_sz)
 {
-    return a->st_dev == b->st_dev &&
-           a->st_ino == b->st_ino &&
-           (a->st_mode & S_IFMT) == (b->st_mode & S_IFMT);
-}
-
-/*
- * Directory file descriptors are opened lazily, when a worker pops a directory
- * record off the queue, rather than at discovery time. This keeps the number of
- * open directory descriptors bounded by the number of traversal workers instead
- * of by the (potentially enormous) queue depth, which is what previously led to
- * "Too many open files" on directories with millions of children.
- */
-static int open_verified_source_dir_path(const char *path,
-                                         const struct stat *expected_st)
-{
-    struct stat opened_st;
-    int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0) {
-        perror(path);
+    const char *suffix = src + g_src_root_len; /* "" for the root, else "/..." */
+    if (snprintf(out, out_sz, "%s%s", g_dst_root, suffix) >= (int)out_sz) {
+        fprintf(stderr, "Target path too long: %s%s\n", g_dst_root, suffix);
         return -1;
     }
-    if (fstat(fd, &opened_st) != 0) {
-        int saved_errno = errno;
-        close(fd);
-        errno = saved_errno;
-        perror(path);
-        return -1;
-    }
-    if (!S_ISDIR(opened_st.st_mode) || !same_source_entry(expected_st, &opened_st)) {
-        close(fd);
-        fprintf(stderr, "Source directory changed during traversal: %s\n", path);
-        errno = ESTALE;
-        return -1;
-    }
-    return fd;
+    return 0;
 }
 
 static int open_or_create_target_dir_path(const char *path, mode_t mode)
@@ -237,45 +128,8 @@ static int open_or_create_target_dir_path(const char *path, mode_t mode)
     return fd;
 }
 
-static void free_dir_node(dir_node_t *n)
-{
-    if (!n) {
-        return;
-    }
-    free(n->src);
-    free(n->dst);
-    free(n);
-}
-
-static int push_dir_locked(const char *src,
-                           const char *dst,
-                           const struct stat *src_st,
-                           int depth)
-{
-    dir_node_t *n = calloc(1, sizeof(*n));
-    if (!n) {
-        perror("calloc");
-        return -1;
-    }
-    n->src = strdup(src);
-    n->dst = strdup(dst);
-    if (!n->src || !n->dst) {
-        perror("strdup");
-        free_dir_node(n);
-        return -1;
-    }
-    n->src_st = *src_st;
-    n->depth = depth;
-
-    if (g_dir_tail) {
-        g_dir_tail->next = n;
-    } else {
-        g_dir_head = n;
-    }
-    g_dir_tail = n;
-    pthread_cond_signal(&g_dir_cond);
-    return 0;
-}
+/* ------------------------------------------------------------------------ */
+/* Finalize list                                                            */
 
 /* Release every finalize record and the array. Caller holds g_finalize_lock. */
 static void free_finalize_dirs_locked(void)
@@ -343,151 +197,61 @@ static int dir_record_cmp_desc_depth(const void *a, const void *b)
     return strcmp(da->dst, db->dst);
 }
 
-typedef struct finalize_batch_ctx {
-    size_t start;
-    size_t end;
-    size_t next;
-    int failed;
-    int bind_seq;
-    pthread_mutex_t lock;
-} finalize_batch_ctx_t;
-
-static void *finalize_batch_worker(void *arg)
+static int finalize_depth_of(size_t i)
 {
-    finalize_batch_ctx_t *ctx = (finalize_batch_ctx_t *)arg;
+    return g_finalize_dirs[i].depth;
+}
 
-    /* Spread finalize SETMETA across the SSH connection pool (no-op locally). */
-    pthread_mutex_lock(&ctx->lock);
-    int bind_idx = ctx->bind_seq++;
-    pthread_mutex_unlock(&ctx->lock);
-    sshx_bind_thread(bind_idx);
+static int finalize_one(size_t i)
+{
+    const dir_record_t *rec = &g_finalize_dirs[i];
+    int frc;
 
-    for (;;) {
-        size_t idx_local;
-
-        pthread_mutex_lock(&ctx->lock);
-        if (ctx->next >= ctx->end) {
-            pthread_mutex_unlock(&ctx->lock);
-            break;
-        }
-        idx_local = ctx->next++;
-        pthread_mutex_unlock(&ctx->lock);
-
-        int frc;
-        if (sshx_active()) {
-            frc = sshx_setmeta(g_finalize_dirs[idx_local].dst,
-                               &g_finalize_dirs[idx_local].src_st, 1);
-        } else {
-            frc = preserve_path_metadata(g_finalize_dirs[idx_local].dst,
-                                         &g_finalize_dirs[idx_local].src_st);
-        }
-        if (frc == 0 && verify_metadata_enabled()) {
-            frc = verify_queue_directory(g_finalize_dirs[idx_local].src,
-                                         g_finalize_dirs[idx_local].dst,
-                                         &g_finalize_dirs[idx_local].src_st);
-        }
-        if (frc != 0) {
-            pthread_mutex_lock(&ctx->lock);
-            ctx->failed = 1;
-            pthread_mutex_unlock(&ctx->lock);
-        }
+    if (sshx_active()) {
+        frc = sshx_setmeta(rec->dst, &rec->src_st, 1);
+    } else {
+        frc = preserve_path_metadata(rec->dst, &rec->src_st);
     }
+    if (frc == 0 && verify_metadata_enabled()) {
+        frc = verify_queue_directory(rec->src, rec->dst, &rec->src_st);
+    }
+    return frc;
+}
 
-    return NULL;
+/*
+ * Remote SETMETA is processed by the server apply pool, and children may have
+ * been written by any server in the pool, so drain every connection between
+ * depth groups: children must finish before their parent gets its final
+ * timestamp.
+ */
+static int finalize_barrier(void)
+{
+    return sshx_active() ? sshx_barrier_all(0) : 0;
+}
+
+/* Spread finalize SETMETA across the SSH connection pool (no-op locally). */
+static void finalize_thread_start(int index)
+{
+    sshx_bind_thread(index);
 }
 
 static int finalize_directories_parallel(void)
 {
-    size_t start;
-
     if (g_finalize_dir_count == 0) {
         return 0;
     }
-
-    /*
-     * Remote SETMETA is processed by the server apply pool. Drain all file and
-     * mkdir work once before finalization, then drain after each depth group:
-     * children must finish before their parent receives its final timestamp.
-     * The barrier must cover every connection since children may have been
-     * written by any server in the pool.
-     */
-    if (sshx_active() && sshx_barrier_all(0) != 0) {
+    if (finalize_barrier() != 0) {
         return -1;
     }
-
-    qsort(g_finalize_dirs,
-          g_finalize_dir_count,
-          sizeof(*g_finalize_dirs),
+    qsort(g_finalize_dirs, g_finalize_dir_count, sizeof(*g_finalize_dirs),
           dir_record_cmp_desc_depth);
-
-    for (start = 0; start < g_finalize_dir_count; ) {
-        size_t end = start + 1;
-        int worker_count;
-        pthread_t *threads;
-        finalize_batch_ctx_t ctx;
-        int i;
-        int rc = 0;
-
-        while (end < g_finalize_dir_count &&
-               g_finalize_dirs[end].depth == g_finalize_dirs[start].depth) {
-            end++;
-        }
-
-        worker_count = g_traversal_workers;
-        if (worker_count < 1) {
-            worker_count = 1;
-        }
-        if ((size_t)worker_count > end - start) {
-            worker_count = (int)(end - start);
-        }
-
-        threads = calloc((size_t)worker_count, sizeof(*threads));
-        if (!threads) {
-            perror("calloc");
-            return -1;
-        }
-
-        ctx.start = start;
-        ctx.end = end;
-        ctx.next = start;
-        ctx.failed = 0;
-        ctx.bind_seq = 0;
-        pthread_mutex_init(&ctx.lock, NULL);
-
-        for (i = 0; i < worker_count; i++) {
-            if (pthread_create(&threads[i], NULL, finalize_batch_worker, &ctx) != 0) {
-                perror("pthread_create");
-                ctx.failed = 1;
-                worker_count = i;
-                rc = -1;
-                break;
-            }
-        }
-
-        for (i = 0; i < worker_count; i++) {
-            pthread_join(threads[i], NULL);
-        }
-
-        if (ctx.failed) {
-            rc = -1;
-        }
-
-        pthread_mutex_destroy(&ctx.lock);
-        free(threads);
-
-        if (rc != 0) {
-            return -1;
-        }
-
-        if (sshx_active() && sshx_barrier_all(0) != 0) {
-            return -1;
-        }
-
-        start = end;
-    }
-
-    return 0;
+    return dirwalk_depth_groups(g_finalize_dir_count, g_traversal_workers,
+                                finalize_depth_of, finalize_one,
+                                finalize_barrier, finalize_thread_start);
 }
+
+/* ------------------------------------------------------------------------ */
+/* Per-directory file batching                                              */
 
 /*
  * Both destination backends use the same traversal batch. SSH resolves the
@@ -513,8 +277,6 @@ typedef struct {
     const char **names;
     int *present;
     struct stat *dst_st;
-    char *getdents_buf;   /* reusable raw getdents64 buffer (0 => libc readdir) */
-    size_t getdents_cap;
 } file_scratch_t;
 
 static __thread file_scratch_t g_file_scratch;
@@ -528,19 +290,8 @@ static void file_scratch_free(void)
     free(s->names);
     free(s->present);
     free(s->dst_st);
-    free(s->getdents_buf);
     memset(s, 0, sizeof(*s));
 }
-
-/*
- * Raw getdents64 read-buffer size per traversal worker (bytes). A larger buffer
- * returns many dirents per syscall, cutting the syscall count on huge
- * directories. 0 disables the raw path and falls back to libc readdir. Set once
- * in traversal_start() from DIRECT_COPY_GETDENTS_BUF, and pinned at 0 where
- * getdents64 is unavailable. Learned from ereport's ecrawl, which uses the same
- * technique for fast metadata crawls.
- */
-static size_t g_getdents_buf_bytes;
 
 static file_scratch_t *file_scratch_get(int remote)
 {
@@ -569,115 +320,38 @@ static file_scratch_t *file_scratch_get(int remote)
             return NULL;
         }
     }
-    if (g_getdents_buf_bytes > 0 && !s->getdents_buf) {
-        /* Best-effort: on OOM leave it NULL so the reader falls back to
-         * readdir instead of failing the traversal. */
-        s->getdents_buf = malloc(g_getdents_buf_bytes);
-        if (s->getdents_buf) s->getdents_cap = g_getdents_buf_bytes;
-    }
     return s;
 }
 
-/*
- * Directory enumeration reader: raw getdents64 into the worker's reusable
- * buffer when enabled, else libc readdir. Either way the parent dir fd used for
- * fstatat/openat is handle->src_fd (unaffected); this only replaces the entry
- * stream. `stream_fd` is a private dup of src_fd whose ownership passes to the
- * reader.
- */
-#ifdef ECOPY_HAVE_GETDENTS64
-struct ecopy_dirent64 {
-    uint64_t       d_ino;
-    int64_t        d_off;
-    unsigned short d_reclen;
-    unsigned char  d_type;
-    char           d_name[];
-};
-#endif
-
+/* State for one directory while its entries are being processed. */
 typedef struct {
-    int fd;          /* getdents path stream fd; -1 => libc fallback */
-    DIR *dirp;       /* libc fallback */
-    char *buf;       /* borrowed from the worker scratch (getdents path) */
-    size_t buf_cap;
-    size_t buf_len;
-    size_t buf_off;
-} dirreader_t;
+    dir_handle_t *handle;   /* src/dst paths and descriptors, refcounted by file tasks */
+    file_scratch_t *s;
+    int n;                  /* files in the current batch */
+    int saw_file;
+    int remote;
+} trav_dir_t;
 
-/* Returns 0 on success (ownership of stream_fd taken), -1 on failure (caller
- * still owns stream_fd). */
-static int dirreader_open(dirreader_t *rd, int stream_fd, file_scratch_t *s)
+static int join_under(char *out, size_t out_sz, const char *parent, const char *name)
 {
-    rd->fd = -1;
-    rd->dirp = NULL;
-    rd->buf = NULL;
-    rd->buf_cap = rd->buf_len = rd->buf_off = 0;
-
-    if (g_getdents_buf_bytes > 0 && s->getdents_buf) {
-        rd->fd = stream_fd;
-        rd->buf = s->getdents_buf;
-        rd->buf_cap = s->getdents_cap;
-        return 0;
-    }
-    rd->dirp = fdopendir(stream_fd);
-    if (!rd->dirp) return -1;
-    return 0;
+    return path_join_fast(parent, strlen(parent), name, strlen(name), out, out_sz);
 }
 
-/* 1 = got an entry (*name_out valid until the next call), 0 = end, -1 = error. */
-static int dirreader_next(dirreader_t *rd, const char **name_out)
+static int stat_destination_batch(trav_dir_t *d, int n)
 {
-    if (rd->fd < 0) {
-        struct dirent *de = readdir(rd->dirp);
-        if (!de) return 0;
-        *name_out = de->d_name;
-        return 1;
-    }
-#ifdef ECOPY_HAVE_GETDENTS64
-    for (;;) {
-        if (rd->buf_off >= rd->buf_len) {
-            long n = syscall(SYS_getdents64, rd->fd, rd->buf, rd->buf_cap);
-            if (n < 0) { perror("getdents64"); return -1; }
-            if (n == 0) return 0;
-            rd->buf_len = (size_t)n;
-            rd->buf_off = 0;
-        }
-        struct ecopy_dirent64 *d =
-            (struct ecopy_dirent64 *)(void *)(rd->buf + rd->buf_off);
-        if (d->d_reclen == 0) return 0; /* defensive: never advance by zero */
-        rd->buf_off += d->d_reclen;
-        *name_out = d->d_name;
-        return 1;
-    }
-#else
-    /* dirreader_open() never selects the raw path without getdents64. */
-    return -1;
-#endif
-}
-
-static void dirreader_close(dirreader_t *rd)
-{
-    if (rd->fd >= 0) { close(rd->fd); rd->fd = -1; }
-    else if (rd->dirp) { closedir(rd->dirp); rd->dirp = NULL; }
-}
-
-static int stat_destination_batch(dir_handle_t *handle,
-                                  const dir_node_t *node,
-                                  file_scratch_t *s,
-                                  int n,
-                                  int remote)
-{
+    dir_handle_t *handle = d->handle;
+    file_scratch_t *s = d->s;
     int rc = 0;
 
     if (copy_policy_destination_fresh()) {
         return 0;
     }
-    if (remote) {
+    if (d->remote) {
         for (int i = 0; i < n; i++) {
             s->names[i] = s->batch[i].name;
         }
-        if (sshx_stat_bulk(node->dst, s->names, n, s->present, s->dst_st) != 0) {
-            fprintf(stderr, "Bulk stat failed under %s\n", node->dst);
+        if (sshx_stat_bulk(handle->dst, s->names, n, s->present, s->dst_st) != 0) {
+            fprintf(stderr, "Bulk stat failed under %s\n", handle->dst);
             return -1;
         }
         return 0;
@@ -691,11 +365,10 @@ static int stat_destination_batch(dir_handle_t *handle,
             s->present[i] = 0;
         } else {
             char dst_path[PATH_MAX];
-            if (join_path(dst_path, sizeof(dst_path), node->dst,
-                          s->batch[i].name) == 0) {
+            if (join_under(dst_path, sizeof(dst_path), handle->dst, s->batch[i].name) == 0) {
                 perror(dst_path);
             } else {
-                perror(node->dst);
+                perror(handle->dst);
             }
             s->present[i] = -1;
             rc = -1;
@@ -704,31 +377,31 @@ static int stat_destination_batch(dir_handle_t *handle,
     return rc;
 }
 
-static int flush_file_batch(dir_handle_t *handle,
-                            const dir_node_t *node,
-                            file_scratch_t *s,
-                            int n,
-                            int remote)
+static int flush_file_batch(trav_dir_t *d)
 {
-    file_entry_t *batch = s->batch;
+    dir_handle_t *handle = d->handle;
+    file_entry_t *batch = d->s->batch;
+    file_scratch_t *s = d->s;
     workers_batch_item_t enqueue_items[FILE_STAT_BATCH];
     int enqueue_count = 0;
+    int n = d->n;
     int rc;
 
+    d->n = 0;
     if (n == 0) {
         return 0;
     }
-    rc = stat_destination_batch(handle, node, s, n, remote);
-    if (rc != 0 && remote) {
+    rc = stat_destination_batch(d, n);
+    if (rc != 0 && d->remote) {
         return -1;
     }
 
     for (int i = 0; i < n; i++) {
         char src_path[PATH_MAX], dst_path[PATH_MAX];
 
-        if (join_path(src_path, sizeof(src_path), node->src, batch[i].name) != 0 ||
-            join_path(dst_path, sizeof(dst_path), node->dst, batch[i].name) != 0) {
-            fprintf(stderr, "Path too long under %s\n", node->src);
+        if (join_under(src_path, sizeof(src_path), handle->src, batch[i].name) != 0 ||
+            join_under(dst_path, sizeof(dst_path), handle->dst, batch[i].name) != 0) {
+            fprintf(stderr, "Path too long under %s\n", handle->src);
             rc = -1;
             continue;
         }
@@ -744,7 +417,7 @@ static int flush_file_batch(dir_handle_t *handle,
                 continue;
             }
             if (same_size_and_mtime(&batch[i].st, &s->dst_st[i])) {
-                int meta_rc = remote
+                int meta_rc = d->remote
                                   ? sshx_setmeta(dst_path, &batch[i].st, 0)
                                   : preserve_path_metadata_at(handle->dst_fd,
                                                               batch[i].name,
@@ -786,8 +459,7 @@ static int flush_file_batch(dir_handle_t *handle,
         enqueue_count++;
     }
 
-    if (workers_enqueue_batch(handle, enqueue_items,
-                              (size_t)enqueue_count) != 0) {
+    if (workers_enqueue_batch(handle, enqueue_items, (size_t)enqueue_count) != 0) {
         rc = -1;
     }
     return rc;
@@ -798,9 +470,9 @@ static int flush_file_batch(dir_handle_t *handle,
  * same link at the destination (local symlinkat / remote MSG_SYMLINK). The
  * target string is preserved verbatim, matching cp -d semantics.
  */
-static void copy_symlink_entry(dir_handle_t *handle, const dir_node_t *node,
-                               const char *name, const struct stat *st, int remote)
+static void copy_symlink_entry(trav_dir_t *d, const char *name, const struct stat *st)
 {
+    dir_handle_t *handle = d->handle;
     char target[PATH_MAX];
     ssize_t len = readlinkat(handle->src_fd, name, target, sizeof(target) - 1);
     if (len < 0) {
@@ -809,7 +481,7 @@ static void copy_symlink_entry(dir_handle_t *handle, const dir_node_t *node,
         return;
     }
     if (len >= (ssize_t)sizeof(target) - 1) {
-        fprintf(stderr, "Symlink target too long under %s/%s\n", node->src, name);
+        fprintf(stderr, "Symlink target too long under %s/%s\n", handle->src, name);
         mark_traversal_error();
         return;
     }
@@ -817,13 +489,13 @@ static void copy_symlink_entry(dir_handle_t *handle, const dir_node_t *node,
     stats_inc_symlink_seen();
 
     char dst_path[PATH_MAX];
-    if (join_path(dst_path, sizeof(dst_path), node->dst, name) != 0) {
-        fprintf(stderr, "Path too long under %s\n", node->dst);
+    if (join_under(dst_path, sizeof(dst_path), handle->dst, name) != 0) {
+        fprintf(stderr, "Path too long under %s\n", handle->dst);
         mark_traversal_error();
         return;
     }
 
-    if (remote) {
+    if (d->remote) {
         if (sshx_symlink(dst_path, target, st) != 0) {
             perror(dst_path);
             mark_traversal_error();
@@ -836,126 +508,171 @@ static void copy_symlink_entry(dir_handle_t *handle, const dir_node_t *node,
     stats_inc_symlink_created();
 }
 
-static void process_dir_entries(dir_handle_t *handle,
-                                const dir_node_t *node,
-                                int dir_stream_fd,
-                                int remote)
+/* ------------------------------------------------------------------------ */
+/* dirwalk callbacks                                                        */
+
+static void walk_thread_start(int index)
 {
-    const char *ent_name;
-    file_scratch_t *s = file_scratch_get(remote);
-    dirreader_t rd;
-    int rdrc;
-    int n = 0;
-    int saw_file = 0;
+    /* Spread mkdir/stat/symlink work across the SSH connection pool. */
+    sshx_bind_thread(index);
+}
 
-    if (!s) {
-        close(dir_stream_fd);
+static int walk_dir_begin(const dirwalk_node_t *node, int dir_fd, void **ctx)
+{
+    trav_dir_t *d;
+    char dst[PATH_MAX];
+    struct stat st = node->st;
+    int src_fd, dst_fd;
+    int remote = sshx_active();
+
+    /* Directories get the forced ownership too, not only their files. */
+    copy_policy_apply_id_override(&st);
+
+    if (dst_path_for(node->path, dst, sizeof(dst)) != 0) {
         mark_traversal_error();
-        return;
+        return -1;
     }
-    if (dirreader_open(&rd, dir_stream_fd, s) != 0) {
-        perror(node->src);
-        close(dir_stream_fd);
+    d = calloc(1, sizeof(*d));
+    if (!d) {
+        perror("calloc");
         mark_traversal_error();
-        return;
+        return -1;
+    }
+    d->remote = remote;
+    d->s = file_scratch_get(remote);
+    if (!d->s) {
+        free(d);
+        mark_traversal_error();
+        return -1;
     }
 
-    while ((rdrc = dirreader_next(&rd, &ent_name)) == 1) {
-        struct stat st;
-        char src_path[PATH_MAX], dst_path[PATH_MAX];
-
-        /* Ctrl+C: stop stat'ing/mkdir'ing further entries in this directory. */
-        if (atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed)) break;
-
-        if (!strcmp(ent_name, ".") || !strcmp(ent_name, "..")) continue;
-
-        if (!remote) {
-            if (join_path(src_path, sizeof(src_path), node->src,
-                          ent_name) != 0) {
-                fprintf(stderr, "Source path too long: %s/%s\n",
-                        node->src, ent_name);
-                mark_traversal_error();
-                continue;
-            }
-            if (path_is_same_or_child(g_dst_root, src_path)) {
-                continue;
-            }
-        }
-
-        if (fstatat(handle->src_fd, ent_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
-            perror(ent_name);
+    if (remote) {
+        /*
+         * Remote destination: no local descriptor. The directory is created
+         * lazily by its first file (PUTFILE/OPEN both mkdir -p their parent),
+         * so an explicit MKDIR is sent only for directories that turn out to
+         * hold no files -- see walk_dir_end.
+         */
+        stats_inc_dirs_created();
+        dst_fd = -1;
+    } else {
+        dst_fd = open_or_create_target_dir_path(dst, st.st_mode & 07777);
+        if (dst_fd < 0) {
+            free(d);
             mark_traversal_error();
-            continue;
-        }
-        copy_policy_apply_id_override(&st);
-
-        if (S_ISDIR(st.st_mode)) {
-            if (join_path(src_path, sizeof(src_path), node->src, ent_name) != 0 ||
-                join_path(dst_path, sizeof(dst_path), node->dst, ent_name) != 0) {
-                fprintf(stderr, "Path too long under %s\n", node->src);
-                mark_traversal_error();
-                continue;
-            }
-            pthread_mutex_lock(&g_dir_lock);
-            if (push_dir_locked(src_path, dst_path, &st, node->depth + 1) != 0) {
-                mark_traversal_error();
-            }
-            pthread_mutex_unlock(&g_dir_lock);
-        } else if (S_ISLNK(st.st_mode)) {
-            copy_symlink_entry(handle, node, ent_name, &st, remote);
-        } else if (S_ISREG(st.st_mode)) {
-            if (strlen(ent_name) >= sizeof(s->batch[0].name)) {
-                fprintf(stderr, "Name too long: %s\n", ent_name);
-                mark_traversal_error();
-                continue;
-            }
-            /*
-             * Hard-linked file: only the first sighting of an inode is copied;
-             * later links are materialized after the copy phase (see
-             * hardlinks_replay) so the data is never duplicated. Leaving
-             * saw_file untouched for a secondary lets a directory that holds
-             * only secondaries still get an explicit remote MKDIR, so the
-             * finalize SETMETA (and the later hard link) find the directory.
-             */
-            if (st.st_nlink > 1) {
-                if (join_path(dst_path, sizeof(dst_path), node->dst,
-                              ent_name) != 0) {
-                    fprintf(stderr, "Path too long under %s\n", node->dst);
-                    mark_traversal_error();
-                    continue;
-                }
-                hl_result_t hr = hardlinks_note(&st, dst_path);
-                if (hr == HL_SECONDARY) {
-                    continue;
-                }
-                if (hr == HL_ERROR) {
-                    mark_traversal_error();
-                    /* fall through and copy it as a normal file (no data loss) */
-                }
-            }
-            stats_inc_files_seen();
-            saw_file = 1;
-            snprintf(s->batch[n].name, sizeof(s->batch[n].name), "%s", ent_name);
-            s->batch[n].st = st;
-            n++;
-            if (n == FILE_STAT_BATCH) {
-                if (flush_file_batch(handle, node, s, n, remote) != 0) {
-                    mark_traversal_error();
-                }
-                n = 0;
-            }
+            return -1;
         }
     }
 
-    if (rdrc < 0) {
+    /* The handle outlives this directory's enumeration (file tasks retain it),
+     * so it needs its own descriptor; the walker closes dir_fd itself. */
+    src_fd = dup(dir_fd);
+    if (src_fd < 0) {
+        perror(node->path);
+        if (dst_fd >= 0) close(dst_fd);
+        free(d);
+        mark_traversal_error();
+        return -1;
+    }
+    d->handle = dir_handle_create(node->path, dst, src_fd, dst_fd);
+    if (!d->handle) {
+        close(src_fd);
+        if (dst_fd >= 0) close(dst_fd);
+        free(d);
+        mark_traversal_error();
+        return -1;
+    }
+
+    stats_inc_dirs_seen();
+    if (record_directory_for_finalize(node->path, dst, &st, node->depth) != 0) {
+        dir_handle_release(d->handle);
+        free(d);
+        mark_traversal_error();
+        return -1;
+    }
+
+    *ctx = d;
+    return 0;
+}
+
+static int walk_entry(const dirwalk_node_t *node, int dir_fd, void *ctx,
+                      const char *name, const struct stat *st_in)
+{
+    trav_dir_t *d = ctx;
+    struct stat st = *st_in;
+    (void)dir_fd;
+
+    copy_policy_apply_id_override(&st);
+
+    if (S_ISDIR(st.st_mode)) {
+        if (!d->remote) {
+            /* Never descend into the destination tree if it lives inside the source. */
+            char child[PATH_MAX];
+            if (join_under(child, sizeof(child), node->path, name) == 0 &&
+                path_is_under_root(child, g_dst_root)) {
+                return DIRWALK_SKIP;
+            }
+        }
+        return DIRWALK_DESCEND;
+    }
+    if (S_ISLNK(st.st_mode)) {
+        copy_symlink_entry(d, name, &st);
+        return DIRWALK_SKIP;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        return DIRWALK_SKIP;
+    }
+
+    if (strlen(name) >= sizeof(d->s->batch[0].name)) {
+        fprintf(stderr, "Name too long: %s\n", name);
+        mark_traversal_error();
+        return DIRWALK_SKIP;
+    }
+    /*
+     * Hard-linked file: only the first sighting of an inode is copied; later
+     * links are materialized after the copy phase (see hardlinks_replay) so
+     * the data is never duplicated. Leaving saw_file untouched for a secondary
+     * lets a directory that holds only secondaries still get an explicit
+     * remote MKDIR, so the finalize SETMETA (and the later hard link) find it.
+     */
+    if (st.st_nlink > 1) {
+        char dst_path[PATH_MAX];
+        if (join_under(dst_path, sizeof(dst_path), d->handle->dst, name) != 0) {
+            fprintf(stderr, "Path too long under %s\n", d->handle->dst);
+            mark_traversal_error();
+            return DIRWALK_SKIP;
+        }
+        hl_result_t hr = hardlinks_note(&st, dst_path);
+        if (hr == HL_SECONDARY) {
+            return DIRWALK_SKIP;
+        }
+        if (hr == HL_ERROR) {
+            mark_traversal_error();
+            /* fall through and copy it as a normal file (no data loss) */
+        }
+    }
+    stats_inc_files_seen();
+    d->saw_file = 1;
+    snprintf(d->s->batch[d->n].name, sizeof(d->s->batch[d->n].name), "%s", name);
+    d->s->batch[d->n].st = st;
+    d->n++;
+    if (d->n == FILE_STAT_BATCH && flush_file_batch(d) != 0) {
         mark_traversal_error();
     }
-    dirreader_close(&rd);
+    return DIRWALK_SKIP;
+}
 
-    if (flush_file_batch(handle, node, s, n, remote) != 0) {
+static void walk_dir_end(const dirwalk_node_t *node, int dir_fd, void *ctx, int rc)
+{
+    trav_dir_t *d = ctx;
+    (void)dir_fd;
+
+    if (rc != 0) {
         mark_traversal_error();
     }
-
+    if (flush_file_batch(d) != 0) {
+        mark_traversal_error();
+    }
     /*
      * A directory that holds at least one file is materialized by that file's
      * PUTFILE/OPEN (both mkdir -p their parent), so the explicit MKDIR would be
@@ -964,151 +681,30 @@ static void process_dir_entries(dir_handle_t *handle,
      * guarantees empty subtrees are still created. The finalize SETMETA later
      * fixes the mode/times of every directory regardless of how it was made.
      */
-    if (remote && !saw_file) {
-        if (sshx_mkdir(node->dst, node->src_st.st_mode & 07777) != 0) {
-            perror(node->dst);
+    if (d->remote && !d->saw_file) {
+        if (sshx_mkdir(d->handle->dst, node->st.st_mode & 07777) != 0) {
+            perror(d->handle->dst);
             mark_traversal_error();
         }
     }
+    dir_handle_release(d->handle);
+    free(d);
 }
 
-static dir_node_t *pop_dir_locked(void)
+static void walk_error(const char *path)
 {
-    dir_node_t *node = g_dir_head;
-    if (!node) {
-        return NULL;
-    }
-    g_dir_head = node->next;
-    if (!g_dir_head) {
-        g_dir_tail = NULL;
-    }
-    node->next = NULL;
-    return node;
+    (void)path;
+    mark_traversal_error();
 }
 
-static void process_directory_node(dir_node_t *node)
+/* ------------------------------------------------------------------------ */
+/* Public API                                                               */
+
+int traversal_start(const char *src_dir, const char *dst_dir)
 {
-    struct stat st;
-    dir_handle_t *handle;
-    int src_fd;
-    int dst_fd;
-    int dir_stream_fd;
-
-    /*
-     * Open the source and destination directory descriptors now, only while
-     * this directory is actually being processed. The queue itself holds no
-     * open descriptors, so a single parent with millions of subdirectories no
-     * longer keeps millions of descriptors open at once.
-     */
-    src_fd = open_verified_source_dir_path(node->src, &node->src_st);
-    if (src_fd < 0) {
-        mark_traversal_error();
-        return;
-    }
-    if (fstat(src_fd, &st) != 0) {
-        perror(node->src);
-        close(src_fd);
-        mark_traversal_error();
-        return;
-    }
-    if (sshx_active()) {
-        /*
-         * Remote destination: no local descriptor. The directory is created
-         * lazily by its first file (PUTFILE/OPEN both mkdir -p their parent),
-         * so we only send an explicit MKDIR for directories that turn out to
-         * hold no files -- see process_dir_entries_remote. There is no local
-         * destination fd.
-         */
-        stats_inc_dirs_created();
-        dst_fd = -1;
-    } else {
-        dst_fd = open_or_create_target_dir_path(node->dst, node->src_st.st_mode & 07777);
-        if (dst_fd < 0) {
-            close(src_fd);
-            mark_traversal_error();
-            return;
-        }
-    }
-    handle = dir_handle_create(node->src, node->dst, src_fd, dst_fd);
-    if (!handle) {
-        close(src_fd);
-        close(dst_fd);
-        mark_traversal_error();
-        return;
-    }
-
-    stats_inc_dirs_seen();
-    if (record_directory_for_finalize(node->src, node->dst, &st, node->depth) != 0) {
-        dir_handle_release(handle);
-        mark_traversal_error();
-        return;
-    }
-
-    /*
-     * A private dup of src_fd for enumeration: the reader consumes its file
-     * offset (getdents64 or fdopendir/readdir), while src_fd keeps serving
-     * offset-independent fstatat/openat for the entries. Ownership passes to
-     * process_dir_entries, which closes it via the reader.
-     */
-    dir_stream_fd = dup(handle->src_fd);
-    if (dir_stream_fd < 0) {
-        perror(node->src);
-        dir_handle_release(handle);
-        mark_traversal_error();
-        return;
-    }
-
-    process_dir_entries(handle, node, dir_stream_fd, sshx_active());
-    dir_handle_release(handle);
-}
-
-static void *traversal_worker_main(void *arg)
-{
-    /* Spread mkdir/stat/symlink work across the SSH connection pool. */
-    sshx_bind_thread((int)(intptr_t)arg);
-
-    for (;;) {
-        dir_node_t *node;
-
-        pthread_mutex_lock(&g_dir_lock);
-        for (;;) {
-            /* Ctrl+C: stop scanning immediately; queued dir nodes are
-             * reclaimed when the process exits. */
-            if (atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed)) {
-                pthread_mutex_unlock(&g_dir_lock);
-                file_scratch_free();
-                return NULL;
-            }
-            node = pop_dir_locked();
-            if (node) {
-                g_dir_active++;
-                break;
-            }
-            if (g_dir_done) {
-                pthread_mutex_unlock(&g_dir_lock);
-                file_scratch_free();
-                return NULL;
-            }
-            pthread_cond_wait(&g_dir_cond, &g_dir_lock);
-        }
-        pthread_mutex_unlock(&g_dir_lock);
-
-        process_directory_node(node);
-        free_dir_node(node);
-
-        pthread_mutex_lock(&g_dir_lock);
-        g_dir_active--;
-        if (!g_dir_head && g_dir_active == 0) {
-            g_dir_done = 1;
-            pthread_cond_broadcast(&g_dir_cond);
-        }
-        pthread_mutex_unlock(&g_dir_lock);
-    }
-}
-
-int traversal_start(const char *src_dir, const char *dst_dir) {
-    int i;
     struct stat root_st;
+    dirwalk_cfg_t cfg;
+    dirwalk_ops_t ops;
 
     pthread_mutex_lock(&g_status_lock);
     g_status = 0;
@@ -1120,6 +716,7 @@ int traversal_start(const char *src_dir, const char *dst_dir) {
         copy_path_checked(g_dst_root, sizeof(g_dst_root), dst_dir, "Target root") != 0) {
         return -1;
     }
+    g_src_root_len = strlen(g_src_root);
 
     if (lstat(g_src_root, &root_st) != 0) {
         perror(g_src_root);
@@ -1133,6 +730,9 @@ int traversal_start(const char *src_dir, const char *dst_dir) {
 
     g_traversal_workers = env_int_or_default("DIRECT_COPY_TRAVERSAL_WORKERS", 8, 1, 128);
 
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.threads = g_traversal_workers;
+    cfg.stop = &g_shutdown_requested;
     /*
      * Raw getdents64 read-buffer size (bytes) per traversal worker; 0 falls
      * back to libc readdir. Default 256 KiB returns thousands of entries per
@@ -1140,76 +740,34 @@ int traversal_start(const char *src_dir, const char *dst_dir) {
      */
 #ifdef ECOPY_HAVE_GETDENTS64
     {
-        int v = env_int_or_default("DIRECT_COPY_GETDENTS_BUF", 262144, 0,
-                                   64 * 1024 * 1024);
+        int v = env_int_or_default("DIRECT_COPY_GETDENTS_BUF", 262144, 0, 64 * 1024 * 1024);
         if (v > 0 && v < 4096) v = 4096;
-        g_getdents_buf_bytes = (size_t)v;
+        cfg.getdents_buf = (size_t)v;
     }
 #else
-    g_getdents_buf_bytes = 0;
+    cfg.getdents_buf = 0;
 #endif
 
-    g_threads = calloc((size_t)g_traversal_workers, sizeof(*g_threads));
-    if (!g_threads) {
-        perror("calloc");
-        return -1;
-    }
+    memset(&ops, 0, sizeof(ops));
+    ops.thread_start = walk_thread_start;
+    ops.thread_end = file_scratch_free;
+    ops.dir_begin = walk_dir_begin;
+    ops.entry = walk_entry;
+    ops.dir_end = walk_dir_end;
+    ops.error = walk_error;
 
-    pthread_mutex_lock(&g_dir_lock);
-    g_dir_head = NULL;
-    g_dir_tail = NULL;
-    g_dir_active = 0;
-    g_dir_done = 0;
-    if (push_dir_locked(g_src_root, g_dst_root, &root_st, 0) != 0) {
-        pthread_mutex_unlock(&g_dir_lock);
-        free(g_threads);
-        g_threads = NULL;
-        return -1;
-    }
-    pthread_mutex_unlock(&g_dir_lock);
-
-    for (i = 0; i < g_traversal_workers; i++) {
-        if (pthread_create(&g_threads[i], NULL, traversal_worker_main,
-                           (void *)(intptr_t)i) != 0) {
-            perror("pthread_create");
-            pthread_mutex_lock(&g_dir_lock);
-            g_dir_done = 1;
-            pthread_cond_broadcast(&g_dir_cond);
-            pthread_mutex_unlock(&g_dir_lock);
-            while (--i >= 0) {
-                pthread_join(g_threads[i], NULL);
-            }
-            /* If no worker ever started, the queued root node is still here. */
-            pthread_mutex_lock(&g_dir_lock);
-            while (g_dir_head) {
-                free_dir_node(pop_dir_locked());
-            }
-            pthread_mutex_unlock(&g_dir_lock);
-            free(g_threads);
-            g_threads = NULL;
-            return -1;
-        }
-    }
-    return 0;
+    return dirwalk_start(g_src_root, &root_st, &cfg, &ops);
 }
 
 void traversal_wait(void)
 {
-    int i;
-    for (i = 0; i < g_traversal_workers; i++) {
-        pthread_join(g_threads[i], NULL);
-    }
-    free(g_threads);
-    g_threads = NULL;
+    dirwalk_wait();
     stats_set_traversal_done();
 }
 
 void traversal_request_stop(void)
 {
-    pthread_mutex_lock(&g_dir_lock);
-    g_dir_done = 1;
-    pthread_cond_broadcast(&g_dir_cond);
-    pthread_mutex_unlock(&g_dir_lock);
+    dirwalk_request_stop();
 }
 
 int traversal_finalize_metadata(void)

@@ -703,8 +703,7 @@ static int open_self_executable(void)
         return -1;
     }
     char resolved[PATH_MAX];
-    if (!realpath(raw, resolved)) {
-        perror(raw);
+    if (path_resolve_existing(raw, resolved, NULL) != 0) {
         return -1;
     }
     int fd = open(resolved, O_RDONLY | O_CLOEXEC);

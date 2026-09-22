@@ -20,7 +20,6 @@
 #include "types.h"
 #include "config.h"
 #include "shutdown.h"
-#include "path_canon.h"
 #include "path_utils.h"
 
 #include <stdio.h>
@@ -34,6 +33,14 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
+
+/* Runs on the shutdown watcher thread after the first SIGINT/SIGTERM. */
+static void ecopy_stop_all(void)
+{
+    traversal_request_stop();
+    workers_request_stop();
+    verify_request_stop();
+}
 
 static void usage(const char *prog) {
     fprintf(stderr,
@@ -307,8 +314,7 @@ static int to_canonical_requested_dir_path(const char *in, char *out, size_t out
                 fprintf(stderr, "Target path component exists but is not a directory: %s\n", probe);
                 return -1;
             }
-            if (!realpath(probe, parent_real)) {
-                perror(probe);
+            if (path_resolve_existing(probe, parent_real, NULL) != 0) {
                 return -1;
             }
             if (join_parent_suffix(parent_real, suffix, out, out_sz) != 0) {
@@ -561,7 +567,7 @@ int main(int argc, char **argv) {
     uint32_t gid_override = 0;
     ssh_target_t target;
 
-    shutdown_install_handlers();
+    shutdown_install_handlers(ecopy_stop_all);
 
     /* Hidden remote peer mode: `ecopy --server <root>`. */
     if (argc == 3 && strcmp(argv[1], "--server") == 0) {
@@ -902,7 +908,7 @@ int main(int argc, char **argv) {
         progress_stop();
         stats_set_shutdown_done();
         printf("\n");
-        if (atomic_load(&g_ecopy_shutdown)) {
+        if (atomic_load(&g_shutdown_requested)) {
             printf("Interrupted.\n");
             return 130;
         }
@@ -953,7 +959,7 @@ int main(int argc, char **argv) {
     }
     workers_stop();
 
-    if (atomic_load(&g_ecopy_shutdown)) {
+    if (atomic_load(&g_shutdown_requested)) {
         /*
          * Ctrl+C: the destination is incomplete by definition, so skip hard
          * link replay, metadata finalization, and verification; just stop the

@@ -114,19 +114,23 @@ make edelete
 ./edelete --uid 1234 --delete /scratch/shared       # only that owner's entries
 ```
 
-Symlinks are never followed, and deletion never ascends above the start path. Thread count:
-`EDELETE_THREADS` (default 16); `EDELETE_MAX_UNLINK_INFLIGHT` caps concurrent `unlink` calls
-(default 256, `0` = unlimited); `EDELETE_FANOUT_MIN_BYTES` (default 64 MiB, `0` = off) queues
-files at least that large for parallel unlink via the work queue instead of inline.
+Symlinks are never followed, and deletion never ascends above the start path. It works like `ecopy`:
+walker threads scan directories and hand each directory's matches, as a batch, to a separate pool of
+unlink threads, so a slow `unlink` never stalls the scan.
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `EDELETE_THREADS` | 16 | Threads scanning directories (and removing empty ones afterwards) |
+| `EDELETE_MAX_UNLINK_INFLIGHT` | 16 | Unlink threads, i.e. the most `unlink` calls in flight at once |
 
 Quota'd XFS: every `unlink` of one owner's files serializes on that owner's dquot mutex, so more
-threads make it *slower* (kernel time in `osq_lock` / `mutex_spin_on_owner`). Cap
-`EDELETE_MAX_UNLINK_INFLIGHT` (2–4 is often best when deleting one user's tree); traversal
-parallelism (`EDELETE_THREADS`) can stay high. Find the knee with:
+unlink threads make it *slower* (kernel time in `osq_lock` / `mutex_spin_on_owner`). Lower
+`EDELETE_MAX_UNLINK_INFLIGHT` (2–4 is often best when deleting one user's tree) and leave
+`EDELETE_THREADS` high. Find the knee with:
 
 ```bash
 for n in 1 2 4 8 16; do
-  EDELETE_THREADS=$n EDELETE_MAX_UNLINK_INFLIGHT=$n ./edelete --delete --force <path> 2>/dev/null \
+  EDELETE_MAX_UNLINK_INFLIGHT=$n ./edelete --delete --force <path> 2>/dev/null \
   | awk -F= -v n=$n '/^deleted_files=/{d=$2} /^elapsed_sec=/{e=$2} END{printf "inflight=%s rate=%.0f/s\n", n, e>0?d/e:0}'
 done
 ```

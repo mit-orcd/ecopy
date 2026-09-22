@@ -18,9 +18,7 @@
 #include <limits.h>
 #include "verify.h"
 
-#ifndef PATH_MAX
-#define PATH_MAX 4096
-#endif
+#include "path_utils.h"
 
 typedef struct {
     char user[256];   /* may be empty */

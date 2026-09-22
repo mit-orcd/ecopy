@@ -38,11 +38,8 @@
 #include <time.h>
 #include <pthread.h>
 #include <stdatomic.h>
-#include <stdatomic.h>
 
-#ifndef PATH_MAX
-#define PATH_MAX 4096
-#endif
+#include "path_utils.h"
 
 /*
  * O_PATH yields a lightweight directory handle usable only as the dirfd of *at
@@ -1323,7 +1320,7 @@ static int handle_stat_bulk(uint64_t id, const uint8_t *payload, uint32_t plen)
         char name[PATH_MAX];
         if (pdec_str(&d, name, sizeof(name)) != 0) { free(rbuf); return reply_status(id, -EINVAL); }
         char full[PATH_MAX];
-        if (base_ok && snprintf(full, sizeof(full), "%s/%s", base, name) < (int)sizeof(full)) {
+        if (base_ok && path_join_fast(base, strlen(base), name, strlen(name), full, sizeof(full)) == 0) {
             encode_stat(&e, full);
         } else {
             penc_u8(&e, 0); penc_u32(&e, 0); penc_i64(&e, 0); penc_i64(&e, 0); penc_i64(&e, 0);

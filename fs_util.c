@@ -8,6 +8,7 @@
 #define _GNU_SOURCE
 #include "compat.h"
 #include "fs_util.h"
+#include "env_util.h"
 #include "copy_policy.h"
 #include "config.h"
 #include "stats.h"
@@ -249,20 +250,14 @@ int copy_file_range_enabled(void) {
     return g_copy_file_range_enabled;
 }
 
-static int env_disable_flag(const char *name)
-{
-    const char *env = getenv(name);
-    return env && *env && strcmp(env, "0") != 0;
-}
-
 int direct_io_enabled(void) {
     return read_direct_io_enabled() && write_direct_io_enabled();
 }
 
 static void init_read_direct_io_enabled(void)
 {
-    if (env_disable_flag("DIRECT_COPY_DISABLE_READ_DIRECT_IO") ||
-        env_disable_flag("DIRECT_COPY_DISABLE_DIRECT_IO")) {
+    if (env_flag_set("DIRECT_COPY_DISABLE_READ_DIRECT_IO") ||
+        env_flag_set("DIRECT_COPY_DISABLE_DIRECT_IO")) {
         g_read_direct_io_enabled = 0;
     } else {
         g_read_direct_io_enabled = 1;
@@ -277,8 +272,8 @@ int read_direct_io_enabled(void)
 
 static void init_write_direct_io_enabled(void)
 {
-    if (env_disable_flag("DIRECT_COPY_DISABLE_WRITE_DIRECT_IO") ||
-        env_disable_flag("DIRECT_COPY_DISABLE_DIRECT_IO")) {
+    if (env_flag_set("DIRECT_COPY_DISABLE_WRITE_DIRECT_IO") ||
+        env_flag_set("DIRECT_COPY_DISABLE_DIRECT_IO")) {
         g_write_direct_io_enabled = 0;
     } else {
         g_write_direct_io_enabled = 1;

@@ -8,6 +8,7 @@
 #define _GNU_SOURCE
 #include "compat.h"
 #include "workers.h"
+#include "env_util.h"
 #include "config.h"
 #include "types.h"
 #include "stats.h"
@@ -313,46 +314,6 @@ static void normalize_large_pipeline_config(int requested_readers, int requested
     g_large_reader_count = requested_readers;
     g_large_writer_count = requested_writers;
     g_large_worker_count = requested_total;
-}
-
-static int env_int_or_default(const char *name, int defval, int minval, int maxval)
-{
-    const char *s = getenv(name);
-    if (!s || !*s) {
-        return defval;
-    }
-
-    errno = 0;
-    char *end = NULL;
-    long v = strtol(s, &end, 10);
-
-    if (errno != 0 || end == s || *end != '\0') {
-        fprintf(stderr,
-                "Warning: %s=%s is invalid; using default %d.\n",
-                name,
-                s,
-                defval);
-        return defval;
-    }
-    if (v < minval) {
-        fprintf(stderr,
-                "Warning: %s=%ld is below minimum %d; using %d.\n",
-                name,
-                v,
-                minval,
-                minval);
-        return minval;
-    }
-    if (v > maxval) {
-        fprintf(stderr,
-                "Warning: %s=%ld exceeds maximum %d; using %d.\n",
-                name,
-                v,
-                maxval,
-                maxval);
-        return maxval;
-    }
-    return (int)v;
 }
 
 static void init_runtime_config(void)
@@ -1599,7 +1560,7 @@ static void *large_reader_main(void *arg)
         pthread_mutex_lock(&ctx->lock);
         /* Ctrl+C unwinds a multi-GB file through the normal failure teardown
          * (buffers reclaimed, temp file unlinked) instead of copying on. */
-        if (atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed) &&
+        if (atomic_load_explicit(&g_shutdown_requested, memory_order_relaxed) &&
             !ctx->failed) {
             mark_large_file_failed_locked(ctx);
         }
@@ -1719,7 +1680,7 @@ static void *large_writer_main(void *arg)
         int i;
 
         pthread_mutex_lock(&ctx->lock);
-        if (atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed) &&
+        if (atomic_load_explicit(&g_shutdown_requested, memory_order_relaxed) &&
             !ctx->failed) {
             mark_large_file_failed_locked(ctx);
         }
@@ -1734,7 +1695,7 @@ static void *large_writer_main(void *arg)
         }
 
         /* On shutdown do not keep writing already-read buffers. */
-        if (atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed) ||
+        if (atomic_load_explicit(&g_shutdown_requested, memory_order_relaxed) ||
             (ctx->failed && !ctx->ready_head) || (!ctx->ready_head && ctx->read_done)) {
             ctx->active_writers--;
             pthread_mutex_unlock(&ctx->lock);
@@ -2134,7 +2095,7 @@ static work_claim_t dequeue_work(file_task_t **stash, int *stash_head,
     memset(&claim, 0, sizeof(claim));
 
     if (*stash_head < *stash_count &&
-        !atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed)) {
+        !atomic_load_explicit(&g_shutdown_requested, memory_order_relaxed)) {
         claim.kind = WORK_SMALL_FILE;
         claim.file_task = stash[(*stash_head)++];
         return claim;
@@ -2142,7 +2103,7 @@ static work_claim_t dequeue_work(file_task_t **stash, int *stash_head,
 
     pthread_mutex_lock(&g_queue_lock);
 
-    if (atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed)) {
+    if (atomic_load_explicit(&g_shutdown_requested, memory_order_relaxed)) {
         /*
          * Ctrl+C: abandon instead of drain. Recycle the stash remainder and
          * wake any producer parked on a full queue so it can observe the
@@ -2167,7 +2128,7 @@ static work_claim_t dequeue_work(file_task_t **stash, int *stash_head,
     for (;;) {
         int total_slots_used = total_worker_slots_used_locked();
 
-        if (atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed)) {
+        if (atomic_load_explicit(&g_shutdown_requested, memory_order_relaxed)) {
             /* Parked worker woken by workers_request_stop(): leave queued
              * work for workers_stop() to free and wake producers so they
              * can unwind too. */
@@ -2349,7 +2310,7 @@ static int copy_file_remote(file_task_t *task, uint64_t *payload_bytes)
     if (sparse) {
         off_t pos = 0;
         while (pos < size &&
-               !atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed)) {
+               !atomic_load_explicit(&g_shutdown_requested, memory_order_relaxed)) {
             off_t data = lseek(fd_in, pos, SEEK_DATA);
             if (data < 0) {
                 if (errno == ENXIO) break;
@@ -2379,7 +2340,7 @@ static int copy_file_remote(file_task_t *task, uint64_t *payload_bytes)
             }
             pos = hole;
         }
-        if (atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed)) {
+        if (atomic_load_explicit(&g_shutdown_requested, memory_order_relaxed)) {
             goto out;
         }
         if (sshx_file_ftruncate(f, size) != 0) {
@@ -2388,7 +2349,7 @@ static int copy_file_remote(file_task_t *task, uint64_t *payload_bytes)
     } else {
         off_t pos = 0;
         while (pos < size &&
-               !atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed)) {
+               !atomic_load_explicit(&g_shutdown_requested, memory_order_relaxed)) {
             /* Chunk-aligned count keeps O_DIRECT reads valid up to EOF. */
             ssize_t r = pread_nocancel(fd_in, buf, chunk, pos);
             if (r < 0) { perror("pread"); goto out; }
@@ -2398,7 +2359,7 @@ static int copy_file_remote(file_task_t *task, uint64_t *payload_bytes)
             record_progress_bytes((uint64_t)r, 1);
             if (payload_bytes) *payload_bytes += (uint64_t)r;
         }
-        if (atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed)) {
+        if (atomic_load_explicit(&g_shutdown_requested, memory_order_relaxed)) {
             goto out;
         }
     }
@@ -2789,14 +2750,14 @@ int workers_enqueue_batch(dir_handle_t *dir,
         pthread_mutex_lock(&g_queue_lock);
         while ((int)(g_small_ring.len + g_large_heap.len) >=
                g_max_queued_files &&
-               !atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed)) {
+               !atomic_load_explicit(&g_shutdown_requested, memory_order_relaxed)) {
             uint64_t wait_start_ns = g_collect_wait_timing ? monotonic_ns() : 0;
             pthread_cond_wait(&g_space_cond, &g_queue_lock);
             if (g_collect_wait_timing) {
                 stats_record_queue_wait_ns(monotonic_ns() - wait_start_ns);
             }
         }
-        if (atomic_load_explicit(&g_ecopy_shutdown, memory_order_relaxed)) {
+        if (atomic_load_explicit(&g_shutdown_requested, memory_order_relaxed)) {
             pthread_mutex_unlock(&g_queue_lock);
             errno = ECANCELED;
             goto fail;

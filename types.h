@@ -15,9 +15,7 @@
 #include <sys/types.h>
 #include <time.h>
 
-#ifndef PATH_MAX
-#define PATH_MAX 4096
-#endif
+#include "path_utils.h"
 
 typedef struct dir_handle {
     char src[PATH_MAX];
