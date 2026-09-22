@@ -12,11 +12,14 @@
  * the start path is ever touched.
  *
  * Structure mirrors ecopy: walker threads enumerate and stat; eligible paths
- * go onto a bounded queue drained by a separate pool of unlink threads, so a
- * slow unlink (quota accounting, ZFS block frees) never stalls the scan and
- * the number of concurrent unlinks is an explicit knob. After the walk, in
- * delete mode, directories that became empty are removed deepest-first, in
- * parallel per depth level, up to and including the start path.
+ * go onto bounded per-worker queues drained by a separate pool of unlink
+ * threads, so a slow unlink (quota accounting, ZFS block frees) never stalls
+ * the scan and the number of concurrent unlinks is an explicit knob. Each
+ * directory is pinned to one unlink thread (hash of its path), because the
+ * kernel serializes unlinks within a directory. After the walk, in delete
+ * mode, directories that became empty are removed deepest-first, in parallel
+ * per depth level with each parent's children on one thread, up to and
+ * including the start path.
  */
 
 #define _GNU_SOURCE
@@ -44,7 +47,7 @@
 
 #define DEFAULT_THREADS        16
 #define DEFAULT_UNLINK_WORKERS 16
-#define UNLINK_QUEUE_MAX       262144   /* backpressure cap on queued unlinks */
+#define UNLINK_QUEUE_MAX       262144   /* backpressure cap on queued unlinks, split across workers */
 #define GETDENTS_BUF_BYTES     (256 * 1024)
 #define WINDOW_SECONDS         10
 
@@ -107,12 +110,46 @@ static void status_stop(void)
     pthread_mutex_unlock(&g_status_lock);
 }
 
+/*
+ * Walker-side counters are accumulated per thread and folded into the shared
+ * atomics every COUNTER_FLUSH entries, at the end of each directory, and when
+ * the thread exits. With 16 walkers doing four contended RMWs per entry the
+ * shared cache lines bounced enough to show walk_entry at ~3% of a delete
+ * profile; the status line only reads once a second, so batching costs
+ * nothing visible.
+ */
+#define COUNTER_FLUSH 256
+
+typedef struct {
+    unsigned long long entries;
+    unsigned long long dirs;
+    unsigned long long files;
+    unsigned long long would_delete;
+} tls_counters_t;
+
+static __thread tls_counters_t t_cnt;
+
+static void counters_flush(void)
+{
+    tls_counters_t *c = &t_cnt;
+
+    if (c->entries) {
+        int idx = atomic_load_explicit(&g_bucket_index, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_entries, c->entries, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_window_entries, c->entries, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_bucket_entries[idx], c->entries, memory_order_relaxed);
+    }
+    if (c->dirs) atomic_fetch_add_explicit(&g_dirs, c->dirs, memory_order_relaxed);
+    if (c->files) atomic_fetch_add_explicit(&g_files, c->files, memory_order_relaxed);
+    if (c->would_delete) {
+        atomic_fetch_add_explicit(&g_would_delete, c->would_delete, memory_order_relaxed);
+    }
+    memset(c, 0, sizeof(*c));
+}
+
 static void count_entry(void)
 {
-    int idx = atomic_load_explicit(&g_bucket_index, memory_order_relaxed);
-    atomic_fetch_add_explicit(&g_entries, 1, memory_order_relaxed);
-    atomic_fetch_add_explicit(&g_window_entries, 1, memory_order_relaxed);
-    atomic_fetch_add_explicit(&g_bucket_entries[idx], 1, memory_order_relaxed);
+    if (++t_cnt.entries >= COUNTER_FLUSH) counters_flush();
 }
 
 static void count_error(void)
@@ -157,28 +194,76 @@ static int eligible(const struct stat *st)
  * UNLINK_BATCH names from one directory, packed NUL-separated. A worker opens
  * the directory once (O_NOFOLLOW) and unlinkat()s each name relative to it, so
  * no path is re-walked per file and a symlinked-in component is never
- * followed. Just as important, consecutive files of one directory land on one
- * worker instead of being sprayed across all of them, which would make every
- * unlink thread contend on that directory's inode lock.
+ * followed.
+ *
+ * Every worker owns its own queue, and an item is routed to the worker chosen
+ * by hashing its directory path. Hence all names of one directory, however
+ * many batches the walker split them into, are unlinked by a single thread.
+ * The kernel serializes unlinks within a directory anyway (the parent's
+ * i_rwsem is taken exclusively per unlink, and XFS adds a per-AG unlinked-list
+ * lock), so spreading one directory over several workers buys no parallelism
+ * — it only makes every unlink thread spin, sleep and wake on that lock. A
+ * profile of a shared-FIFO version on a 281k-file tree showed ~19% of all CPU
+ * in rwsem_down_write_slowpath and another ~12% in scheduler load-balancing
+ * caused by the resulting 94k context switches/s. Distinct directories still
+ * run in parallel across workers.
+ *
+ * Backpressure is per worker: a walker whose current directory hashes to a
+ * full queue blocks until that worker catches up, which is exactly the
+ * directory the walker cannot usefully run ahead of.
+ *
+ * Containment. The names in an item were read from one specific directory
+ * inode; they must only ever be unlinked from that inode. The worker reopens
+ * the directory by path, and O_NOFOLLOW protects just the last component: if
+ * an intermediate component were swapped for a symlink between the scan and
+ * the unlink, the path would resolve somewhere else. So every item carries the
+ * directory's (st_dev, st_ino) as seen by the walker's verified open, and the
+ * worker refuses the whole batch when the reopened directory is not that
+ * inode. Same rule as the walker's open_verified_dir(), applied on the way out.
  */
 #define UNLINK_BATCH        512
 #define UNLINK_BATCH_BYTES  (64 * 1024)
+#define UNLINK_QUEUE_MIN_PER_WORKER (4 * UNLINK_BATCH)
 
 typedef struct unlink_item {
     struct unlink_item *next;
     int count;
     size_t dir_len;
+    dev_t dir_dev;  /* identity of the directory the names came from */
+    ino_t dir_ino;
     char data[];   /* dir path, NUL, then `count` NUL-terminated names */
 } unlink_item_t;
 
-static pthread_mutex_t g_uq_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t g_uq_not_empty = PTHREAD_COND_INITIALIZER;
-static pthread_cond_t g_uq_not_full = PTHREAD_COND_INITIALIZER;
-static unlink_item_t *g_uq_head = NULL;
-static unlink_item_t *g_uq_tail = NULL;
-static size_t g_uq_files = 0;       /* names queued, for backpressure */
-static int g_uq_closed = 0;
-static pthread_t *g_unlink_threads = NULL;
+/* Test hooks (undocumented, only read when set): delays that widen the
+ * window between scan and unlink / before the rmdir pass, so the smoke suite
+ * can swap a directory for a symlink in between and check that the workers
+ * refuse it. Zero in normal use; costs one integer compare per batch. */
+static int g_test_unlink_delay_ms = 0;
+static int g_test_rmdir_delay_ms = 0;
+
+static void test_delay(int ms)
+{
+    if (ms > 0) {
+        struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+}
+
+typedef struct {
+    pthread_mutex_t lock;
+    pthread_cond_t not_empty;
+    pthread_cond_t not_full;
+    unlink_item_t *head;
+    unlink_item_t *tail;
+    size_t files;          /* names queued, for backpressure */
+    int waiters;           /* walkers blocked in push() on this queue */
+    pthread_t tid;
+} unlink_queue_t;
+
+static unlink_queue_t *g_uq = NULL;
+static int g_uq_count = 0;
+static size_t g_uq_cap_per_worker = UNLINK_QUEUE_MAX;
+static int g_uq_closed = 0;    /* set once, under every queue's lock */
 static int g_unlink_threads_started = 0;
 
 static int stopping(void)
@@ -186,34 +271,55 @@ static int stopping(void)
     return atomic_load_explicit(&g_shutdown_requested, memory_order_relaxed);
 }
 
-/* Walker side. Blocks while the queue is full; drops the item on shutdown. */
+/* FNV-1a over the directory path: cheap, and any spread is good enough. */
+static unsigned unlink_queue_index_for(const char *dir, size_t dir_len)
+{
+    uint64_t h = UINT64_C(1469598103934665603);
+    size_t i;
+
+    for (i = 0; i < dir_len; i++) {
+        h ^= (unsigned char)dir[i];
+        h *= UINT64_C(1099511628211);
+    }
+    return (unsigned)(h % (uint64_t)g_uq_count);
+}
+
+/* Walker side. Blocks while that worker's queue is full; drops the item on
+ * shutdown. */
 static void unlink_queue_push(unlink_item_t *it)
 {
-    pthread_mutex_lock(&g_uq_lock);
-    while (g_uq_files >= UNLINK_QUEUE_MAX && !g_uq_closed && !stopping()) {
-        pthread_cond_wait(&g_uq_not_full, &g_uq_lock);
+    unlink_queue_t *q = &g_uq[unlink_queue_index_for(it->data, it->dir_len)];
+
+    pthread_mutex_lock(&q->lock);
+    while (q->files >= g_uq_cap_per_worker && !g_uq_closed && !stopping()) {
+        q->waiters++;
+        pthread_cond_wait(&q->not_full, &q->lock);
+        q->waiters--;
     }
     if (g_uq_closed || stopping()) {
-        pthread_mutex_unlock(&g_uq_lock);
+        pthread_mutex_unlock(&q->lock);
         free(it);
         return;
     }
     it->next = NULL;
-    if (g_uq_tail) g_uq_tail->next = it;
-    else g_uq_head = it;
-    g_uq_tail = it;
-    g_uq_files += (size_t)it->count;
-    pthread_cond_signal(&g_uq_not_empty);
-    pthread_mutex_unlock(&g_uq_lock);
+    if (q->tail) q->tail->next = it;
+    else q->head = it;
+    q->tail = it;
+    q->files += (size_t)it->count;
+    pthread_cond_signal(&q->not_empty);
+    pthread_mutex_unlock(&q->lock);
 }
 
 static void unlink_batch_run(const unlink_item_t *it)
 {
     const char *dir = it->data;
     const char *name = dir + it->dir_len + 1;
-    int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    int i;
+    struct stat st;
+    unsigned long long deleted = 0;
+    int fd, i;
 
+    test_delay(g_test_unlink_delay_ms);
+    fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) {
         if (errno != ENOENT) {
             fprintf(stderr, "edelete: open %s: %s\n", dir, strerror(errno));
@@ -221,9 +327,18 @@ static void unlink_batch_run(const unlink_item_t *it)
         }
         return;
     }
+    if (fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode) ||
+        st.st_dev != it->dir_dev || st.st_ino != it->dir_ino) {
+        fprintf(stderr,
+                "edelete: %s: directory changed since the scan; %d name(s) not unlinked\n",
+                dir, it->count);
+        count_error();
+        close(fd);
+        return;
+    }
     for (i = 0; i < it->count; i++) {
         if (unlinkat(fd, name, 0) == 0) {
-            atomic_fetch_add_explicit(&g_deleted, 1, memory_order_relaxed);
+            deleted++;
         } else if (errno != ENOENT) {
             fprintf(stderr, "edelete: unlink %s/%s: %s\n", dir, name, strerror(errno));
             count_error();
@@ -231,31 +346,48 @@ static void unlink_batch_run(const unlink_item_t *it)
         name += strlen(name) + 1;
     }
     close(fd);
+    if (deleted) {
+        atomic_fetch_add_explicit(&g_deleted, deleted, memory_order_relaxed);
+    }
 }
 
+/*
+ * Each wakeup takes the whole queued list in one lock acquisition, then works
+ * through it lock-free; items still unprocessed when a stop is requested are
+ * dropped. The walker side is only woken when someone is actually blocked.
+ */
 static void *unlink_worker_main(void *arg)
 {
-    (void)arg;
+    unlink_queue_t *q = (unlink_queue_t *)arg;
+
     for (;;) {
         unlink_item_t *it;
+        int wake_pushers;
 
-        pthread_mutex_lock(&g_uq_lock);
-        while (!g_uq_head && !g_uq_closed && !stopping()) {
-            pthread_cond_wait(&g_uq_not_empty, &g_uq_lock);
+        pthread_mutex_lock(&q->lock);
+        while (!q->head && !g_uq_closed && !stopping()) {
+            pthread_cond_wait(&q->not_empty, &q->lock);
         }
-        it = g_uq_head;
+        it = q->head;
         if (!it || stopping()) {
-            pthread_mutex_unlock(&g_uq_lock);
+            pthread_mutex_unlock(&q->lock);
             return NULL;
         }
-        g_uq_head = it->next;
-        if (!g_uq_head) g_uq_tail = NULL;
-        g_uq_files -= (size_t)it->count;
-        pthread_cond_broadcast(&g_uq_not_full);
-        pthread_mutex_unlock(&g_uq_lock);
+        q->head = NULL;
+        q->tail = NULL;
+        q->files = 0;
+        wake_pushers = q->waiters > 0;
+        if (wake_pushers) pthread_cond_broadcast(&q->not_full);
+        pthread_mutex_unlock(&q->lock);
 
-        unlink_batch_run(it);
-        free(it);
+        while (it) {
+            unlink_item_t *next = it->next;
+            if (!stopping()) {
+                unlink_batch_run(it);
+            }
+            free(it);
+            it = next;
+        }
     }
 }
 
@@ -272,7 +404,12 @@ typedef struct {
 
 static __thread name_batch_t t_batch;
 
-static void batch_flush(const char *dir, size_t dir_len)
+/*
+ * node->st is the fstat of the directory the walker actually has open and is
+ * reading names from (open_verified_dir refreshed it), so its dev/ino is the
+ * identity the unlink worker must find again.
+ */
+static void batch_flush(const dirwalk_node_t *node, size_t dir_len)
 {
     name_batch_t *b = &t_batch;
     unlink_item_t *it;
@@ -285,7 +422,9 @@ static void batch_flush(const char *dir, size_t dir_len)
     } else {
         it->count = b->count;
         it->dir_len = dir_len;
-        memcpy(it->data, dir, dir_len + 1);
+        it->dir_dev = node->st.st_dev;
+        it->dir_ino = node->st.st_ino;
+        memcpy(it->data, node->path, dir_len + 1);
         memcpy(it->data + dir_len + 1, b->names, b->used);
         unlink_queue_push(it);
     }
@@ -293,9 +432,10 @@ static void batch_flush(const char *dir, size_t dir_len)
     b->count = 0;
 }
 
-static void batch_add(const char *dir, size_t dir_len, const char *name)
+static void batch_add(const dirwalk_node_t *node, size_t dir_len, const char *name)
 {
     name_batch_t *b = &t_batch;
+    const char *dir = node->path;
     size_t nlen = strlen(name) + 1;
 
     if (!b->names) {
@@ -307,7 +447,7 @@ static void batch_add(const char *dir, size_t dir_len, const char *name)
         }
     }
     if (b->count == UNLINK_BATCH || b->used + nlen > UNLINK_BATCH_BYTES) {
-        batch_flush(dir, dir_len);
+        batch_flush(node, dir_len);
     }
     if (nlen > UNLINK_BATCH_BYTES) {
         fprintf(stderr, "edelete: name too long under %s\n", dir);
@@ -323,60 +463,99 @@ static void batch_thread_end(void)
 {
     free(t_batch.names);
     memset(&t_batch, 0, sizeof(t_batch));
+    counters_flush();
 }
 
+/*
+ * One queue and one thread per worker. Should a thread fail to start, its
+ * queue is dropped from the routing set so no item is ever hashed to a queue
+ * nobody drains (the started queues are compacted to the front).
+ */
 static int unlink_pool_start(void)
 {
     int i;
 
-    g_unlink_threads = calloc((size_t)g_unlink_workers, sizeof(*g_unlink_threads));
-    if (!g_unlink_threads) {
+    g_uq = calloc((size_t)g_unlink_workers, sizeof(*g_uq));
+    if (!g_uq) {
         perror("calloc");
         return -1;
     }
     for (i = 0; i < g_unlink_workers; i++) {
-        if (pthread_create(&g_unlink_threads[i], NULL, unlink_worker_main, NULL) != 0) {
+        unlink_queue_t *q = &g_uq[g_unlink_threads_started];
+
+        pthread_mutex_init(&q->lock, NULL);
+        pthread_cond_init(&q->not_empty, NULL);
+        pthread_cond_init(&q->not_full, NULL);
+        if (pthread_create(&q->tid, NULL, unlink_worker_main, q) != 0) {
             perror("pthread_create");
+            pthread_cond_destroy(&q->not_full);
+            pthread_cond_destroy(&q->not_empty);
+            pthread_mutex_destroy(&q->lock);
             break;
         }
         g_unlink_threads_started++;
     }
-    return g_unlink_threads_started > 0 ? 0 : -1;
+    g_uq_count = g_unlink_threads_started;
+    if (g_uq_count == 0) {
+        free(g_uq);
+        g_uq = NULL;
+        return -1;
+    }
+    g_uq_cap_per_worker = UNLINK_QUEUE_MAX / (size_t)g_uq_count;
+    if (g_uq_cap_per_worker < UNLINK_QUEUE_MIN_PER_WORKER) {
+        g_uq_cap_per_worker = UNLINK_QUEUE_MIN_PER_WORKER;
+    }
+    return 0;
 }
 
-/* Close the queue (workers drain what is left, then exit) and join them. */
+/*
+ * Close the queues (workers drain what is left, then exit) and join them. The
+ * queue structs themselves stay allocated for the life of the process: the
+ * signal watcher may call unlink_pool_wake() at any time, and it must never
+ * find a freed array or a destroyed mutex.
+ */
 static void unlink_pool_finish(void)
 {
     int i;
-    unlink_item_t *it;
 
-    pthread_mutex_lock(&g_uq_lock);
-    g_uq_closed = 1;
-    pthread_cond_broadcast(&g_uq_not_empty);
-    pthread_cond_broadcast(&g_uq_not_full);
-    pthread_mutex_unlock(&g_uq_lock);
-
-    for (i = 0; i < g_unlink_threads_started; i++) {
-        pthread_join(g_unlink_threads[i], NULL);
+    for (i = 0; i < g_uq_count; i++) {
+        unlink_queue_t *q = &g_uq[i];
+        pthread_mutex_lock(&q->lock);
+        g_uq_closed = 1;
+        pthread_cond_broadcast(&q->not_empty);
+        pthread_cond_broadcast(&q->not_full);
+        pthread_mutex_unlock(&q->lock);
     }
-    free(g_unlink_threads);
-    g_unlink_threads = NULL;
-
-    /* Anything still queued was abandoned by a shutdown request. */
-    while ((it = g_uq_head) != NULL) {
-        g_uq_head = it->next;
-        free(it);
+    for (i = 0; i < g_uq_count; i++) {
+        pthread_join(g_uq[i].tid, NULL);
     }
-    g_uq_tail = NULL;
-    g_uq_files = 0;
+    for (i = 0; i < g_uq_count; i++) {
+        unlink_queue_t *q = &g_uq[i];
+        unlink_item_t *it;
+
+        /* Anything still queued was abandoned by a shutdown request. */
+        pthread_mutex_lock(&q->lock);
+        while ((it = q->head) != NULL) {
+            q->head = it->next;
+            free(it);
+        }
+        q->tail = NULL;
+        q->files = 0;
+        pthread_mutex_unlock(&q->lock);
+    }
 }
 
 static void unlink_pool_wake(void)
 {
-    pthread_mutex_lock(&g_uq_lock);
-    pthread_cond_broadcast(&g_uq_not_empty);
-    pthread_cond_broadcast(&g_uq_not_full);
-    pthread_mutex_unlock(&g_uq_lock);
+    int i;
+
+    for (i = 0; i < g_uq_count; i++) {
+        unlink_queue_t *q = &g_uq[i];
+        pthread_mutex_lock(&q->lock);
+        pthread_cond_broadcast(&q->not_empty);
+        pthread_cond_broadcast(&q->not_full);
+        pthread_mutex_unlock(&q->lock);
+    }
 }
 
 /* ------------------------------------------------------------------------ */
@@ -385,6 +564,8 @@ static void unlink_pool_wake(void)
 typedef struct {
     char *path;
     int depth;
+    dev_t dev;   /* identity of the directory as the walker had it open */
+    ino_t ino;
 } dir_rec_t;
 
 static pthread_mutex_t g_dirs_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -392,9 +573,9 @@ static dir_rec_t *g_dir_list = NULL;
 static size_t g_dir_count = 0;
 static size_t g_dir_cap = 0;
 
-static int record_dir(const char *path, int depth)
+static int record_dir(const dirwalk_node_t *node)
 {
-    char *dup = strdup(path);
+    char *dup = strdup(node->path);
     if (!dup) {
         perror("strdup");
         return -1;
@@ -413,7 +594,9 @@ static int record_dir(const char *path, int depth)
         g_dir_cap = nc;
     }
     g_dir_list[g_dir_count].path = dup;
-    g_dir_list[g_dir_count].depth = depth;
+    g_dir_list[g_dir_count].depth = node->depth;
+    g_dir_list[g_dir_count].dev = node->st.st_dev;
+    g_dir_list[g_dir_count].ino = node->st.st_ino;
     g_dir_count++;
     pthread_mutex_unlock(&g_dirs_lock);
     return 0;
@@ -439,18 +622,78 @@ static int rmdir_depth_of(size_t i)
     return g_dir_list[i].depth;
 }
 
+/* Length of the parent part of an absolute path (up to, excluding, the last
+ * '/'; 0 for a direct child of "/"). */
+static size_t parent_len(const char *p)
+{
+    const char *slash = strrchr(p, '/');
+    return slash ? (size_t)(slash - p) : 0;
+}
+
+static int rmdir_same_parent(size_t a, size_t b)
+{
+    const char *pa = g_dir_list[a].path;
+    const char *pb = g_dir_list[b].path;
+    size_t la = parent_len(pa);
+
+    return la == parent_len(pb) && memcmp(pa, pb, la) == 0;
+}
+
+/*
+ * Remove one directory that the walk visited, by name relative to its parent,
+ * and only if the entry of that name is still the very directory inode the
+ * walker had open. A plain rmdir(path) would follow a symlink swapped into an
+ * intermediate component and remove an empty directory somewhere else.
+ */
 static int rmdir_one(size_t i)
 {
-    const char *p = g_dir_list[i].path;
+    const dir_rec_t *d = &g_dir_list[i];
+    const char *p = d->path;
+    size_t plen = parent_len(p);
+    const char *name = p + plen + 1;
+    char parent[PATH_MAX];
+    struct stat st;
+    int pfd;
 
     if (strcmp(p, "/") == 0) return 0;
-    if (rmdir(p) == 0) {
+    if (plen == 0) {
+        parent[0] = '/';
+        parent[1] = '\0';
+    } else {
+        memcpy(parent, p, plen);
+        parent[plen] = '\0';
+    }
+
+    pfd = open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (pfd < 0) {
+        if (errno != ENOENT) {
+            fprintf(stderr, "edelete: open %s: %s\n", parent, strerror(errno));
+            count_error();
+        }
+        return 0;
+    }
+    if (fstatat(pfd, name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+        if (errno != ENOENT) {
+            fprintf(stderr, "edelete: stat %s: %s\n", p, strerror(errno));
+            count_error();
+        }
+        close(pfd);
+        return 0;
+    }
+    if (!S_ISDIR(st.st_mode) || st.st_dev != d->dev || st.st_ino != d->ino) {
+        fprintf(stderr, "edelete: %s: directory changed since the scan; not removed\n", p);
+        count_error();
+        close(pfd);
+        return 0;
+    }
+    if (unlinkat(pfd, name, AT_REMOVEDIR) == 0) {
         atomic_fetch_add_explicit(&g_removed_dirs, 1, memory_order_relaxed);
     } else if (errno != ENOTEMPTY && errno != EEXIST && errno != ENOENT &&
                errno != EBUSY && errno != ENOTDIR) {
         fprintf(stderr, "edelete: rmdir %s: %s\n", p, strerror(errno));
         count_error();
     }
+    close(pfd);
     return 0; /* an rmdir failure is counted, not fatal to the pass */
 }
 
@@ -459,12 +702,23 @@ static int rmdir_one(size_t i)
  * parents, and the depth grouping guarantees a parent is tried only after all
  * of its children have been, so a whole emptied subtree collapses in one pass
  * (including the start path itself when it ends up empty).
+ *
+ * Within a level the list is sorted by path, so siblings are adjacent; the
+ * contiguous slicing with parent-aware boundaries hands each parent's
+ * children to exactly one thread. rmdir takes the parent's inode lock
+ * exclusively, so any distribution that puts siblings on several threads has
+ * them spin on that lock (over half of the rmdir pass in the round-robin
+ * version, and still two thirds of it with plain equal slices on a tree
+ * whose levels have only two parents).
  */
 static void remove_empty_directories(void)
 {
     if (g_dir_count == 0) return;
+    test_delay(g_test_rmdir_delay_ms);
     qsort(g_dir_list, g_dir_count, sizeof(*g_dir_list), dir_rec_cmp_desc_depth);
-    dirwalk_depth_groups(g_dir_count, g_threads, rmdir_depth_of, rmdir_one, NULL, NULL);
+    dirwalk_depth_groups_ex(g_dir_count, g_threads, rmdir_depth_of, rmdir_one,
+                            NULL, NULL, DIRWALK_GROUPS_CONTIGUOUS,
+                            rmdir_same_parent);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -475,8 +729,8 @@ static int walk_dir_begin(const dirwalk_node_t *node, int dir_fd, void **ctx)
     (void)dir_fd;
     *ctx = NULL;
     count_entry();
-    atomic_fetch_add_explicit(&g_dirs, 1, memory_order_relaxed);
-    if (!g_dry_run && record_dir(node->path, node->depth) != 0) {
+    t_cnt.dirs++;
+    if (!g_dry_run && record_dir(node) != 0) {
         count_error();
     }
     return 0;
@@ -493,15 +747,15 @@ static int walk_entry(const dirwalk_node_t *node, int dir_fd, void *ctx,
     }
 
     count_entry();
-    atomic_fetch_add_explicit(&g_files, 1, memory_order_relaxed);
+    t_cnt.files++;
     if (!eligible(st)) {
         return DIRWALK_SKIP;
     }
     if (g_dry_run) {
-        atomic_fetch_add_explicit(&g_would_delete, 1, memory_order_relaxed);
+        t_cnt.would_delete++;
         return DIRWALK_SKIP;
     }
-    batch_add(node->path, strlen(node->path), name);
+    batch_add(node, strlen(node->path), name);
     return DIRWALK_SKIP;
 }
 
@@ -509,7 +763,8 @@ static void walk_dir_end(const dirwalk_node_t *node, int dir_fd, void *ctx, int 
 {
     (void)dir_fd; (void)ctx;
     if (rc != 0) count_error();
-    if (!g_dry_run) batch_flush(node->path, strlen(node->path));
+    if (!g_dry_run) batch_flush(node, strlen(node->path));
+    counters_flush();
 }
 
 static void walk_error(const char *path)
@@ -753,6 +1008,10 @@ int main(int argc, char **argv)
 
     if (path_resolve_existing(root_path, root_abs, "edelete: ") != 0) return 2;
     root_path = root_abs;
+    if (strcmp(root_path, "/") == 0) {
+        fprintf(stderr, "edelete: refusing to operate on the filesystem root `/`\n");
+        return 2;
+    }
     if (lstat(root_path, &root_st) != 0) {
         fprintf(stderr, "edelete: %s: %s\n", root_path, strerror(errno));
         return 2;
@@ -772,6 +1031,8 @@ int main(int argc, char **argv)
 
     g_threads = env_int_or_default("EDELETE_THREADS", DEFAULT_THREADS, 1, 1024);
     g_unlink_workers = env_int_or_default("EDELETE_MAX_UNLINK_INFLIGHT", DEFAULT_UNLINK_WORKERS, 1, 1024);
+    g_test_unlink_delay_ms = env_int_or_default("EDELETE_TEST_UNLINK_DELAY_MS", 0, 0, 60000);
+    g_test_rmdir_delay_ms = env_int_or_default("EDELETE_TEST_RMDIR_DELAY_MS", 0, 0, 60000);
 
     if (!g_dry_run && !g_force && confirm_delete_prompt(root_path, basis_str) != 0) return 3;
 

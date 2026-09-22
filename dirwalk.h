@@ -101,4 +101,24 @@ int dirwalk_depth_groups(size_t n, int threads,
                          int (*between_groups)(void),
                          void (*thread_start)(int index));
 
+/*
+ * Within each depth level, give every thread one contiguous slice of indices
+ * instead of handing them out one at a time. When the level is sorted by path
+ * this keeps the children of one parent on a single thread — the choice for
+ * operations that take the parent's inode lock exclusively (rmdir, unlink),
+ * where round-robin only makes the threads spin on that lock. same_run
+ * (optional) tells whether indices a and b (adjacent, a < b) belong to the
+ * same run, e.g. share a parent; slice boundaries are then moved to run
+ * boundaries so no run is ever split between threads.
+ */
+#define DIRWALK_GROUPS_CONTIGUOUS 0x1
+
+int dirwalk_depth_groups_ex(size_t n, int threads,
+                            int (*depth_of)(size_t i),
+                            int (*fn)(size_t i),
+                            int (*between_groups)(void),
+                            void (*thread_start)(int index),
+                            int flags,
+                            int (*same_run)(size_t a, size_t b));
+
 #endif /* DIRWALK_H */

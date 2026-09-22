@@ -446,24 +446,75 @@ void dirwalk_request_stop(void)
 /* Deepest-first grouped pass                                                */
 
 typedef struct {
+    size_t start;
     size_t end;
     size_t next;
+    int count;         /* threads in this group */
+    int contiguous;    /* DIRWALK_GROUPS_CONTIGUOUS */
     int failed;
     int bind_seq;
     pthread_mutex_t lock;
     int (*fn)(size_t i);
+    int (*same_run)(size_t a, size_t b);
     void (*thread_start)(int index);
 } group_ctx_t;
+
+/*
+ * Move a nominal slice boundary forward to the start of the next run, so a
+ * run (e.g. the children of one parent) is never split between two threads.
+ * Monotonic in `pos`, hence consecutive threads' slices stay disjoint and
+ * together still cover [start, end).
+ */
+static size_t snap_to_run_start(const group_ctx_t *ctx, size_t pos)
+{
+    if (!ctx->same_run) {
+        return pos;
+    }
+    while (pos > ctx->start && pos < ctx->end && ctx->same_run(pos - 1, pos)) {
+        pos++;
+    }
+    return pos;
+}
 
 static void *group_worker(void *arg)
 {
     group_ctx_t *ctx = (group_ctx_t *)arg;
+    int idx;
 
+    pthread_mutex_lock(&ctx->lock);
+    idx = ctx->bind_seq++;
+    pthread_mutex_unlock(&ctx->lock);
     if (ctx->thread_start) {
-        pthread_mutex_lock(&ctx->lock);
-        int idx = ctx->bind_seq++;
-        pthread_mutex_unlock(&ctx->lock);
         ctx->thread_start(idx);
+    }
+
+    if (ctx->contiguous) {
+        /*
+         * Fixed slice per thread. The caller sorted the level by path, so the
+         * children of one parent are adjacent; with same_run() the slice
+         * boundaries are moved to parent boundaries, so one parent's children
+         * are all handled by the same thread. Siblings are then never
+         * rmdir'ed by several threads at once — the kernel would serialize
+         * them on the parent's inode lock anyway, with every thread spinning.
+         * A level with fewer parents than threads simply leaves threads idle.
+         */
+        size_t len = ctx->end - ctx->start;
+        size_t lo = snap_to_run_start(ctx, ctx->start + len * (size_t)idx / (size_t)ctx->count);
+        size_t hi = snap_to_run_start(ctx, ctx->start + len * (size_t)(idx + 1) / (size_t)ctx->count);
+        size_t i;
+        int failed = 0;
+
+        for (i = lo; i < hi; i++) {
+            if (ctx->fn(i) != 0) {
+                failed = 1;
+            }
+        }
+        if (failed) {
+            pthread_mutex_lock(&ctx->lock);
+            ctx->failed = 1;
+            pthread_mutex_unlock(&ctx->lock);
+        }
+        return NULL;
     }
 
     for (;;) {
@@ -486,11 +537,13 @@ static void *group_worker(void *arg)
     return NULL;
 }
 
-int dirwalk_depth_groups(size_t n, int threads,
-                         int (*depth_of)(size_t i),
-                         int (*fn)(size_t i),
-                         int (*between_groups)(void),
-                         void (*thread_start)(int index))
+int dirwalk_depth_groups_ex(size_t n, int threads,
+                            int (*depth_of)(size_t i),
+                            int (*fn)(size_t i),
+                            int (*between_groups)(void),
+                            void (*thread_start)(int index),
+                            int flags,
+                            int (*same_run)(size_t a, size_t b))
 {
     size_t start;
 
@@ -519,11 +572,15 @@ int dirwalk_depth_groups(size_t n, int threads,
             return -1;
         }
 
+        ctx.start = start;
         ctx.end = end;
         ctx.next = start;
+        ctx.count = count;
+        ctx.contiguous = (flags & DIRWALK_GROUPS_CONTIGUOUS) != 0;
         ctx.failed = 0;
         ctx.bind_seq = 0;
         ctx.fn = fn;
+        ctx.same_run = same_run;
         ctx.thread_start = thread_start;
         pthread_mutex_init(&ctx.lock, NULL);
 
@@ -553,4 +610,14 @@ int dirwalk_depth_groups(size_t n, int threads,
         start = end;
     }
     return 0;
+}
+
+int dirwalk_depth_groups(size_t n, int threads,
+                         int (*depth_of)(size_t i),
+                         int (*fn)(size_t i),
+                         int (*between_groups)(void),
+                         void (*thread_start)(int index))
+{
+    return dirwalk_depth_groups_ex(n, threads, depth_of, fn, between_groups,
+                                   thread_start, 0, NULL);
 }

@@ -232,4 +232,126 @@ expect_eq "edelete safety: n3 errors" "0" "$(kv_last errors "$out")"
 
 pass "edelete safety negatives (symlink targets, age freshness, containment)"
 
+# --- containment: everything else that could reach outside the start path ---
+#   c1: the start path itself is a symlink -> only the resolved target is
+#       touched, the link's siblings survive, start_path= reports the target;
+#   c2: symlinks to an ancestor and to the tree itself are unlinked as links,
+#       never descended (would otherwise loop / climb out);
+#   c3: a hard link inside the tree -> only the name inside goes, the inode
+#       and its outside name survive with content;
+#   c4: hostile names (spaces, newline, leading dash, unicode) are unlinked
+#       by name relative to the directory fd, never re-parsed;
+#   c5: the filesystem root is refused before anything is walked;
+#   c6: RACE — an intermediate directory is swapped for a symlink between the
+#       scan and the unlink; the worker must refuse the batch (dev/ino check);
+#   c7: RACE — same swap before the rmdir pass; no directory elsewhere is
+#       removed.
+
+base="${td}/edelete_contain"
+mkdir -p "$base"
+
+# c1
+mkdir -p "${base}/c1/real/sub" "${base}/c1/other"
+echo r >"${base}/c1/real/sub/r.txt"
+echo o >"${base}/c1/other/o.txt"
+ln -s real "${base}/c1/link"
+c1_real=$(cd "${base}/c1/real" && pwd -P)
+out="${base}/c1.stdout"
+"$EDELETE" --delete --force "${base}/c1/link" >"$out" 2>"${base}/c1.stderr" || die "edelete contain: c1 start-path symlink failed"
+expect_eq "edelete contain: c1 start_path is the resolved target" "$c1_real" "$(kv_last start_path "$out")"
+[[ ! -e "${base}/c1/real/sub/r.txt" ]] || die "edelete contain: c1 target contents should be removed"
+[[ -f "${base}/c1/other/o.txt" ]] || die "edelete contain: c1 sibling of the link must survive"
+expect_eq "edelete contain: c1 errors" "0" "$(kv_last errors "$out")"
+
+# c2
+mkdir -p "${base}/c2/tree/deep"
+echo p >"${base}/c2/parent_file.txt"
+echo d >"${base}/c2/tree/deep/d.txt"
+ln -s .. "${base}/c2/tree/up"          # -> ${base}/c2 (ancestor)
+ln -s . "${base}/c2/tree/self"         # -> the tree itself
+ln -s ../../.. "${base}/c2/tree/deep/far_up"
+out="${base}/c2.stdout"
+"$EDELETE" --delete --force "${base}/c2/tree" >"$out" 2>"${base}/c2.stderr" || die "edelete contain: c2 ancestor links failed"
+[[ -f "${base}/c2/parent_file.txt" ]] || die "edelete contain: c2 ancestor file must survive"
+[[ -d "$base" && -d "$td" ]] || die "edelete contain: c2 climbed out of the tree"
+[[ ! -e "${base}/c2/tree" ]] || die "edelete contain: c2 tree (links + file) should be fully removed"
+expect_eq "edelete contain: c2 errors" "0" "$(kv_last errors "$out")"
+
+# c3
+mkdir -p "${base}/c3/tree" "${base}/c3/outside"
+echo shared >"${base}/c3/outside/orig.txt"
+if ln "${base}/c3/outside/orig.txt" "${base}/c3/tree/hardlink.txt" 2>/dev/null; then
+    out="${base}/c3.stdout"
+    "$EDELETE" --delete --force "${base}/c3/tree" >"$out" 2>"${base}/c3.stderr" || die "edelete contain: c3 hard link failed"
+    [[ ! -e "${base}/c3/tree/hardlink.txt" ]] || die "edelete contain: c3 inside name should be removed"
+    [[ "$(cat "${base}/c3/outside/orig.txt")" == "shared" ]] || die "edelete contain: c3 outside name/content must survive"
+    expect_eq "edelete contain: c3 errors" "0" "$(kv_last errors "$out")"
+else
+    log "edelete contain: skip c3 (hard links not supported here)"
+fi
+
+# c4
+mkdir -p "${base}/c4/tree/-rf" "${base}/c4/tree/with space"
+: >"${base}/c4/tree/-rf/--help"
+: >"${base}/c4/tree/with space/a b.txt"
+: >"${base}/c4/tree/$(printf 'new\nline').txt"
+: >"${base}/c4/tree/ünïcödé ✓.txt"
+: >"${base}/c4/tree/..hidden"          # legal name, not ".."
+: >"${base}/c4/tree/-"
+echo sib >"${base}/c4/sibling.txt"
+n_c4=$(find "${base}/c4/tree" -type f -print0 | tr -dc '\0' | wc -c)   # -print0: one name has a newline
+out="${base}/c4.stdout"
+"$EDELETE" --delete --force "${base}/c4/tree" >"$out" 2>"${base}/c4.stderr" || die "edelete contain: c4 hostile names failed"
+expect_eq "edelete contain: c4 deleted_files" "$n_c4" "$(kv_last deleted_files "$out")"
+[[ ! -e "${base}/c4/tree" ]] || die "edelete contain: c4 tree should be removed"
+[[ -f "${base}/c4/sibling.txt" ]] || die "edelete contain: c4 sibling must survive"
+expect_eq "edelete contain: c4 errors" "0" "$(kv_last errors "$out")"
+
+# c5 (dry-run form only: if the refusal were broken, nothing would be deleted)
+if timeout 30 "$EDELETE" / >"${base}/c5.stdout" 2>"${base}/c5.stderr"; then
+    die "edelete contain: c5 must refuse /"
+fi
+grep -q "refusing to operate on the filesystem root" "${base}/c5.stderr" || die "edelete contain: c5 refusal message missing"
+[[ ! -s "${base}/c5.stdout" ]] || die "edelete contain: c5 must not walk anything"
+
+# c6: unlink race. tree/a/b holds the victims' names; decoy/b holds files of
+# the same names. While the unlink worker is held back, tree/a is renamed
+# away and replaced by a symlink to decoy, so the batch path tree/a/b now
+# resolves to decoy/b. Nothing in decoy and nothing in the moved tree may go.
+mkdir -p "${base}/c6/tree/a/b" "${base}/c6/decoy/b"
+for f in f1 f2 f3; do echo victim >"${base}/c6/tree/a/b/$f"; echo decoy >"${base}/c6/decoy/b/$f"; done
+out="${base}/c6.stdout"
+EDELETE_TEST_UNLINK_DELAY_MS=1500 "$EDELETE" --delete --force "${base}/c6/tree" >"$out" 2>"${base}/c6.stderr" &
+c6_pid=$!
+sleep 0.4
+mv "${base}/c6/tree/a" "${base}/c6/tree/a.moved"
+ln -s ../decoy "${base}/c6/tree/a"
+wait "$c6_pid" && die "edelete contain: c6 must exit non-zero after refusing a batch"
+for f in f1 f2 f3; do
+    [[ "$(cat "${base}/c6/decoy/b/$f")" == "decoy" ]] || die "edelete contain: c6 decoy/b/$f was deleted through the swapped symlink"
+    [[ "$(cat "${base}/c6/tree/a.moved/b/$f")" == "victim" ]] || die "edelete contain: c6 a.moved/b/$f unexpectedly gone"
+done
+[[ -L "${base}/c6/tree/a" ]] || die "edelete contain: c6 the swapped-in symlink must not be removed by the rmdir pass"
+[[ -d "${base}/c6/decoy/b" ]] || die "edelete contain: c6 decoy/b directory must survive"
+grep -q "directory changed since the scan" "${base}/c6.stderr" || die "edelete contain: c6 expected the dev/ino refusal message"
+expect_eq "edelete contain: c6 deleted_files" "0" "$(kv_last deleted_files "$out")"
+
+# c7: rmdir race. tree/a/b is an empty directory; decoy/b is an empty
+# directory. Swap tree/a for a symlink to decoy before the rmdir pass; the
+# pass must not remove decoy/b (or anything under a.moved).
+mkdir -p "${base}/c7/tree/a/b" "${base}/c7/decoy/b"
+out="${base}/c7.stdout"
+EDELETE_TEST_RMDIR_DELAY_MS=1500 "$EDELETE" --delete --force "${base}/c7/tree" >"$out" 2>"${base}/c7.stderr" &
+c7_pid=$!
+sleep 0.4
+mv "${base}/c7/tree/a" "${base}/c7/tree/a.moved"
+ln -s ../decoy "${base}/c7/tree/a"
+wait "$c7_pid" || true
+[[ -d "${base}/c7/decoy/b" ]] || die "edelete contain: c7 decoy/b was removed through the swapped symlink"
+[[ -d "${base}/c7/tree/a.moved/b" ]] || die "edelete contain: c7 a.moved/b unexpectedly gone"
+[[ -L "${base}/c7/tree/a" ]] || die "edelete contain: c7 the swapped-in symlink must survive the rmdir pass"
+expect_eq "edelete contain: c7 removed_empty_dirs" "0" "$(kv_last removed_empty_dirs "$out")"
+
+pass "edelete containment (start-path symlink, ancestor links, hard links, hostile names, root refusal, swap races)"
+
 pass "edelete test suite"
