@@ -51,7 +51,7 @@ OBJS = \
 
 .PHONY: all clean test
 
-all: $(TARGET)
+all: $(TARGET) edelete
 
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS)

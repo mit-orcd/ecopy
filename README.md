@@ -101,12 +101,10 @@ Existing files on the target may be replaced. Nothing is ever deleted.
 
 ## edelete
 
-This repo also builds `edelete`, a parallel tree deleter (moved here from the ereport repo). Dry-run by
+`make` also builds `edelete`, a parallel tree deleter (moved here from the ereport repo). Dry-run by
 default; nothing is removed unless you pass `--delete`.
 
 ```bash
-make edelete
-
 ./edelete /scratch/staging                          # dry run: prints would_delete=
 ./edelete mtime 90 /scratch/job123                  # dry run, only entries older than 90 days
 ./edelete --delete mtime 90 /scratch/job123         # asks you to type YES
