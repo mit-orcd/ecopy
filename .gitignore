@@ -2,6 +2,7 @@
 *.d
 *.dSYM/
 /ecopy
+/edelete
 /protocol_test
 /telemetry_test
 /logs/

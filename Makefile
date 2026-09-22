@@ -39,6 +39,7 @@ OBJS = \
 	copy_policy.o \
 	verify.o \
 	shutdown.o \
+	path_utils.o \
 	$(BLAKE3_OBJS) \
 	suggestion.o \
 	protocol.o \
@@ -64,6 +65,9 @@ third_party/blake3/blake3_sse41.o: override CFLAGS += -mssse3 -msse4.1
 third_party/blake3/blake3_avx2.o: override CFLAGS += -mavx2
 third_party/blake3/blake3_avx512.o: override CFLAGS += -mavx512f -mavx512vl
 
+edelete: edelete.o path_utils.o
+	$(CC) $(CFLAGS) -o $@ edelete.o path_utils.o $(LDFLAGS)
+
 protocol_test: tests/protocol_test.c protocol.o $(BLAKE3_OBJS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tests/protocol_test.c protocol.o $(BLAKE3_OBJS) $(LDFLAGS)
 
@@ -71,10 +75,10 @@ telemetry_test: tests/telemetry_test.c telemetry.o stats.o $(BLAKE3_OBJS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tests/telemetry_test.c telemetry.o stats.o $(BLAKE3_OBJS) $(LDFLAGS)
 
 clean:
-	rm -f *.o *.d third_party/blake3/*.o third_party/blake3/*.d $(TARGET) protocol_test telemetry_test
+	rm -f *.o *.d third_party/blake3/*.o third_party/blake3/*.d $(TARGET) edelete protocol_test telemetry_test
 	rm -rf *.dSYM   # debug bundles, emitted when linking with -g on macOS
 
-test: $(TARGET) protocol_test telemetry_test
+test: $(TARGET) edelete protocol_test telemetry_test
 	@set -e; \
 	echo "==> protocol_test"; \
 	./protocol_test; \
@@ -85,4 +89,4 @@ test: $(TARGET) protocol_test telemetry_test
 		bash "$$t"; \
 	done
 
--include $(OBJS:.o=.d)
+-include $(OBJS:.o=.d) edelete.d path_utils.d

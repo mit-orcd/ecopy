@@ -20,6 +20,8 @@
 #include "types.h"
 #include "config.h"
 #include "shutdown.h"
+#include "path_canon.h"
+#include "path_utils.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -147,16 +149,12 @@ static int to_abs_path(const char *in, char *out, size_t out_sz) {
             perror("getcwd");
             return -1;
         }
-        if (snprintf(out, out_sz, "%s/%s", cwd, in) >= (int)out_sz) {
+        if (path_join_fast(cwd, strlen(cwd), in, strlen(in), out, out_sz) != 0) {
             return -1;
         }
     }
 
-    size_t len = strlen(out);
-    while (len > 1 && out[len - 1] == '/') {
-        out[len - 1] = '\0';
-        len--;
-    }
+    path_rstrip_slashes(out);
 
     return 0;
 }
@@ -167,14 +165,12 @@ static int to_canonical_dir_path(const char *in, char *out, size_t out_sz) {
         return -1;
     }
 
-    if (!realpath(tmp, out)) {
-        perror(in);
+    /* path_resolve_existing writes a realpath(3) result, so out must be PATH_MAX. */
+    if (out_sz < PATH_MAX) {
+        errno = ENAMETOOLONG;
         return -1;
     }
-
-    if (strlen(out) >= out_sz) {
-        errno = ENAMETOOLONG;
-        perror("realpath");
+    if (path_resolve_existing(tmp, out, NULL) != 0) {
         return -1;
     }
 
@@ -258,7 +254,7 @@ static int prepend_suffix_component(char *suffix, size_t suffix_sz, const char *
         return 0;
     }
 
-    if (snprintf(tmp, sizeof(tmp), "%s/%s", component, suffix) >= (int)sizeof(tmp) ||
+    if (path_join_fast(component, strlen(component), suffix, strlen(suffix), tmp, sizeof(tmp)) != 0 ||
         snprintf(suffix, suffix_sz, "%s", tmp) >= (int)suffix_sz) {
         errno = ENAMETOOLONG;
         return -1;
@@ -276,12 +272,8 @@ static int join_parent_suffix(const char *parent, const char *suffix, char *out,
         return 0;
     }
 
-    if (strcmp(parent, "/") == 0) {
-        if (snprintf(out, out_sz, "/%s", suffix) >= (int)out_sz) {
-            errno = ENAMETOOLONG;
-            return -1;
-        }
-    } else if (snprintf(out, out_sz, "%s/%s", parent, suffix) >= (int)out_sz) {
+    /* path_join_fast handles the parent == "/" case (no double slash). */
+    if (path_join_fast(parent, strlen(parent), suffix, strlen(suffix), out, out_sz) != 0) {
         errno = ENAMETOOLONG;
         return -1;
     }
@@ -787,8 +779,8 @@ int main(int argc, char **argv) {
         if (!src_is_dir) {
             /* The ssh:// path is always the destination directory; the file
              * keeps its source name inside it. */
-            if (snprintf(file_enqueue_dst, sizeof(file_enqueue_dst), "%s/%s",
-                         dst_root, src_name) >= (int)sizeof(file_enqueue_dst)) {
+            if (path_join_fast(dst_root, strlen(dst_root), src_name, strlen(src_name),
+                               file_enqueue_dst, sizeof(file_enqueue_dst)) != 0) {
                 fprintf(stderr, "ecopy: remote path too long\n");
                 sshx_disconnect();
                 return 1;
@@ -871,10 +863,10 @@ int main(int argc, char **argv) {
             return 1;
         }
         copy_policy_set_destination(0, 0);
-        if (snprintf(file_enqueue_dst, sizeof(file_enqueue_dst), "%s/%s", dst_dir, src_name)
-                >= (int)sizeof(file_enqueue_dst) ||
-            snprintf(file_final_dst, sizeof(file_final_dst), "%s/%s", dst_dir, final_name)
-                >= (int)sizeof(file_final_dst)) {
+        if (path_join_fast(dst_dir, strlen(dst_dir), src_name, strlen(src_name),
+                           file_enqueue_dst, sizeof(file_enqueue_dst)) != 0 ||
+            path_join_fast(dst_dir, strlen(dst_dir), final_name, strlen(final_name),
+                           file_final_dst, sizeof(file_final_dst)) != 0) {
             fprintf(stderr, "Target path too long: %s\n", dst_arg);
             return 1;
         }

@@ -99,6 +99,38 @@ target and start over.
 
 Existing files on the target may be replaced. Nothing is ever deleted.
 
+## edelete
+
+This repo also builds `edelete`, a parallel tree deleter (moved here from the ereport repo). Dry-run by
+default; nothing is removed unless you pass `--delete`.
+
+```bash
+make edelete
+
+./edelete /scratch/staging                          # dry run: prints would_delete=
+./edelete mtime 90 /scratch/job123                  # dry run, only entries older than 90 days
+./edelete --delete mtime 90 /scratch/job123         # asks you to type YES
+./edelete --delete --force ctime 14 /cache/tmp      # no prompt (scripting)
+./edelete --uid 1234 --delete /scratch/shared       # only that owner's entries
+```
+
+Symlinks are never followed, and deletion never ascends above the start path. Thread count:
+`EDELETE_THREADS` (default 16); `EDELETE_MAX_UNLINK_INFLIGHT` caps concurrent `unlink` calls
+(default 256, `0` = unlimited); `EDELETE_FANOUT_MIN_BYTES` (default 64 MiB, `0` = off) queues
+files at least that large for parallel unlink via the work queue instead of inline.
+
+Quota'd XFS: every `unlink` of one owner's files serializes on that owner's dquot mutex, so more
+threads make it *slower* (kernel time in `osq_lock` / `mutex_spin_on_owner`). Cap
+`EDELETE_MAX_UNLINK_INFLIGHT` (2–4 is often best when deleting one user's tree); traversal
+parallelism (`EDELETE_THREADS`) can stay high. Find the knee with:
+
+```bash
+for n in 1 2 4 8 16; do
+  EDELETE_THREADS=$n EDELETE_MAX_UNLINK_INFLIGHT=$n ./edelete --delete --force <path> 2>/dev/null \
+  | awk -F= -v n=$n '/^deleted_files=/{d=$2} /^elapsed_sec=/{e=$2} END{printf "inflight=%s rate=%.0f/s\n", n, e>0?d/e:0}'
+done
+```
+
 ## Testing
 
 ```bash
