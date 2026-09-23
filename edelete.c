@@ -198,8 +198,7 @@ static int eligible(const struct stat *st)
  * followed.
  *
  * Every worker owns its own queue, and an item is routed to the worker chosen
- * by its directory (XFS allocation group of the directory inode when known,
- * else a hash of the path — see unlink_queue_index_for). Hence all names of one directory, however
+ * by hashing its directory path. Hence all names of one directory, however
  * many batches the walker split them into, are unlinked by a single thread.
  * The kernel serializes unlinks within a directory anyway (the parent's
  * i_rwsem is taken exclusively per unlink, and XFS adds a per-AG unlinked-list
@@ -273,70 +272,16 @@ static int stopping(void)
     return atomic_load_explicit(&g_shutdown_requested, memory_order_relaxed);
 }
 
-/* FNV-1a over the directory path: cheap, and any spread is good enough. */
 /*
- * Allocation-group affinity (XFS). Each unlink appends the inode to the
- * unlinked list in the AGI buffer of the inode's allocation group, under that
- * buffer's lock. With workers picked by path hash, two workers regularly hold
- * directories from the same AG and take turns sleeping on that lock (the
- * profile: xfs_iunlink -> xfs_read_agi -> xfs_buf_lock -> down() -> schedule,
- * ~15% of samples, plus the scheduler's load-balancing that every such sleep
- * triggers). XFS allocates a file's inode in its parent directory's AG, so
- * routing a directory's batches by the AG of the directory inode gives every
- * AG exactly one unlinker whenever agcount >= workers; otherwise
- * workers/agcount workers share an AG, chosen by path hash within the AG.
+ * FNV-1a over the directory path: cheap, and any spread is good enough.
  *
- * The AG is the high bits of the inode number: ino >> (agblklog + inopblog),
- * both from XFS_IOC_FSGEOMETRY of the start directory. Non-XFS start paths
- * and directories on another filesystem (a mount inside the tree) use the
- * path hash. EDELETE_AG_AFFINITY=0 disables the routing for A/B runs.
+ * Tried and rejected (Sep 2026): routing by the XFS allocation group of the
+ * directory inode, so that no two workers share an AGI buffer lock. It halved
+ * the voluntary context switches (676k -> 341k on a 1.33M-file tree) but made
+ * wall time 0.5 s worse out of 7.4 s in every pair, because directories are
+ * not spread evenly over AGs and the affinity costs more parallelism than the
+ * AGI sleeps cost. The AGI wait is cheap; keep the hash.
  */
-static dev_t g_root_dev = 0;
-static int g_ag_shift = -1;          /* -1: no AG routing */
-static uint64_t g_agcount = 0;
-static int g_ag_affinity = 1;
-
-#ifdef __linux__
-#include <sys/ioctl.h>
-/* struct xfs_fsop_geom_v1 from xfs_fs.h; stable since Linux 2.4. */
-struct edelete_xfs_geom_v1 {
-    uint32_t blocksize, rtextsize, agblocks, agcount, logblocks, sectsize;
-    uint32_t inodesize, imaxpct;
-    uint64_t datablocks, rtblocks, rtextents, logstart;
-    unsigned char uuid[16];
-    uint32_t sunit, swidth;
-    int32_t version;
-    uint32_t flags, logsectsize, rtsectsize, dirblocksize;
-};
-#define EDELETE_XFS_IOC_FSGEOMETRY_V1 _IOR('X', 100, struct edelete_xfs_geom_v1)
-
-static int log2_roundup(uint32_t v)
-{
-    int l = 0;
-    while (((uint32_t)1 << l) < v) l++;
-    return l;
-}
-
-static void ag_affinity_probe(const char *root)
-{
-    struct edelete_xfs_geom_v1 g;
-    int fd;
-
-    if (!g_ag_affinity) return;
-    fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0) return;
-    if (ioctl(fd, EDELETE_XFS_IOC_FSGEOMETRY_V1, &g) == 0 &&
-        g.agblocks > 0 && g.agcount > 0 && g.inodesize > 0 &&
-        g.blocksize >= g.inodesize) {
-        g_ag_shift = log2_roundup(g.agblocks) + log2_roundup(g.blocksize / g.inodesize);
-        g_agcount = g.agcount;
-    }
-    close(fd);
-}
-#else
-static void ag_affinity_probe(const char *root) { (void)root; }
-#endif
-
 static unsigned unlink_queue_index_for(const unlink_item_t *it)
 {
     uint64_t h = UINT64_C(1469598103934665603);
@@ -345,15 +290,6 @@ static unsigned unlink_queue_index_for(const unlink_item_t *it)
     for (i = 0; i < it->dir_len; i++) {
         h ^= (unsigned char)it->data[i];
         h *= UINT64_C(1099511628211);
-    }
-    if (g_ag_shift >= 0 && it->dir_dev == g_root_dev) {
-        uint64_t agno = (uint64_t)it->dir_ino >> g_ag_shift;
-        if (agno < g_agcount) {
-            /* ceil(workers/agcount) sub-slots per AG so no worker idles when
-             * agcount does not divide the worker count; 1 when agcount >= workers */
-            uint64_t per_ag = ((uint64_t)g_uq_count + g_agcount - 1) / g_agcount;
-            return (unsigned)((agno * per_ag + h % per_ag) % (uint64_t)g_uq_count);
-        }
     }
     return (unsigned)(h % (uint64_t)g_uq_count);
 }
@@ -1096,8 +1032,6 @@ int main(int argc, char **argv)
         fprintf(stderr, "edelete: %s: not a directory\n", root_path);
         return 2;
     }
-    g_root_dev = root_st.st_dev;
-    if (!g_dry_run) ag_affinity_probe(root_path);
 
     if (!g_delete_all) {
         g_now = time(NULL);
@@ -1111,10 +1045,9 @@ int main(int argc, char **argv)
     g_unlink_workers = env_int_or_default("EDELETE_MAX_UNLINK_INFLIGHT", DEFAULT_UNLINK_WORKERS, 1, 1024);
     g_test_unlink_delay_ms = env_int_or_default("EDELETE_TEST_UNLINK_DELAY_MS", 0, 0, 60000);
     g_test_rmdir_delay_ms = env_int_or_default("EDELETE_TEST_RMDIR_DELAY_MS", 0, 0, 60000);
-    g_ag_affinity = env_int_or_default("EDELETE_AG_AFFINITY", 1, 0, 1);
-    /* Without ownership/age filters the walker needs no stat for files. */
-    g_lazy_stat = env_int_or_default("EDELETE_LAZY_STAT", 1, 0, 1) &&
-                  g_delete_all && !g_have_uid_filter && !g_have_gid_filter;
+    /* Without ownership/age filters the walker needs no stat for files:
+     * d_type tells directories apart, and that is all walk_entry() reads. */
+    g_lazy_stat = g_delete_all && !g_have_uid_filter && !g_have_gid_filter;
 
     if (!g_dry_run && !g_force && confirm_delete_prompt(root_path, basis_str) != 0) return 3;
 
@@ -1188,11 +1121,6 @@ int main(int argc, char **argv)
         printf("start_path=%s\n", root_path);
         printf("threads=%d\n", g_threads);
         printf("max_unlink_inflight=%d\n", g_dry_run ? 0 : g_unlink_threads_started);
-        if (g_ag_shift >= 0)
-            printf("unlink_routing=xfs-ag (agcount=%llu)\n", (unsigned long long)g_agcount);
-        else
-            printf("unlink_routing=%s\n", g_dry_run ? "none" : "path-hash");
-        printf("lazy_stat=%d\n", g_lazy_stat);
         printf("walk_entries=%llu\n", entries);
         printf("entries_scanned=%llu\n", entries);
         printf("dirs_seen=%llu\n", (unsigned long long)atomic_load(&g_dirs));
