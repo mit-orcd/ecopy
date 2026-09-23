@@ -1658,6 +1658,7 @@ static int copy_file_serial_small(file_task_t *task, uint64_t *payload_bytes)
     int copy_range_available;
     off_t size;
     off_t bulk_end;
+    off_t copy_end;
     off_t pos = 0;
     int rc = -1;
     int target_created = 0;
@@ -1737,8 +1738,20 @@ static int copy_file_serial_small(file_task_t *task, uint64_t *payload_bytes)
         goto out;
     }
 
-    while (pos < bulk_end) {
-        off_t remain = bulk_end - pos;
+    /*
+     * With copy_file_range on a buffered pair, hand it the whole file, not
+     * just the ALIGNMENT-rounded bulk. A remap that ends at EOF on both
+     * sides may be unaligned, so on XFS/btrfs the partial last block is
+     * cloned with the rest and nothing is read; elsewhere the kernel splices
+     * the tail in the same call. Copying the tail ourselves cost one cold
+     * 4 KiB pread per file (1.33M preads, 257 s blocked, ~8 s of a 14 s wall
+     * per worker on the imagenet run) while the reflink itself took 38 us.
+     * The O_DIRECT paths keep the buffered tail below.
+     */
+    copy_end = (!in_direct && !out_direct && copy_range_available) ? size : bulk_end;
+
+    while (pos < copy_end) {
+        off_t remain = copy_end - pos;
         off_t this_len_off = (remain >= g_chunk_size) ? g_chunk_size : remain;
         size_t len = (size_t)this_len_off;
 
@@ -1756,6 +1769,14 @@ static int copy_file_serial_small(file_task_t *task, uint64_t *payload_bytes)
             stats_record_copy_file_range_fallback();
             copy_range_available = 0;
             advise_source_streaming(fd_in); /* now we read it ourselves */
+            /* Back to the aligned bulk; the tail copy below takes the rest. */
+            copy_end = bulk_end;
+            remain = copy_end - pos;
+            if (remain <= 0) {
+                break;
+            }
+            this_len_off = (remain >= g_chunk_size) ? g_chunk_size : remain;
+            len = (size_t)this_len_off;
         }
 
         {
@@ -1804,7 +1825,8 @@ static int copy_file_serial_small(file_task_t *task, uint64_t *payload_bytes)
     fadvise_batch_flush(&fadv);
 
     if (!in_direct && !out_direct) {
-        if (copy_tail_buffered_fds(fd_in, fd_out, bulk_end, size, 1) != 0) {
+        /* pos == size when copy_file_range covered the whole file: no-op. */
+        if (copy_tail_buffered_fds(fd_in, fd_out, pos, size, 1) != 0) {
             goto out;
         }
         if (finalize_copied_file_fd(fd_out, task->dst, &task->src_st) != 0) {
