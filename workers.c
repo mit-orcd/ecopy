@@ -2895,14 +2895,23 @@ static void *worker_main(void *arg)
                 g_small_workers_active == 0 && g_large_workers_active == 0) {
                 pthread_cond_broadcast(&g_queue_cond);
             } else if (g_queue_waiters > 0 &&
-                       (g_small_q.len > 0 || g_large_heap.len > 0)) {
+                       (g_large_heap.len > 0 ||
+                        (g_small_q.len > 0 &&
+                         g_small_worker_limit - (int)g_small_workers_active >=
+                             SMALL_CLAIM_BATCH))) {
                 /*
                  * Wake a parked worker only when there is something for it
-                 * to claim. Signaling unconditionally per completed file
-                 * made every finish a futex wake of one of the (up to 256)
-                 * parked threads, which then fought the live workers for
-                 * this mutex and re-parked: 62% of cycles in futex and
-                 * 500k context switches/s on the imagenet profile.
+                 * to claim, and for small files only once a whole stash
+                 * (SMALL_CLAIM_BATCH slots) is free, matching the enqueue
+                 * side's one-wake-per-batch rule. Waking on every freed
+                 * slot handed each completed file to one of the ~220 parked
+                 * threads, which claimed a single task, copied it, and
+                 * woke the next: 1.33M futex wakes plus the mutex fight
+                 * behind each, 36% of cycles in the futex spinlock once the
+                 * per-file pread no longer paced the workers. Workers whose
+                 * stash runs dry re-enter dequeue_work themselves and take
+                 * whatever is free, so leftovers below a full stash are
+                 * still drained without a wake.
                  */
                 pthread_cond_signal(&g_queue_cond);
             }
