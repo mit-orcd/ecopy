@@ -2518,14 +2518,33 @@ static void wake_producer_if_room_locked(void)
  * stash and only re-enters the scheduler when the stash is empty, cutting
  * lock round-trips per dispatched file. A stash is a run of consecutive
  * files from one directory batch (the batch is then rotated behind the other
- * queued directories, see small_queue_t). Stashed tasks stay counted in
- * g_small_workers_active until completed, so slot accounting and the
- * shutdown condition are unaffected.
+ * queued directories, see small_queue_t).
+ *
+ * g_small_workers_active counts worker THREADS holding a stash, not stashed
+ * tasks. A thread takes one slot when it claims its first stash, keeps it
+ * across refills, and gives it back only when it finds the small queue
+ * empty. So the small worker limit is the number of files copied
+ * concurrently, and a completed file needs no lock at all: finished tasks
+ * stay in the stash and are recycled in bulk at the next refill. (Counting
+ * tasks instead made a limit of 32 with stashes of 8 mean four busy threads,
+ * and every completion a wake of a parked one.)
  */
 #define SMALL_CLAIM_BATCH 8
 
+/* Return the finished tasks in stash[0..head) and reset it. Called with the
+ * queue lock held; directory refs are dropped by the caller beforehand. */
+static void stash_recycle_locked(file_task_t **stash, int *stash_head, int *stash_count)
+{
+    for (int k = 0; k < *stash_head; k++) {
+        stash[k]->next = g_task_freelist;
+        g_task_freelist = stash[k];
+    }
+    *stash_head = 0;
+    *stash_count = 0;
+}
+
 static work_claim_t dequeue_work(file_task_t **stash, int *stash_head,
-                                 int *stash_count)
+                                 int *stash_count, int *small_slot)
 {
     work_claim_t claim;
     memset(&claim, 0, sizeof(claim));
@@ -2535,6 +2554,12 @@ static work_claim_t dequeue_work(file_task_t **stash, int *stash_head,
         claim.kind = WORK_SMALL_FILE;
         claim.file_task = stash[(*stash_head)++];
         return claim;
+    }
+
+    /* Drop directory refs of the finished tasks outside the queue lock;
+     * the task structs themselves are recycled under it below. */
+    for (int k = 0; k < *stash_head; k++) {
+        dir_handle_release(stash[k]->dir);
     }
 
     pthread_mutex_lock(&g_queue_lock);
@@ -2547,19 +2572,21 @@ static work_claim_t dequeue_work(file_task_t **stash, int *stash_head,
          * workers_stop().
          */
         while (*stash_head < *stash_count) {
-            file_task_t *t = stash[(*stash_head)++];
-            dir_handle_release(t->dir);
-            t->next = g_task_freelist;
-            g_task_freelist = t;
+            dir_handle_release(stash[(*stash_head)++]->dir);
+        }
+        stash_recycle_locked(stash, stash_head, stash_count);
+        if (*small_slot) {
+            *small_slot = 0;
             if (g_small_workers_active > 0) {
                 g_small_workers_active--;
             }
         }
-        *stash_count = 0;
         pthread_cond_broadcast(&g_space_cond);
         pthread_mutex_unlock(&g_queue_lock);
         return claim;
     }
+
+    stash_recycle_locked(stash, stash_head, stash_count);
 
     for (;;) {
         int total_slots_used = total_worker_slots_used_locked();
@@ -2584,18 +2611,18 @@ static work_claim_t dequeue_work(file_task_t **stash, int *stash_head,
         }
 
         if (g_small_q.len > 0 &&
-            (int)g_small_workers_active < g_small_worker_limit &&
-            total_slots_used + 1 <= g_worker_count) {
+            (*small_slot ||
+             ((int)g_small_workers_active < g_small_worker_limit &&
+              total_slots_used + 1 <= g_worker_count))) {
             dir_batch_t *b = smallq_pop_batch(&g_small_q);
+            if (!*small_slot) {
+                *small_slot = 1;
+                g_small_workers_active++;
+            }
             *stash_head = 0;
             *stash_count = 0;
-            while (*stash_count < SMALL_CLAIM_BATCH &&
-                   b->head < b->count &&
-                   (int)g_small_workers_active < g_small_worker_limit &&
-                   total_slots_used + 1 <= g_worker_count) {
+            while (*stash_count < SMALL_CLAIM_BATCH && b->head < b->count) {
                 stash[(*stash_count)++] = b->tasks[b->head++];
-                g_small_workers_active++;
-                total_slots_used++;
             }
             wake_producer_if_room_locked();
             /* Rotate a part-claimed directory behind the others so the next
@@ -2628,6 +2655,20 @@ static work_claim_t dequeue_work(file_task_t **stash, int *stash_head,
             claim.kind = WORK_SMALL_FILE;
             claim.file_task = stash[(*stash_head)++];
             break;
+        }
+
+        /* Nothing small to refill with: give the thread slot back. If that
+         * was the last outstanding work after the producers finished, every
+         * parked worker must see the termination condition. */
+        if (*small_slot) {
+            *small_slot = 0;
+            if (g_small_workers_active > 0) {
+                g_small_workers_active--;
+            }
+            if (g_queue_done && g_small_q.len == 0 && g_large_heap.len == 0 &&
+                g_small_workers_active == 0 && g_large_workers_active == 0) {
+                pthread_cond_broadcast(&g_queue_cond);
+            }
         }
 
         if (g_small_q.len == 0 && g_large_heap.len == 0 &&
@@ -2833,13 +2874,14 @@ static void *worker_main(void *arg)
     file_task_t *stash[SMALL_CLAIM_BATCH];
     int stash_head = 0;
     int stash_count = 0;
+    int small_slot = 0;
 
     /* Bind this worker to one SSH connection of the pool so a streamed file's
      * OPEN/WRITE/COMMIT frames all land on the same server (a no-op locally). */
     sshx_bind_thread((int)(intptr_t)arg);
 
     for (;;) {
-        work_claim_t claim = dequeue_work(stash, &stash_head, &stash_count);
+        work_claim_t claim = dequeue_work(stash, &stash_head, &stash_count, &small_slot);
         if (claim.kind == WORK_NONE) {
             break;
         }
@@ -2878,44 +2920,8 @@ static void *worker_main(void *arg)
                 mark_worker_error();
             }
 
-            free_file_task(claim.file_task);
-
-            pthread_mutex_lock(&g_queue_lock);
-            if (g_small_workers_active > 0) {
-                g_small_workers_active--;
-            }
-            /*
-             * A single freed slot normally only needs to wake one waiter. But
-             * once shutdown has been requested and this was the last
-             * outstanding work, every parked worker must be released so it can
-             * observe the termination condition and exit; a lone signal would
-             * leave the others blocked forever and hang workers_stop().
-             */
-            if (g_queue_done && g_small_q.len == 0 && g_large_heap.len == 0 &&
-                g_small_workers_active == 0 && g_large_workers_active == 0) {
-                pthread_cond_broadcast(&g_queue_cond);
-            } else if (g_queue_waiters > 0 &&
-                       (g_large_heap.len > 0 ||
-                        (g_small_q.len > 0 &&
-                         g_small_worker_limit - (int)g_small_workers_active >=
-                             SMALL_CLAIM_BATCH))) {
-                /*
-                 * Wake a parked worker only when there is something for it
-                 * to claim, and for small files only once a whole stash
-                 * (SMALL_CLAIM_BATCH slots) is free, matching the enqueue
-                 * side's one-wake-per-batch rule. Waking on every freed
-                 * slot handed each completed file to one of the ~220 parked
-                 * threads, which claimed a single task, copied it, and
-                 * woke the next: 1.33M futex wakes plus the mutex fight
-                 * behind each, 36% of cycles in the futex spinlock once the
-                 * per-file pread no longer paced the workers. Workers whose
-                 * stash runs dry re-enter dequeue_work themselves and take
-                 * whatever is free, so leftovers below a full stash are
-                 * still drained without a wake.
-                 */
-                pthread_cond_signal(&g_queue_cond);
-            }
-            pthread_mutex_unlock(&g_queue_lock);
+            /* The finished task stays in the stash and is recycled at the
+             * next refill; no queue lock per completed file. */
             continue;
         }
 
@@ -3320,10 +3326,12 @@ int workers_enqueue_batch(dir_handle_t *dir,
             }
 
             if (g_small_q.len > 0 && free_slots > 0) {
+                int stashes = ((int)g_small_q.len + SMALL_CLAIM_BATCH - 1) /
+                              SMALL_CLAIM_BATCH;
                 small_wake = g_small_worker_limit -
                              (int)g_small_workers_active;
-                if (small_wake > (int)g_small_q.len) {
-                    small_wake = (int)g_small_q.len;
+                if (small_wake > stashes) {
+                    small_wake = stashes;
                 }
                 if (small_wake > free_slots) {
                     small_wake = free_slots;
@@ -3331,16 +3339,13 @@ int workers_enqueue_batch(dir_handle_t *dir,
             }
 
             /*
-             * One woken worker batch-claims up to SMALL_CLAIM_BATCH small
-             * tasks, so signaling once per enqueued task over-wakes ~8x:
-             * every signal that finds a waiter is a futex wake plus the
-             * woken thread's lock reacquisition. Wake only as many workers
-             * as can actually claim, and only when someone is parked.
-             * Under-waking cannot strand work: any worker returning from a
-             * copy pops the heap again before it would wait.
+             * One wake per worker that can actually take a slot and a
+             * stash; every signal that finds a waiter is a futex wake plus
+             * the woken thread's lock reacquisition, so never over-wake.
+             * Under-waking cannot strand work: a worker whose stash runs
+             * dry refills from the queue before it would park.
              */
-            int wakes = large_wake +
-                        (small_wake + SMALL_CLAIM_BATCH - 1) / SMALL_CLAIM_BATCH;
+            int wakes = large_wake + small_wake;
             if (wakes > g_queue_waiters) {
                 wakes = g_queue_waiters;
             }
