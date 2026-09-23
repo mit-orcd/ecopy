@@ -20,7 +20,10 @@ int same_size_and_mtime(const struct stat *a, const struct stat *b);
 int preserve_path_metadata(const char *dst, const struct stat *src_st);
 int preserve_fd_metadata(int fd, const char *path_for_warning, const struct stat *src_st);
 int finalize_copied_file(const char *dst, const struct stat *src_st);
-int finalize_copied_file_fd(int fd, const char *path_for_warning, const struct stat *src_st);
+int finalize_copied_file_fd(int fd,
+                            const char *path_for_warning,
+                            const struct stat *src_st,
+                            int current_mode);
 int direct_io_enabled(void);
 int read_direct_io_enabled(void);
 int write_direct_io_enabled(void);
@@ -40,13 +43,16 @@ int create_temp_write_at_maybe_direct(int dir_fd,
                                       off_t data_size,
                                       char *tmp_name,
                                       size_t tmp_name_sz,
-                                      int *used_direct);
+                                      int reopen_by_name,
+                                      int *used_direct,
+                                      int *created_mode);
 int create_final_write_at_maybe_direct(int dir_fd,
                                        const char *name,
                                        const char *display_path,
                                        mode_t mode,
                                        off_t data_size,
-                                       int *used_direct);
+                                       int *used_direct,
+                                       int *created_mode);
 int open_temp_write_existing_at_buffered(int dir_fd,
                                          const char *tmp_name,
                                          const char *display_path);

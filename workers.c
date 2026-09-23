@@ -106,6 +106,7 @@ typedef struct large_file_ctx {
     int fd_out;
     int in_direct;
     int out_direct;
+    int out_mode;   /* destination mode bits at create time, -1 if unknown */
     int failed;
     int read_done;
     int active_readers;
@@ -1575,6 +1576,7 @@ static int copy_file_sparse(file_task_t *task, uint64_t *payload_bytes)
     int fd_in = -1;
     int fd_out = -1;
     int out_direct = 0;
+    int out_mode = -1;
     int target_created = 0;
     int rc = -1;
     void *buf = NULL;
@@ -1599,7 +1601,9 @@ static int copy_file_sparse(file_task_t *task, uint64_t *payload_bytes)
                                                task->src_st.st_size,
                                                tmp_name,
                                                sizeof(tmp_name),
-                                               &out_direct);
+                                               0,
+                                               &out_direct,
+                                               &out_mode);
     if (fd_out < 0) {
         goto out;
     }
@@ -1637,7 +1641,7 @@ static int copy_file_sparse(file_task_t *task, uint64_t *payload_bytes)
         goto out;
     }
 
-    if (finalize_copied_file_fd(fd_out, task->dst, &task->src_st) != 0) {
+    if (finalize_copied_file_fd(fd_out, task->dst, &task->src_st, out_mode) != 0) {
         goto out;
     }
     if (ecopy_close_nocancel(fd_out) != 0) {
@@ -1741,6 +1745,7 @@ static int copy_file_serial_small(file_task_t *task, uint64_t *payload_bytes)
     int fd_out = -1;
     int in_direct = 0;
     int out_direct = 0;
+    int out_mode = -1;
     void *buf = NULL;
     int copy_range_available;
     off_t size;
@@ -1782,7 +1787,8 @@ static int copy_file_serial_small(file_task_t *task, uint64_t *payload_bytes)
                                                     task->dst,
                                                     task->src_st.st_mode & 07777,
                                                     task->src_st.st_size,
-                                                    &out_direct);
+                                                    &out_direct,
+                                                    &out_mode);
         write_name = task->name;
     } else {
         fd_out = create_temp_write_at_maybe_direct(task->dir->dst_fd,
@@ -1791,7 +1797,9 @@ static int copy_file_serial_small(file_task_t *task, uint64_t *payload_bytes)
                                                    task->src_st.st_size,
                                                    tmp_name,
                                                    sizeof(tmp_name),
-                                                   &out_direct);
+                                                   0,
+                                                   &out_direct,
+                                                   &out_mode);
         write_name = tmp_name;
     }
     if (fd_out < 0) {
@@ -1799,10 +1807,10 @@ static int copy_file_serial_small(file_task_t *task, uint64_t *payload_bytes)
     }
     target_created = 1;
 
-    if (ecopy_ftruncate_nocancel(fd_out, size) != 0) {
-        perror("ftruncate");
-        goto out;
-    }
+    /* No ftruncate() pre-sizing here: the destination is empty (new temp or
+     * O_TRUNC) and every byte gets written, so the writes set the final size.
+     * Only the sparse path needs the explicit truncate for a trailing hole.
+     * On NFS that saves a SETATTR round trip per file. */
 
     /*
      * copy_file_range() either reflinks (same-fs XFS/btrfs) or splices in
@@ -1935,7 +1943,7 @@ static int copy_file_serial_small(file_task_t *task, uint64_t *payload_bytes)
         if (copy_tail_buffered_fds(fd_in, fd_out, pos, size, 1) != 0) {
             goto out;
         }
-        if (finalize_copied_file_fd(fd_out, task->dst, &task->src_st) != 0) {
+        if (finalize_copied_file_fd(fd_out, task->dst, &task->src_st, out_mode) != 0) {
             goto out;
         }
         if (ecopy_close_nocancel(fd_out) != 0) {
@@ -2300,7 +2308,7 @@ static void finish_large_file_ctx(large_file_ctx_t *ctx)
                                   ctx->src_st.st_size,
                                   0) != 0) {
             rc = -1;
-        } else if (finalize_copied_file_fd(ctx->fd_out, ctx->dst, &ctx->src_st) != 0) {
+        } else if (finalize_copied_file_fd(ctx->fd_out, ctx->dst, &ctx->src_st, ctx->out_mode) != 0) {
             rc = -1;
         } else if (ecopy_close_nocancel(ctx->fd_out) != 0) {
             ctx->fd_out = -1;
@@ -2455,7 +2463,9 @@ static int start_large_file_copy(file_task_t *task)
                                                     ctx->src_st.st_size,
                                                     ctx->tmp_name,
                                                     sizeof(ctx->tmp_name),
-                                                    &ctx->out_direct);
+                                                    1, /* tail re-opens the temp by name */
+                                                    &ctx->out_direct,
+                                                    &ctx->out_mode);
     if (ctx->fd_out < 0) {
         goto fail;
     }

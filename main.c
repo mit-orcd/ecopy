@@ -577,6 +577,13 @@ int main(int argc, char **argv) {
         return server_main(argv[2], 1);
     }
 
+    /* Every file and directory ecopy creates carries an explicit mode copied
+     * from the source, so clear the umask: O_CREAT/mkdirat then land the exact
+     * bits and the metadata pass can skip the follow-up fchmod (one SETATTR RPC
+     * per file on NFS, one inode transaction locally). The server side does
+     * the same. */
+    umask(0);
+
     int no_preserve_times = 0;
     {
         const char *worker_env = getenv("DIRECT_COPY_VERIFY_WORKERS");

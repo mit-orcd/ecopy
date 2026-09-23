@@ -107,8 +107,28 @@ void dir_handle_release(dir_handle_t *dir)
     free(dir);
 }
 
+/*
+ * Scratch mode for a destination that will be re-opened by name while being
+ * written (O_DIRECT bulk + buffered tail): owner read/write is forced so the
+ * re-open succeeds for read-only sources. The final mode is applied later.
+ */
 static mode_t copy_data_mode(mode_t final_mode) {
     return (final_mode & 0777) | S_IRUSR | S_IWUSR;
+}
+
+/*
+ * Create mode for a destination that is written through its original fd only.
+ * A freshly created fd is writable regardless of the stored mode bits, and the
+ * process runs with umask(0), so creating with the final mode directly lets the
+ * metadata pass skip the fchmod (one SETATTR RPC per file on NFS, one inode
+ * transaction on local filesystems). Setuid/setgid bits may be stripped by the
+ * kernel at create time, so those still take the scratch mode + fchmod route.
+ */
+static mode_t buffered_create_mode(mode_t final_mode) {
+    if (final_mode & (S_ISUID | S_ISGID)) {
+        return copy_data_mode(final_mode);
+    }
+    return final_mode & 07777;
 }
 
 static void init_self_ids(void)
@@ -438,7 +458,17 @@ static int make_temp_name(char *tmp_name, size_t tmp_name_sz)
     return 0;
 }
 
-static int validate_opened_temp_regular(int fd, const char *display_path, int open_flags)
+/*
+ * Verify the just-opened destination is a regular file and clear O_NONBLOCK.
+ * Reports the file's current permission bits (from the fstat we do anyway) so
+ * callers know the exact on-disk mode without a follow-up fchmod: for a new
+ * file that is the create mode (umask is 0), for an existing in-place target it
+ * is whatever it had before.
+ */
+static int validate_opened_temp_regular(int fd,
+                                        const char *display_path,
+                                        int open_flags,
+                                        int *actual_mode)
 {
     struct stat st;
 
@@ -456,6 +486,9 @@ static int validate_opened_temp_regular(int fd, const char *display_path, int op
     if (clear_nonblock(fd, display_path, open_flags) != 0) {
         return -1;
     }
+    if (actual_mode) {
+        *actual_mode = (int)(st.st_mode & 07777);
+    }
     return 0;
 }
 
@@ -464,7 +497,8 @@ static int open_temp_created_once(int dir_fd,
                                   const char *display_path,
                                   mode_t open_mode,
                                   int direct,
-                                  int *used_direct)
+                                  int *used_direct,
+                                  int *created_mode)
 {
     int flags = O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK;
     int fd;
@@ -480,17 +514,10 @@ static int open_temp_created_once(int dir_fd,
     if (direct && ecopy_set_direct_io(fd) != 0) {
         direct = 0;
     }
-    if (validate_opened_temp_regular(fd, display_path, flags) != 0) {
+    /* O_EXCL guarantees a fresh file and main() runs with umask(0), so the
+     * create already landed open_mode exactly; no fchmod round trip needed. */
+    if (validate_opened_temp_regular(fd, display_path, flags, created_mode) != 0) {
         ecopy_close_nocancel(fd);
-        return -1;
-    }
-    if (ecopy_fchmod_nocancel(fd, open_mode) != 0) {
-        int saved_errno = errno;
-        stats_inc_metadata_error();
-        ecopy_close_nocancel(fd);
-        errno = saved_errno;
-        progress_interrupt();
-        perror("fchmod");
         return -1;
     }
     if (used_direct) {
@@ -506,14 +533,22 @@ int create_temp_write_at_maybe_direct(int dir_fd,
                                       off_t data_size,
                                       char *tmp_name,
                                       size_t tmp_name_sz,
-                                      int *used_direct)
+                                      int reopen_by_name,
+                                      int *used_direct,
+                                      int *created_mode)
 {
-    mode_t open_mode = copy_data_mode(mode);
     int attempt;
     int try_direct = write_direct_io_enabled() && direct_io_worthwhile(data_size);
+    /* Anything re-opened by name while read-only source modes are being copied
+     * needs the owner-writable scratch mode; otherwise create with the final
+     * mode so the metadata pass can skip its fchmod. */
+    mode_t buffered_mode = reopen_by_name ? copy_data_mode(mode) : buffered_create_mode(mode);
 
     if (used_direct) {
         *used_direct = 0;
+    }
+    if (created_mode) {
+        *created_mode = -1;
     }
 
     for (attempt = 0; attempt < 100; attempt++) {
@@ -526,7 +561,10 @@ int create_temp_write_at_maybe_direct(int dir_fd,
         }
 
         if (try_direct) {
-            fd = open_temp_created_once(dir_fd, tmp_name, display_path, open_mode, 1, used_direct);
+            /* The direct path re-opens the temp by name for its buffered tail,
+             * so it needs the owner-writable scratch mode. */
+            fd = open_temp_created_once(dir_fd, tmp_name, display_path,
+                                        copy_data_mode(mode), 1, used_direct, created_mode);
             if (fd >= 0) {
                 return fd;
             }
@@ -541,7 +579,8 @@ int create_temp_write_at_maybe_direct(int dir_fd,
             unlinkat(dir_fd, tmp_name, 0);
         }
 
-        fd = open_temp_created_once(dir_fd, tmp_name, display_path, open_mode, 0, used_direct);
+        fd = open_temp_created_once(dir_fd, tmp_name, display_path,
+                                    buffered_mode, 0, used_direct, created_mode);
         if (fd >= 0) {
             return fd;
         }
@@ -564,7 +603,8 @@ static int open_final_created_once(int dir_fd,
                                    const char *display_path,
                                    mode_t open_mode,
                                    int direct,
-                                   int *used_direct)
+                                   int *used_direct,
+                                   int *created_mode)
 {
     int flags = O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK;
     int fd;
@@ -580,7 +620,7 @@ static int open_final_created_once(int dir_fd,
          * for truncation. Add owner write (the final mode is restored later by
          * the metadata pass) and retry once.
          */
-        if (fchmodat(dir_fd, name, open_mode, 0) == 0) {
+        if (fchmodat(dir_fd, name, copy_data_mode(open_mode), 0) == 0) {
             fd = ecopy_openat_nocancel(dir_fd, name, flags, open_mode);
         }
     }
@@ -590,17 +630,11 @@ static int open_final_created_once(int dir_fd,
     if (direct && ecopy_set_direct_io(fd) != 0) {
         direct = 0;
     }
-    if (validate_opened_temp_regular(fd, display_path, flags) != 0) {
+    /* open_mode only applies when O_CREAT actually created the file; an
+     * existing target keeps its old bits. validate reports the real mode so the
+     * metadata pass issues the fchmod exactly when it is needed. */
+    if (validate_opened_temp_regular(fd, display_path, flags, created_mode) != 0) {
         ecopy_close_nocancel(fd);
-        return -1;
-    }
-    if (ecopy_fchmod_nocancel(fd, open_mode) != 0) {
-        int saved_errno = errno;
-        stats_inc_metadata_error();
-        ecopy_close_nocancel(fd);
-        errno = saved_errno;
-        progress_interrupt();
-        perror("fchmod");
         return -1;
     }
     if (used_direct) {
@@ -622,17 +656,21 @@ int create_final_write_at_maybe_direct(int dir_fd,
                                        const char *display_path,
                                        mode_t mode,
                                        off_t data_size,
-                                       int *used_direct)
+                                       int *used_direct,
+                                       int *created_mode)
 {
-    mode_t open_mode = copy_data_mode(mode);
     int fd;
 
     if (used_direct) {
         *used_direct = 0;
     }
+    if (created_mode) {
+        *created_mode = -1;
+    }
 
     if (write_direct_io_enabled() && direct_io_worthwhile(data_size)) {
-        fd = open_final_created_once(dir_fd, name, display_path, open_mode, 1, used_direct);
+        fd = open_final_created_once(dir_fd, name, display_path,
+                                     copy_data_mode(mode), 1, used_direct, created_mode);
         if (fd >= 0) {
             return fd;
         }
@@ -643,7 +681,8 @@ int create_final_write_at_maybe_direct(int dir_fd,
         }
     }
 
-    fd = open_final_created_once(dir_fd, name, display_path, open_mode, 0, used_direct);
+    fd = open_final_created_once(dir_fd, name, display_path,
+                                 buffered_create_mode(mode), 0, used_direct, created_mode);
     if (fd < 0) {
         progress_interrupt();
         perror(display_path);
@@ -663,7 +702,7 @@ int open_temp_write_existing_at_buffered(int dir_fd,
         perror(display_path);
         return -1;
     }
-    if (validate_opened_temp_regular(fd, display_path, oflags) != 0) {
+    if (validate_opened_temp_regular(fd, display_path, oflags, NULL) != 0) {
         ecopy_close_nocancel(fd);
         return -1;
     }
@@ -862,14 +901,16 @@ int finalize_copied_file(const char *dst, const struct stat *src_st) {
     return preserve_path_metadata(dst, src_st);
 }
 
-int finalize_copied_file_fd(int fd, const char *path_for_warning, const struct stat *src_st) {
-    /*
-     * The destination fd was created with copy_data_mode(src mode); pass that as
-     * the known current mode so preserve can skip a redundant fchmod SETATTR
-     * when the create already produced the final permissions.
-     */
-    return preserve_fd_metadata_impl(fd, path_for_warning, src_st,
-                                     (int)copy_data_mode(src_st->st_mode));
+/*
+ * current_mode is the destination's present permission bits as reported by the
+ * create_*_write_at_maybe_direct() call that opened fd (-1 if unknown). When it
+ * already equals the source mode the fchmod SETATTR is skipped.
+ */
+int finalize_copied_file_fd(int fd,
+                            const char *path_for_warning,
+                            const struct stat *src_st,
+                            int current_mode) {
+    return preserve_fd_metadata_impl(fd, path_for_warning, src_st, current_mode);
 }
 
 /*
