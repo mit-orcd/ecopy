@@ -54,6 +54,7 @@ void stats_inc_hardlink_created(void);
 void stats_add_hardlink_saved(uint64_t bytes);
 void stats_record_copy_file_range_call(uint64_t bytes);
 void stats_record_copy_file_range_fallback(void);
+void stats_record_small_bulk_direct(void);
 void stats_inc_metadata_warning(void);
 void stats_inc_metadata_error(void);
 void stats_set_verify_config(int metadata, int data, double percent, uint64_t seed);

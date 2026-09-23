@@ -77,6 +77,7 @@ static _Atomic uint64_t a_cfr_bytes;
 static _Atomic uint64_t a_cfr_syscalls;
 static _Atomic uint64_t a_cfr_ns;
 static _Atomic uint64_t a_cfr_fallbacks;
+static _Atomic uint64_t a_small_bulk_direct;
 static _Atomic uint64_t a_large_chunk_buffer_allocs;
 static _Atomic uint64_t a_metadata_warnings;
 static _Atomic uint64_t a_metadata_errors;
@@ -116,6 +117,7 @@ static void stats_load_hot(stats_t *s) {
     s->copy_file_range_syscalls = hot_load(&a_cfr_syscalls);
     s->copy_file_range_ns = hot_load(&a_cfr_ns);
     s->copy_file_range_fallbacks = hot_load(&a_cfr_fallbacks);
+    s->small_bulk_direct = hot_load(&a_small_bulk_direct);
     s->large_chunk_buffer_allocs = hot_load(&a_large_chunk_buffer_allocs);
     s->metadata_warnings = hot_load(&a_metadata_warnings);
     s->metadata_errors = hot_load(&a_metadata_errors);
@@ -199,6 +201,7 @@ void stats_init(void) {
     atomic_store_explicit(&a_cfr_syscalls, 0, memory_order_relaxed);
     atomic_store_explicit(&a_cfr_ns, 0, memory_order_relaxed);
     atomic_store_explicit(&a_cfr_fallbacks, 0, memory_order_relaxed);
+    atomic_store_explicit(&a_small_bulk_direct, 0, memory_order_relaxed);
     atomic_store_explicit(&a_large_chunk_buffer_allocs, 0, memory_order_relaxed);
     atomic_store_explicit(&a_metadata_warnings, 0, memory_order_relaxed);
     atomic_store_explicit(&a_metadata_errors, 0, memory_order_relaxed);
@@ -526,6 +529,7 @@ void stats_record_copy_file_range_call(uint64_t bytes) {
     }
 }
 void stats_record_copy_file_range_fallback(void) { hot_add(&a_cfr_fallbacks, 1); }
+void stats_record_small_bulk_direct(void) { hot_add(&a_small_bulk_direct, 1); }
 void stats_inc_metadata_warning(void) { hot_add(&a_metadata_warnings, 1); }
 void stats_inc_metadata_error(void) { hot_add(&a_metadata_errors, 1); }
 void stats_set_verify_config(int metadata, int data, double percent, uint64_t seed) {
@@ -1098,6 +1102,7 @@ void stats_print_final(int verbose) {
     printf("copy_file_range calls     : %" PRIu64 "\n", s.copy_file_range_calls);
     printf("copy_file_range bytes     : %" PRIu64 "\n", s.copy_file_range_bytes);
     printf("copy_file_range fallbacks : %" PRIu64 "\n", s.copy_file_range_fallbacks);
+    printf("Small bulk direct writes  : %" PRIu64 "\n", s.small_bulk_direct);
     printf("Read opens   direct      : %" PRIu64 "\n", s.read_direct_opens);
     printf("Read opens   buffered    : %" PRIu64 "\n", s.read_buffered_opens);
     printf("Write opens  direct      : %" PRIu64 "\n", s.write_direct_opens);

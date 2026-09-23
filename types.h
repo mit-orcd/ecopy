@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include <limits.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
@@ -25,6 +26,9 @@ typedef struct dir_handle {
     mode_t src_mode;       /* source directory mode; used by remote lazy mkdir */
     unsigned int refs;
     pthread_mutex_t lock;
+    /* Destination filesystem takes O_DIRECT small-file bulk writes well
+     * (local block fs): 0 unknown, 1 yes, -1 no. Probed lazily by workers. */
+    _Atomic int dst_direct_ok;
 } dir_handle_t;
 
 typedef struct {
@@ -43,6 +47,7 @@ typedef struct {
     uint64_t copy_file_range_calls;
     uint64_t copy_file_range_bytes;
     uint64_t copy_file_range_fallbacks;
+    uint64_t small_bulk_direct;   /* small files whose aligned bulk was written O_DIRECT */
     uint64_t planned_copy_bytes;
     uint64_t read_direct_opens;
     uint64_t read_buffered_opens;

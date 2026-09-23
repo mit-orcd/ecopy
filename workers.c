@@ -28,6 +28,9 @@
 #include <pthread.h>
 #include <errno.h>
 #include <sys/stat.h>
+#ifdef __linux__
+#include <sys/vfs.h>
+#endif
 #include <sys/types.h>
 #include <sys/syscall.h>
 #include <limits.h>
@@ -152,6 +155,16 @@ static int g_large_writer_count = 0;
 static int g_large_config_clamped = 0;
 static off_t g_chunk_size = 0;
 static off_t g_large_threshold = 0;
+/*
+ * Small files whose ALIGNMENT-rounded bulk is at least this large get that
+ * bulk written O_DIRECT (tail buffered) when copy_file_range is not usable,
+ * i.e. on cross-device copies. Buffered small writes are paced by the
+ * kernel's single per-device flusher and the dirty-page throttle
+ * (vm.dirty_bytes): 2.2 GiB/s on a drive fio writes at 3.4 GiB/s with the
+ * same 128 KiB O_DIRECT pattern. Below the threshold a synchronous device
+ * write per file costs more than the page-cache copy. 0 disables.
+ */
+static off_t g_small_write_direct_min = -1;
 static int g_max_queued_files = 0;
 static int g_small_worker_limit = 0;
 static off_t g_ssh_putfile_max = 0;   /* max size streamed as one PUTFILE frame */
@@ -424,6 +437,12 @@ static void init_runtime_config(void)
                                              SMALL_WORKER_SLOTS,
                                              1,
                                              g_worker_count);
+
+    {
+        int kib = env_int_or_default("DIRECT_COPY_SMALL_WRITE_DIRECT_MIN_KB",
+                                     64, 0, 1024 * 1024);
+        g_small_write_direct_min = (off_t)kib * 1024;
+    }
 
     {
         /* Files at or below this size are shipped to an SSH target as a single
@@ -1648,6 +1667,74 @@ out:
     return rc;
 }
 
+/*
+ * Switch an open destination between buffered and O_DIRECT. Linux allows
+ * O_DIRECT in F_SETFL; elsewhere report failure and the caller stays
+ * buffered. Ranges written in the two modes never overlap here (aligned
+ * bulk, then the partial last block), so page-cache coherency is not an
+ * issue.
+ */
+static int fd_set_direct_write(int fd, int on)
+{
+#ifdef __linux__
+    int fl = fcntl(fd, F_GETFL);
+    if (fl < 0) {
+        return -1;
+    }
+    fl = on ? (fl | O_DIRECT) : (fl & ~O_DIRECT);
+    return fcntl(fd, F_SETFL, fl);
+#else
+    (void)fd;
+    (void)on;
+    return -1;
+#endif
+}
+
+/*
+ * O_DIRECT small-file bulks pay off on local block filesystems only. On a
+ * network destination each direct write is a synchronous RPC with no
+ * client-side coalescing: measured 20% slower than buffered on an NFS
+ * target, while 1.4x faster on a local NVMe. Probe the destination
+ * directory's filesystem once per dir_handle and allowlist local types.
+ */
+static int dst_fs_direct_ok(dir_handle_t *dir)
+{
+    int v = atomic_load_explicit(&dir->dst_direct_ok, memory_order_relaxed);
+    if (v != 0) {
+        return v > 0;
+    }
+#ifdef __linux__
+    {
+        struct statfs sf;
+        v = -1;
+        if (fstatfs(dir->dst_fd, &sf) == 0) {
+            switch ((unsigned long)sf.f_type) {
+            case 0x58465342UL: /* XFS */
+            case 0xEF53UL:     /* ext2/3/4 */
+            case 0x9123683EUL: /* btrfs */
+            case 0xF2F52010UL: /* f2fs */
+                v = 1;
+                break;
+            default:
+                break;
+            }
+        }
+    }
+#else
+    v = -1;
+#endif
+    atomic_store_explicit(&dir->dst_direct_ok, v, memory_order_relaxed);
+    return v > 0;
+}
+
+/* Small buffered destination, copy_file_range unusable: write the aligned
+ * bulk O_DIRECT if the file is big enough to make the device write pay. */
+static int small_bulk_wants_direct(dir_handle_t *dir, off_t bulk_end)
+{
+    return g_small_write_direct_min > 0 && bulk_end >= g_small_write_direct_min &&
+           write_direct_io_enabled() && dst_fs_direct_ok(dir);
+}
+
 static int copy_file_serial_small(file_task_t *task, uint64_t *payload_bytes)
 {
     int fd_in = -1;
@@ -1662,6 +1749,7 @@ static int copy_file_serial_small(file_task_t *task, uint64_t *payload_bytes)
     off_t pos = 0;
     int rc = -1;
     int target_created = 0;
+    int bulk_direct = 0;    /* destination bulk written O_DIRECT on a buffered fd */
     int inplace = copy_policy_small_inplace();
     const char *write_name;
     char tmp_name[PATH_MAX] = "";
@@ -1750,6 +1838,11 @@ static int copy_file_serial_small(file_task_t *task, uint64_t *payload_bytes)
      */
     copy_end = (!in_direct && !out_direct && copy_range_available) ? size : bulk_end;
 
+    if (!in_direct && !out_direct && !copy_range_available &&
+        small_bulk_wants_direct(task->dir, bulk_end) && fd_set_direct_write(fd_out, 1) == 0) {
+        bulk_direct = 1;
+    }
+
     while (pos < copy_end) {
         off_t remain = copy_end - pos;
         off_t this_len_off = (remain >= g_chunk_size) ? g_chunk_size : remain;
@@ -1769,6 +1862,12 @@ static int copy_file_serial_small(file_task_t *task, uint64_t *payload_bytes)
             stats_record_copy_file_range_fallback();
             copy_range_available = 0;
             advise_source_streaming(fd_in); /* now we read it ourselves */
+            /* Cross-device: nothing has been written yet, so the aligned
+             * bulk can still go O_DIRECT straight to the device. */
+            if (pos == 0 && small_bulk_wants_direct(task->dir, bulk_end) &&
+                fd_set_direct_write(fd_out, 1) == 0) {
+                bulk_direct = 1;
+            }
             /* Back to the aligned bulk; the tail copy below takes the rest. */
             copy_end = bulk_end;
             remain = copy_end - pos;
@@ -1825,6 +1924,13 @@ static int copy_file_serial_small(file_task_t *task, uint64_t *payload_bytes)
     fadvise_batch_flush(&fadv);
 
     if (!in_direct && !out_direct) {
+        if (bulk_direct) {
+            if (fd_set_direct_write(fd_out, 0) != 0) {
+                perror("fcntl(O_DIRECT off)");
+                goto out;
+            }
+            stats_record_small_bulk_direct();
+        }
         /* pos == size when copy_file_range covered the whole file: no-op. */
         if (copy_tail_buffered_fds(fd_in, fd_out, pos, size, 1) != 0) {
             goto out;
