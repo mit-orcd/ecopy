@@ -36,7 +36,7 @@ timestamps, and owner/group when you have permission to set them. Not copied: xa
 | `--verify-only` | Check only. Never writes to the target |
 | `--verify-skipped` | Also check files that were skipped as already copied |
 | `--uid N` / `--gid N` | Give everything on the target this owner / group |
-| `--no-preserve-times` | Don't copy timestamps (slightly faster over NFS) |
+| `--no-preserve-times` | Don't copy timestamps (saves one round trip per file on NFS targets) |
 | `-v` | Show more detail while running and in the final report |
 
 `ecopy --help` lists everything.
@@ -63,16 +63,32 @@ preserved` and is not a failure. Real mismatches are.
 Verification runs alongside the copy, so it adds little wall time. `Total Elapsed` in the report is the number
 that matters.
 
+## What to expect
+
+The defaults work for both large and small files without tuning. Large files stream with O_DIRECT through a
+reader/writer pipeline. Small files are read buffered and their 4 KiB-aligned bulk is written O_DIRECT (on local
+XFS/ext4/btrfs/f2fs; NFS targets stay buffered). On the same XFS filesystem with reflink, files are cloned instead
+of copied.
+
+Measured on one host with NVMe RAID-0 on both ends (ceilings from `fio`):
+
+- Large files: 97–99% of the slower drive's read or write ceiling (10.5 GiB/s for 16 × 100 GiB).
+- 1.3 M files of ~100 KiB: 87% of the write ceiling, ~54 k files/s. The rest is the per-file create, rename and
+  timestamp metadata.
+- NFS target: bound by the server's per-file RPC rate (open, write, set-times, close), typically ~10 k files/s.
+  More threads don't help; `--no-preserve-times` removes one of the four round trips.
+
 ## Making it faster
 
-The defaults are tuned for large files. The two settings worth trying:
-
 ```bash
-# Lots of small files? Buffered I/O is usually faster.
-DIRECT_COPY_DISABLE_DIRECT_IO=1 ecopy /src /dst
-
 # Slow ssh link? More connections (still one login).
 DIRECT_COPY_SSH_CONNECTIONS=8 ecopy /src ssh://host/dst
+
+# Small files landing on a filesystem that handles O_DIRECT badly: write them buffered.
+DIRECT_COPY_SMALL_WRITE_DIRECT_MIN_KB=0 ecopy /src /dst
+
+# Everything buffered (old behaviour, for comparison).
+DIRECT_COPY_DISABLE_DIRECT_IO=1 ecopy /src /dst
 ```
 
 Other common knobs (set as environment variables):
@@ -81,6 +97,7 @@ Other common knobs (set as environment variables):
 | --- | --- | --- |
 | `DIRECT_COPY_MAX_WORKERS` | 256 | Total worker threads |
 | `DIRECT_COPY_SMALL_MAX_WORKERS` | 32 | Small files copied at once |
+| `DIRECT_COPY_SMALL_WRITE_DIRECT_MIN_KB` | 64 | Small files at least this big write their aligned bulk O_DIRECT (0 = never) |
 | `DIRECT_COPY_LARGE_WORKERS` | 6 | Large files copied at once |
 | `DIRECT_COPY_LARGE_THRESHOLD_MB` | 10 | What counts as "large" |
 | `DIRECT_COPY_TRAVERSAL_WORKERS` | 8 | Threads scanning directories |
